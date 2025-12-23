@@ -1,0 +1,9 @@
+torch
+numpy
+datasets
+tiktoken
+tqdm
+ipywidgets
+safetensors
+huggingface_hub
+tensorboard
