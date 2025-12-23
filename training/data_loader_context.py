@@ -4,10 +4,16 @@ data_loader_context.py - Data loader that preserves document boundaries for cont
 
 import torch
 import gc
+import sys
+from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
-from architecture.tokenizer import get_tokenizer
 from datasets import load_dataset
 from tqdm import tqdm
+
+# Add parent directory to path to enable imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from architecture.tokenizer import get_tokenizer
 
 class DocumentDataset(Dataset):
     """

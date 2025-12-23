@@ -64,6 +64,60 @@ def get_args():
     return ap.parse_args()
 
 # ------------------------------ helpers --------------------------------------
+def load_pretrained_weights(model, device, models_dir="models"):
+    """Load pretrained weights from best model in models folder, skipping LSI cross-attention layers."""
+    best_model_path = None
+    if os.path.exists(models_dir):
+        # Look for best model files
+        for filename in ["final_model.pt", "best_model.pt"]:
+            path = os.path.join(models_dir, filename)
+            if os.path.exists(path):
+                best_model_path = path
+                break
+        
+        # If no named best model, find the latest checkpoint
+        if not best_model_path:
+            checkpoints = [f for f in os.listdir(models_dir) if f.startswith("checkpoint_") and f.endswith(".pt")]
+            if checkpoints:
+                # Sort by iteration number
+                checkpoints.sort(key=lambda x: int(x.split("_")[1].split(".")[0]), reverse=True)
+                best_model_path = os.path.join(models_dir, checkpoints[0])
+    
+    if best_model_path and os.path.exists(best_model_path):
+        print(f"Found existing model at {best_model_path}")
+        print("Loading weights up to LSI cross-attention layer...")
+        try:
+            checkpoint = torch.load(best_model_path, map_location=device)
+            pretrained_state = checkpoint.get('model', checkpoint)
+            
+            # Load state dict but skip LSI cross-attention weights
+            current_state = model.state_dict()
+            loaded_keys = []
+            skipped_keys = []
+            
+            for key, value in pretrained_state.items():
+                # Skip LSI cross-attention weights to train them from scratch
+                if 'lsi_cross_attn' in key:
+                    skipped_keys.append(key)
+                    continue
+                
+                # Load if shape matches
+                if key in current_state and current_state[key].shape == value.shape:
+                    current_state[key] = value
+                    loaded_keys.append(key)
+            
+            model.load_state_dict(current_state)
+            print(f"Loaded {len(loaded_keys)} layers from pretrained model")
+            print(f"Skipped {len(skipped_keys)} LSI cross-attention layers (training from scratch)")
+            if skipped_keys:
+                print(f"  Skipped keys: {skipped_keys[:5]}{'...' if len(skipped_keys) > 5 else ''}")
+        except Exception as e:
+            print(f"Warning: Could not load pretrained model: {e}")
+            print("Starting training from scratch")
+    else:
+        print("No existing model found in models folder. Starting from scratch.")
+
+
 def build_config(name: str, vocab_size: int) -> ModelConfig:
     """Build model configuration based on size"""
     if name == "large":
@@ -250,7 +304,10 @@ def main():
     model = Transformer(config, device=device)
     model.train()
     
-    # Load checkpoint if resuming
+    # Load pretrained weights from models folder (if available)
+    load_pretrained_weights(model, device, models_dir="models")
+    
+    # Load checkpoint if resuming (this overrides the pretrained weights)
     start_iter = 0
     if args.resume and args.checkpoint_path and os.path.exists(args.checkpoint_path):
         print(f"Loading checkpoint from {args.checkpoint_path}")
