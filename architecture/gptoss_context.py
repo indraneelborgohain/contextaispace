@@ -539,7 +539,7 @@ class Transformer(torch.nn.Module):
 
     def reset_context(self):
         """Reset context state to zeros for new conversation."""
-        self.context_state.zero_()
+        self.context_state = torch.zeros_like(self.context_state)
 
     def forward(self, x: torch.Tensor, update_context: bool = True) -> torch.Tensor:
         """
@@ -578,7 +578,7 @@ class Transformer(torch.nn.Module):
         logits = self.unembedding(x_tokens)
         
         if update_context and x_tokens.shape[0] > 0:
-            self.context_state.copy_(x_tokens[-1].detach())
+            self.context_state = x_tokens[-1].detach().clone()
         
         return logits
 
