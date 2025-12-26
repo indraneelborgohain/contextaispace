@@ -464,18 +464,23 @@ class LSICrossAttentionBlock(torch.nn.Module):
         K = torch.from_numpy(K_np).to(x.device).to(torch.bfloat16)
         V = torch.from_numpy(V_np).to(x.device).to(torch.bfloat16)
         
-        # Reshape Q, K, V back to (num_layers, seq_len, lsi_components)
-        Q = Q.reshape(num_layers, seq_len, self.lsi_components)
-        K = K.reshape(num_layers, seq_len, self.lsi_components)
-        V = V.reshape(num_layers, seq_len, self.lsi_components)
+        # Q, K, V have shape (num_layers * seq_len, actual_components)
+        # where actual_components may be less than lsi_components due to SVD constraints
+        actual_components = Q.shape[1]
+        
+        # Reshape Q, K, V back to (num_layers, seq_len, actual_components)
+        Q = Q.reshape(num_layers, seq_len, actual_components)
+        K = K.reshape(num_layers, seq_len, actual_components)
+        V = V.reshape(num_layers, seq_len, actual_components)
         
         # Aggregate across layers (mean pooling)
-        Q_agg = Q.mean(dim=0)  # (seq_len, lsi_components)
-        K_agg = K.mean(dim=0)  # (seq_len, lsi_components)
-        V_agg = V.mean(dim=0)  # (seq_len, lsi_components)
+        Q_agg = Q.mean(dim=0)  # (seq_len, actual_components)
+        K_agg = K.mean(dim=0)  # (seq_len, actual_components)
+        V_agg = V.mean(dim=0)  # (seq_len, actual_components)
         
-        # Compute attention scores: Q @ K^T
-        attn_scores = torch.matmul(Q_agg, K_agg.transpose(-2, -1)) * self.scale
+        # Compute attention scores: Q @ K^T with dynamic scaling
+        scale = 1.0 / math.sqrt(actual_components)
+        attn_scores = torch.matmul(Q_agg, K_agg.transpose(-2, -1)) * scale
         
         # Apply softmax
         attn_weights = torch.softmax(attn_scores, dim=-1)
