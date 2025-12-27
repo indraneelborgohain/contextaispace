@@ -203,9 +203,11 @@ def evaluate(model, val_loader, eval_iters, device, dtype_ctx):
             seq_target = targets[j]
             seq_len = lengths[j].item()
             
-            # Only use actual tokens (not padding)
-            seq_input = seq_input[:seq_len]
-            seq_target = seq_target[:seq_len]
+            # Use actual tokens (model handles long sequences via chunking)
+            # Only slice if there's padding, otherwise use full sequence
+            if seq_len < seq_input.shape[0]:
+                seq_input = seq_input[:seq_len]
+                seq_target = seq_target[:seq_len]
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
                 logits = model(seq_input, update_context=False)  # Don't update context during eval
@@ -236,7 +238,8 @@ def generate_sample(model, tokenizer, prompt, max_tokens, temperature, top_k, de
     tokens = torch.tensor(tokens, dtype=torch.long, device=device)
     
     for _ in range(max_tokens):
-        logits = model(tokens[-512:], update_context=True)  # Use last 512 tokens as context
+        # Model now handles long sequences via chunking, no need to truncate
+        logits = model(tokens, update_context=True)
         logits = logits[-1] / temperature
         
         if top_k > 0:
@@ -388,9 +391,11 @@ def main():
             seq_target = targets[j]
             seq_len = lengths[j].item()
             
-            # Only use actual tokens (not padding)
-            seq_input = seq_input[:seq_len]
-            seq_target = seq_target[:seq_len]
+            # Use actual tokens (model handles long sequences via chunking)
+            # Only slice if there's padding, otherwise use full sequence
+            if seq_len < seq_input.shape[0]:
+                seq_input = seq_input[:seq_len]
+                seq_target = seq_target[:seq_len]
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
                 logits = model(seq_input, update_context=True)  # Update context during training

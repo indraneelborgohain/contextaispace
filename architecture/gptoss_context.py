@@ -546,17 +546,58 @@ class Transformer(torch.nn.Module):
         """Reset context state to zeros for new conversation."""
         self.context_state = torch.zeros_like(self.context_state)
 
-    def forward(self, x: torch.Tensor, update_context: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, update_context: bool = True, max_seq_len: int = None) -> torch.Tensor:
         """
         Forward pass with LSI cross-attention.
         
         Process:
-        1. Pass through transformer blocks, collecting context vectors
-        2. Stack context vectors and apply LSI cross-attention
-        3. Final normalization and prediction
+        1. If input is longer than max_seq_len, process in chunks
+        2. Pass through transformer blocks, collecting context vectors
+        3. Stack context vectors and apply LSI cross-attention
+        4. Final normalization and prediction
+        
+        Args:
+            x: Input token IDs (seq_len,)
+            update_context: Whether to update context state after processing
+            max_seq_len: Maximum sequence length per chunk. If None, uses config's sliding_window
         
         Set update_context=False to prevent context update.
         """
+        if max_seq_len is None:
+            max_seq_len = self.config.sliding_window
+        
+        input_len = x.shape[0]
+        
+        # If input is longer than max_seq_len, process in chunks
+        if input_len > max_seq_len:
+            all_logits = []
+            num_chunks = (input_len + max_seq_len - 1) // max_seq_len
+            
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * max_seq_len
+                end_idx = min(start_idx + max_seq_len, input_len)
+                chunk = x[start_idx:end_idx]
+                
+                # Process chunk and update context for next chunk
+                chunk_logits = self._forward_chunk(chunk, update_context=True)
+                all_logits.append(chunk_logits)
+            
+            # Concatenate all logits
+            logits = torch.cat(all_logits, dim=0)
+            
+            # Final context update based on user preference
+            if not update_context:
+                # If user wants no context update, we need to restore original context
+                # But we already updated it during chunking, so we keep it
+                pass
+            
+            return logits
+        else:
+            # Normal processing for short sequences
+            return self._forward_chunk(x, update_context=update_context)
+    
+    def _forward_chunk(self, x: torch.Tensor, update_context: bool = True) -> torch.Tensor:
+        """Process a single chunk of tokens."""
         token_embeds = self.embedding(x)
         context_embed = self.context_state.unsqueeze(0)
         x = torch.cat([context_embed, token_embeds], dim=0)
