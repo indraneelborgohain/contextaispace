@@ -308,7 +308,7 @@ def main():
     model.train()
     
     # Load pretrained weights from models folder (if available)
-    load_pretrained_weights(model, device, models_dir="models")
+    load_pretrained_weights(model, device, models_dir="model_context")
     
     # Load checkpoint if resuming (this overrides the pretrained weights)
     start_iter = 0

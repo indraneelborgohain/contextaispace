@@ -486,10 +486,19 @@ class LSICrossAttentionBlock(torch.nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=-1)
         
         # Apply attention to values: attn_weights @ V
-        attn_output = torch.matmul(attn_weights, V_agg)  # (seq_len, lsi_components)
+        attn_output = torch.matmul(attn_weights, V_agg)  # (seq_len, actual_components)
         
         # Project back to hidden_size
-        attn_output = self.from_lsi(attn_output)
+        # Handle variable dimensionality from SVD
+        if actual_components != self.lsi_components:
+            # Create a temporary projection layer for this actual_components size
+            temp_proj = torch.nn.Linear(
+                actual_components, self.hidden_size,
+                device=x.device, dtype=torch.bfloat16
+            )
+            attn_output = temp_proj(attn_output)
+        else:
+            attn_output = self.from_lsi(attn_output)
         
         # Residual connection and normalization
         x = x + self.out_proj(attn_output)
