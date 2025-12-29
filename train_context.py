@@ -61,6 +61,8 @@ def get_args():
     # tensorboard
     ap.add_argument("--use_tensorboard", action="store_true", default=False, help="Enable TensorBoard logging")
     ap.add_argument("--log_dir", type=str, default="runs_context", help="TensorBoard log directory")
+    # model architecture
+    ap.add_argument("--lsi", action="store_true", default=False, help="Enable LSI cross-attention layer")
     return ap.parse_args()
 
 # ------------------------------ helpers --------------------------------------
@@ -118,7 +120,7 @@ def load_pretrained_weights(model, device, models_dir="models"):
         print("No existing model found in models folder. Starting from scratch.")
 
 
-def build_config(name: str, vocab_size: int) -> ModelConfig:
+def build_config(name: str, vocab_size: int, use_lsi: bool = False) -> ModelConfig:
     """Build model configuration based on size"""
     if name == "large":
         return ModelConfig(
@@ -133,6 +135,7 @@ def build_config(name: str, vocab_size: int) -> ModelConfig:
             intermediate_size=2048,
             sliding_window=128,
             initial_context_length=4096,
+            use_lsi_cross_attention=use_lsi,
         )
     elif name == "medium":
         return ModelConfig(
@@ -147,6 +150,7 @@ def build_config(name: str, vocab_size: int) -> ModelConfig:
             intermediate_size=1024,
             sliding_window=128,
             initial_context_length=2048,
+            use_lsi_cross_attention=use_lsi,
         )
     else:  # toy
         return ModelConfig(
@@ -161,6 +165,7 @@ def build_config(name: str, vocab_size: int) -> ModelConfig:
             intermediate_size=512,
             sliding_window=64,
             initial_context_length=1024,
+            use_lsi_cross_attention=use_lsi,
         )
 
 
@@ -292,7 +297,11 @@ def main():
     
     # Create model config
     print(f"Building {args.model_size} model config...")
-    config = build_config(args.model_size, vocab_size)
+    config = build_config(args.model_size, vocab_size, use_lsi=args.lsi)
+    if args.lsi:
+        print("LSI cross-attention layer enabled")
+    else:
+        print("LSI cross-attention layer disabled")
     
     # Save config
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
