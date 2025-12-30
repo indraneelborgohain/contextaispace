@@ -20,34 +20,27 @@ class DocumentDataset(Dataset):
     Dataset that keeps document boundaries intact.
     Each sample is a full document (story) from TinyStories.
     """
-    def __init__(self, documents, tokenizer, max_length=4096):
+    def __init__(self, documents, tokenizer, max_length=None):
         """
         Args:
             documents: List of text documents
             tokenizer: Tokenizer instance
-            max_length: Maximum sequence length per document
+            max_length: Deprecated - kept for compatibility but not used.
+                        Model handles chunking via sliding_window in forward pass.
         """
         self.tokenizer = tokenizer
-        self.max_length = max_length
         self.samples = []
         
         print(f"Tokenizing {len(documents)} documents...")
         for doc in tqdm(documents):
-            # Tokenize each document
+            # Tokenize each document - keep entire document intact
             tokens = tokenizer.encode(doc)
             
-            # If document is longer than max_length, split into chunks
-            # Each chunk is treated as a separate "document" for context purposes
-            if len(tokens) > max_length:
-                for i in range(0, len(tokens) - 1, max_length):
-                    chunk = tokens[i:i + max_length]
-                    if len(chunk) > 1:  # Need at least 2 tokens (input + target)
-                        self.samples.append(torch.tensor(chunk, dtype=torch.long))
-            else:
-                if len(tokens) > 1:  # Need at least 2 tokens
-                    self.samples.append(torch.tensor(tokens, dtype=torch.long))
+            # Only skip documents that are too short
+            if len(tokens) > 1:  # Need at least 2 tokens (input + target)
+                self.samples.append(torch.tensor(tokens, dtype=torch.long))
         
-        print(f"Created {len(self.samples)} document chunks")
+        print(f"Created {len(self.samples)} documents (model will handle chunking)")
 
     def __len__(self):
         return len(self.samples)
@@ -102,16 +95,19 @@ def collate_fn_with_padding(batch):
 
 def create_context_dataloaders(
     batch_size=5,
-    max_length=4096,
+    max_length=None,
     num_workers=4,
     shuffle_train=True
 ):
     """
     Create dataloaders that preserve document boundaries for context-aware training.
     
+    Note: Documents are kept intact. The model's forward() method handles chunking
+    based on its sliding_window parameter.
+    
     Args:
         batch_size: Batch size
-        max_length: Maximum sequence length per document
+        max_length: Deprecated - kept for compatibility but not used
         num_workers: Number of workers for data loading
         shuffle_train: Whether to shuffle training data
     
@@ -132,9 +128,9 @@ def create_context_dataloaders(
     # Get tokenizer
     tokenizer = get_tokenizer()
     
-    # Create datasets
-    train_dataset = DocumentDataset(train_docs, tokenizer, max_length=max_length)
-    val_dataset = DocumentDataset(val_docs, tokenizer, max_length=max_length)
+    # Create datasets - no max_length, model handles chunking
+    train_dataset = DocumentDataset(train_docs, tokenizer)
+    val_dataset = DocumentDataset(val_docs, tokenizer)
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -162,9 +158,9 @@ def create_context_dataloaders(
     return train_loader, val_loader
 
 
-# If run as script, create and test the dataloaders
-if __name__ == "__main__":
-    print("Creating context-aware dataloaders...")
+# Ifprint("Note: Documents are kept intact. Model will handle chunking via sliding_window.\n")
+    train_loader, val_loader = create_context_dataloaders(
+        batch_size=ontext-aware dataloaders...")
     train_loader, val_loader = create_context_dataloaders(
         batch_size=2,
         max_length=512,
