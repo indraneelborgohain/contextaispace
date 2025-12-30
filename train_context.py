@@ -15,8 +15,8 @@ import torch.nn.functional as F
 
 from architecture.gptoss_context import Transformer, ModelConfig
 from architecture.tokenizer import get_tokenizer
-from training.trainer import clear_gpu_memory
-from training.data_loader_context import create_context_dataloaders
+from dataloader.trainer import clear_gpu_memory
+from dataloader.data_loader_context import create_context_dataloaders
 
 try:
     from torch.utils.tensorboard import SummaryWriter

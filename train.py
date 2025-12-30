@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from architecture.gptoss import Transformer, ModelConfig
 from architecture.tokenizer import get_tokenizer
-from training.trainer import clear_gpu_memory
+from dataloader.trainer import clear_gpu_memory
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -226,7 +226,7 @@ def main():
     # Load existing data loaders
     print("Loading data...")
     try:
-        from training.data_loader import train_loader, val_loader
+        from dataloader.data_loader import train_loader, val_loader
         print(f"Loaded train_loader with {len(train_loader)} batches")
         print(f"Loaded val_loader with {len(val_loader)} batches")
     except Exception as e:
