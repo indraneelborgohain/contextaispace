@@ -44,6 +44,7 @@ class ModelConfig:
     rope_ntk_beta: float = 32.0
     lsi_components: int = 64  # Number of LSI latent dimensions
     use_lsi_cross_attention: bool = True  # Enable LSI cross-attention
+    use_context_embedding: bool = True  # Prepend context embedding to input sequence
     
     @property
     def context_dim(self) -> int:
@@ -195,7 +196,7 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
     return attn.reshape(n_tokens, -1)
 
 
-class AttentionBlock(torch.nn.Module):
+class ContextAttentionBlock(torch.nn.Module):
     """
     Context-aware attention block with grouped-query attention.
     Integrates context via projection layer.
@@ -288,7 +289,7 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     return out_glu * (x_linear + 1)
 
 
-class MLPBlock(torch.nn.Module):
+class ContextMLPBlock(torch.nn.Module):
     """
     Context-aware Mixture of Experts MLP block.
     Uses sparse MoE with top-k expert selection.
@@ -375,8 +376,184 @@ class MLPBlock(torch.nn.Module):
         return x + output
 
 
-class TransformerBlock(torch.nn.Module):
+class ContextTransformerBlock(torch.nn.Module):
     """Transformer block with context-aware attention and MLP."""
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_idx: int,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.attn = ContextAttentionBlock(config, layer_idx, device)
+        self.mlp = ContextMLPBlock(config, device)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        x = self.attn(x, context)
+        x = self.mlp(x, context)
+        return x
+
+
+class AttentionBlock(torch.nn.Module):
+    """
+    Standard attention block without context.
+    Grouped-query attention with RoPE.
+    """
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_idx: int = 0,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.head_dim = config.head_dim
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
+        self.sinks = torch.nn.Parameter(
+            torch.empty(config.num_attention_heads, device=device, dtype=torch.bfloat16)
+        )
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        
+        qkv_dim = config.head_dim * (
+            config.num_attention_heads + 2 * config.num_key_value_heads
+        )
+        self.qkv = torch.nn.Linear(
+            config.hidden_size, qkv_dim, device=device, dtype=torch.bfloat16
+        )
+        self.out = torch.nn.Linear(
+            config.head_dim * config.num_attention_heads,
+            config.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        self.sm_scale = 1 / math.sqrt(config.head_dim)
+        self.rope = RotaryEmbedding(
+            config.head_dim,
+            config.rope_theta,
+            torch.float32,
+            initial_context_length=config.initial_context_length,
+            scaling_factor=config.rope_scaling_factor,
+            ntk_alpha=config.rope_ntk_alpha,
+            ntk_beta=config.rope_ntk_beta,
+            device=device,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        t = self.norm(x)
+        qkv = self.qkv(t)
+        q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
+        k = qkv[
+            :,
+            self.num_attention_heads
+            * self.head_dim : (self.num_attention_heads + self.num_key_value_heads)
+            * self.head_dim,
+        ].contiguous()
+        v = qkv[
+            :,
+            (self.num_attention_heads + self.num_key_value_heads)
+            * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
+            * self.head_dim,
+        ].contiguous()
+
+        q = q.view(
+            -1,
+            self.num_key_value_heads,
+            self.num_attention_heads // self.num_key_value_heads,
+            self.head_dim,
+        )
+        k = k.view(-1, self.num_key_value_heads, self.head_dim)
+        v = v.view(-1, self.num_key_value_heads, self.head_dim)
+        q, k = self.rope(q, k)
+        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
+        t = self.out(t)
+        t = x + t
+        return t
+
+
+class MLPBlock(torch.nn.Module):
+    """
+    Standard Mixture of Experts MLP block without context.
+    Uses sparse MoE with top-k expert selection.
+    """
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.experts_per_token = config.experts_per_token
+        self.swiglu_limit = config.swiglu_limit
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        
+        self.gate = torch.nn.Linear(
+            config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16
+        )
+        assert config.intermediate_size % self.world_size == 0
+        
+        self.experts = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(
+                    config.hidden_size, 
+                    config.intermediate_size * 2 // self.world_size, 
+                    device=device, 
+                    dtype=torch.bfloat16
+                ),
+                torch.nn.Linear(
+                    config.intermediate_size // self.world_size, 
+                    config.hidden_size, 
+                    device=device, 
+                    dtype=torch.bfloat16
+                )
+            ) for _ in range(config.num_experts)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len, hidden_size = x.shape
+        
+        t = self.norm(x)
+        g = self.gate(t)
+        
+        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
+        expert_weights = torch.nn.functional.softmax(experts.values, dim=-1)
+        expert_indices = experts.indices
+        
+        t_flat = t.view(-1, hidden_size)
+        expert_indices_flat = expert_indices.view(-1, self.experts_per_token)
+        expert_weights_flat = expert_weights.view(-1, self.experts_per_token)
+        
+        output = torch.zeros_like(t_flat)
+        
+        for expert_idx in range(self.num_experts):
+            mask = (expert_indices_flat == expert_idx).any(dim=-1)
+            if not mask.any():
+                continue
+                
+            token_indices = torch.where(mask)[0]
+            expert_pos = (expert_indices_flat[token_indices] == expert_idx).nonzero(as_tuple=True)[1]
+            
+            expert_input = t_flat[token_indices]
+            weights = expert_weights_flat[token_indices, expert_pos]
+            
+            expert_out = expert_input
+            expert_out = self.experts[expert_idx][0](expert_out)
+            expert_out = swiglu(expert_out, limit=self.swiglu_limit)
+            expert_out = self.experts[expert_idx][1](expert_out)
+            
+            output[token_indices] += expert_out * weights.unsqueeze(-1)
+        
+        if self.world_size > 1:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        
+        output = output.view(seq_len, hidden_size)
+        return x + output
+
+
+class TransformerBlock(torch.nn.Module):
+    """Standard transformer block without context."""
     def __init__(
         self,
         config: ModelConfig,
@@ -388,9 +565,9 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, device)
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x, context)
-        x = self.mlp(x, context)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.attn(x)
+        x = self.mlp(x)
         return x
 
 
@@ -524,12 +701,11 @@ class Transformer(torch.nn.Module):
         self.embedding = torch.nn.Embedding(
             config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
         )
-        self.block = torch.nn.ModuleList(
-            [
-                TransformerBlock(config, layer_idx, device)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
+        # First block is context-aware, rest are standard
+        self.block = torch.nn.ModuleList()
+        self.block.append(ContextTransformerBlock(config, 0, device))
+        for layer_idx in range(1, config.num_hidden_layers):
+            self.block.append(TransformerBlock(config, layer_idx, device))
         
         # LSI cross-attention block
         if config.use_lsi_cross_attention:
@@ -608,18 +784,32 @@ class Transformer(torch.nn.Module):
     def _forward_chunk(self, x: torch.Tensor, update_context: bool = True) -> torch.Tensor:
         """Process a single chunk of tokens."""
         token_embeds = self.embedding(x)
-        context_embed = self.context_state.unsqueeze(0)
-        x = torch.cat([context_embed, token_embeds], dim=0)
+        
+        # Optionally prepend context embedding
+        if self.config.use_context_embedding:
+            context_embed = self.context_state.unsqueeze(0)
+            x = torch.cat([context_embed, token_embeds], dim=0)
+            context_offset = 1  # Account for prepended context
+        else:
+            x = token_embeds
+            context_offset = 0  # No context prepended
+        
+        # Pass context to first block, then use standard blocks
         context = self.context_state.unsqueeze(0).expand(x.shape[0], -1)
         
         # Collect context vectors from each transformer block
         if self.lsi_cross_attn is not None:
             context_vectors = []
         
-        for block in self.block:
-            x = block(x, context)
+        # First block with context
+        x = self.block[0](x, context)
+        if self.lsi_cross_attn is not None:
+            context_vectors.append(x.clone())
+        
+        # Remaining blocks without context
+        for i in range(1, len(self.block)):
+            x = self.block[i](x)
             if self.lsi_cross_attn is not None:
-                # Store the output of this block for LSI processing
                 context_vectors.append(x.clone())
         
         # Apply LSI cross-attention if enabled
@@ -629,7 +819,13 @@ class Transformer(torch.nn.Module):
             x = self.lsi_cross_attn(x, context_stack)
         
         x = self.norm(x)
-        x_tokens = x[1:]
+        
+        # Remove context embedding if it was prepended
+        if context_offset > 0:
+            x_tokens = x[context_offset:]
+        else:
+            x_tokens = x
+        
         logits = self.unembedding(x_tokens)
         
         if update_context and x_tokens.shape[0] > 0:
