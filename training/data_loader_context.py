@@ -171,14 +171,79 @@ if __name__ == "__main__":
         num_workers=0  # Use 0 for testing
     )
     
-    print("\nTesting train_loader...")
-    for i, (inputs, targets, doc_starts, lengths) in enumerate(train_loader):
-        print(f"Batch {i}:")
-        print(f"  Input shape: {inputs.shape}")
-        print(f"  Target shape: {targets.shape}")
-        print(f"  Doc starts: {doc_starts}")
-        print(f"  Lengths: {lengths}")
-        if i >= 2:
+    # Get tokenizer for decoding
+    tokenizer = get_tokenizer()
+    
+    print("\nTesting train_loader with detailed debug output...")
+    print("=" * 80)
+    
+    for batch_idx, (inputs, targets, doc_starts, lengths) in enumerate(train_loader):
+        print(f"\n{'='*80}")
+        print(f"BATCH {batch_idx}")
+        print(f"{'='*80}")
+        print(f"Batch input shape: {inputs.shape}")
+        print(f"Batch target shape: {targets.shape}")
+        print(f"Document starts: {doc_starts.tolist()}")
+        print(f"Sequence lengths: {lengths.tolist()}")
+        
+        # Examine each sequence in the batch
+        for seq_idx in range(inputs.shape[0]):
+            print(f"\n{'-'*80}")
+            print(f"Sequence {seq_idx} in batch:")
+            print(f"  Is document start: {doc_starts[seq_idx].item()}")
+            print(f"  Length: {lengths[seq_idx].item()}")
+            
+            seq_input = inputs[seq_idx]
+            seq_target = targets[seq_idx]
+            seq_len = lengths[seq_idx].item()
+            
+            # Get actual tokens (without padding)
+            actual_input = seq_input[:seq_len]
+            actual_target = seq_target[:seq_len]
+            
+            print(f"\n  Input tokens (first 30): {actual_input[:30].tolist()}")
+            print(f"  Target tokens (first 30): {actual_target[:30].tolist()}")
+            
+            # Verify input[i+1] == target[i]
+            print(f"\n  Verification: input[1:] should match target[:-1]")
+            if seq_len > 1:
+                matches = (actual_input[1:] == actual_target[:-1]).all()
+                print(f"  Match: {matches.item()}")
+                if not matches.item():
+                    print("  WARNING: Input/target mismatch detected!")
+            
+            # Decode text
+            print(f"\n  Decoded input text (first 200 chars):")
+            input_text = tokenizer.decode(actual_input.tolist())
+            print(f"  {repr(input_text[:200])}")
+            
+            print(f"\n  Decoded target text (first 200 chars):")
+            target_valid = actual_target[actual_target != -100]
+            if len(target_valid) > 0:
+                target_text = tokenizer.decode(target_valid.tolist())
+                print(f"  {repr(target_text[:200])}")
+            
+            # Show the offset
+            print(f"\n  Token offset demonstration (first 10 positions):")
+            print(f"  Position | Input Token ID | Input Token Text         | Target Token ID | Target Token Text")
+            print(f"  {'-'*100}")
+            for pos in range(min(10, seq_len)):
+                inp_tok = actual_input[pos].item()
+                tgt_tok = actual_target[pos].item()
+                
+                # Decode individual tokens
+                inp_text = tokenizer.decode([inp_tok])
+                tgt_text = tokenizer.decode([tgt_tok]) if tgt_tok != -100 else "<PAD>"
+                
+                # Truncate text if too long
+                inp_text = inp_text[:20] if len(inp_text) <= 20 else inp_text[:17] + "..."
+                tgt_text = tgt_text[:20] if len(tgt_text) <= 20 else tgt_text[:17] + "..."
+                
+                print(f"  {pos:8d} | {inp_tok:14d} | {repr(inp_text):24s} | {tgt_tok:15d} | {repr(tgt_text):20s}")
+        
+        print(f"\n{'='*80}")
+        
+        if batch_idx >= 2:  # Show first 3 batches
             break
     
     print("\nDataloader test complete!")
