@@ -158,12 +158,12 @@ def create_context_dataloaders(
     return train_loader, val_loader
 
 
-# Ifprint("Note: Documents are kept intact. Model will handle chunking via sliding_window.\n")
-    train_loader, val_loader = create_context_dataloaders(
-        batch_size=ontext-aware dataloaders...")
+# If run as script, create and test the dataloaders
+if __name__ == "__main__":
+    print("Creating context-aware dataloaders...")
+    print("Note: Documents are kept intact. Model will handle chunking via sliding_window.\n")
     train_loader, val_loader = create_context_dataloaders(
         batch_size=2,
-        max_length=512,
         num_workers=0  # Use 0 for testing
     )
     
