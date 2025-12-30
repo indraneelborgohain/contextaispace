@@ -726,6 +726,12 @@ class Transformer(torch.nn.Module):
             'context_state',
             torch.zeros(config.hidden_size, device=device, dtype=torch.bfloat16)
         )
+        
+        # Learnable <start> token embedding for short sequences
+        if config.use_context_embedding:
+            self.start_token_embedding = torch.nn.Parameter(
+                torch.randn(config.hidden_size, device=device, dtype=torch.bfloat16) * 0.02
+            )
 
     def reset_context(self):
         """Reset context state to zeros for new conversation."""
@@ -785,17 +791,28 @@ class Transformer(torch.nn.Module):
         """Process a single chunk of tokens."""
         token_embeds = self.embedding(x)
         
-        # Optionally prepend context embedding
+        # Always prepend a token at the beginning of each sequence
         if self.config.use_context_embedding:
-            context_embed = self.context_state.unsqueeze(0)
-            x = torch.cat([context_embed, token_embeds], dim=0)
-            context_offset = 1  # Account for prepended context
+            # Use learnable <start> token for all sequences at the beginning
+            # For long sequences (> sliding_window), replace with context_state
+            if x.shape[0] > self.config.sliding_window:
+                # Long sequence: use context from previous sequence
+                prepend_embed = self.context_state.unsqueeze(0)
+                context_vector = self.context_state
+            else:
+                # Normal sequence: use learnable <start> token
+                prepend_embed = self.start_token_embedding.unsqueeze(0)
+                context_vector = self.start_token_embedding
+            
+            x = torch.cat([prepend_embed, token_embeds], dim=0)
+            context_offset = 1  # Account for prepended token
         else:
             x = token_embeds
-            context_offset = 0  # No context prepended
+            context_offset = 0  # No token prepended
+            context_vector = self.context_state
         
         # Pass context to first block, then use standard blocks
-        context = self.context_state.unsqueeze(0).expand(x.shape[0], -1)
+        context = context_vector.unsqueeze(0).expand(x.shape[0], -1)
         
         # Collect context vectors from each transformer block
         if self.lsi_cross_attn is not None:
