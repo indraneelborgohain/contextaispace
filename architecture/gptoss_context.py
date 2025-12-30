@@ -769,8 +769,9 @@ class Transformer(torch.nn.Module):
                 end_idx = min(start_idx + max_seq_len, input_len)
                 chunk = x[start_idx:end_idx]
                 
-                # Process chunk and update context for next chunk
-                chunk_logits = self._forward_chunk(chunk, update_context=True)
+                # First chunk gets start token, subsequent chunks use context from previous
+                is_first_chunk = (chunk_idx == 0)
+                chunk_logits = self._forward_chunk(chunk, update_context=True, is_first_chunk=is_first_chunk)
                 all_logits.append(chunk_logits)
             
             # Concatenate all logits
@@ -784,25 +785,25 @@ class Transformer(torch.nn.Module):
             
             return logits
         else:
-            # Normal processing for short sequences
-            return self._forward_chunk(x, update_context=update_context)
+            # Normal processing for short sequences - this is always a first chunk
+            return self._forward_chunk(x, update_context=update_context, is_first_chunk=True)
     
-    def _forward_chunk(self, x: torch.Tensor, update_context: bool = True) -> torch.Tensor:
+    def _forward_chunk(self, x: torch.Tensor, update_context: bool = True, is_first_chunk: bool = False) -> torch.Tensor:
         """Process a single chunk of tokens."""
         token_embeds = self.embedding(x)
         
         # Always prepend a token at the beginning of each sequence
         if self.config.use_context_embedding:
-            # Use learnable <start> token for all sequences at the beginning
-            # For long sequences (> sliding_window), replace with context_state
-            if x.shape[0] > self.config.sliding_window:
-                # Long sequence: use context from previous sequence
-                prepend_embed = self.context_state.unsqueeze(0)
-                context_vector = self.context_state
-            else:
-                # Normal sequence: use learnable <start> token
+            # Use learnable <start> token only for the first chunk of a new sequence
+            # For subsequent chunks, use context_state from previous chunk
+            if is_first_chunk:
+                # First chunk: use learnable <start> token
                 prepend_embed = self.start_token_embedding.unsqueeze(0)
                 context_vector = self.start_token_embedding
+            else:
+                # Continuation chunk: use context from previous chunk/sequence
+                prepend_embed = self.context_state.unsqueeze(0)
+                context_vector = self.context_state
             
             x = torch.cat([prepend_embed, token_embeds], dim=0)
             context_offset = 1  # Account for prepended token
