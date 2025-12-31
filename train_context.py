@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train_context.py - Training script for context-aware gptoss_context.py model
+train_context.py - Training script for context-aware transformer.py model
 Key feature: Resets context vector at document boundaries
 """
 import argparse
@@ -13,7 +13,8 @@ import datetime
 import torch
 import torch.nn.functional as F
 
-from architecture.gptoss_context import Transformer, ModelConfig
+from architecture.transformer import Transformer
+from architecture.config import ModelConfig
 from architecture.tokenizer import get_tokenizer
 from dataloader.trainer import clear_gpu_memory
 from dataloader.data_loader_context import create_context_dataloaders
