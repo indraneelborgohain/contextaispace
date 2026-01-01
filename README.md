@@ -498,4 +498,8 @@ answer = tokenizer.decode(tokens.tolist())
 print(answer)  # Output: "<Q> Where is the Eiffel Tower? <SEP> Paris, France"
 ```
 
----
+python train_encoder_decoder_stories.py \
+  --model_size medium \
+  --pretrained_decoder_path "model_context/checkpoint_5000.pt" \
+  --use_lsi_compression \
+ 

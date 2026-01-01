@@ -39,7 +39,7 @@ def get_args():
     # training
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--block_size", type=int, default=512)
-    ap.add_argument("--encoder_chunk_size", type=int, default=256, help="Size of encoder context chunks")
+    ap.add_argument("--encoder_chunk_size", type=int, default=512, help="Size of encoder context chunks (should match block_size)")
     ap.add_argument("--max_iters", type=int, default=5000)
     ap.add_argument("--log_interval", type=int, default=10)
     ap.add_argument("--eval_interval", type=int, default=150)
