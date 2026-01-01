@@ -39,13 +39,16 @@
 ## Key Improvements of GPT-OSS over GPT-2
 
 ### 🏗️ Architecture Enhancements
-- **Mixture of Experts (MoE) in MLP** with a Router → Sparse experts active per token (big model capacity, low active FLOPs)
+- **Mixture of Experts (MoE) in MLP** with Router → Sparse experts active per token (big model capacity, low active FLOPs)
 - **Gated Router** → Token-dependent routing to experts (shown inside MoE block)
 - **SwiGLU Feed-Forward (FFN) modules** → Modern activation in FFN instead of GELU
-- **Grouped Query Attention + RoPE** → Alternate attention that supports longer context and stable queries
-- **Sliding Window Attention** → Efficient attention pattern that reduces computation while maintaining context
+- **Grouped Query Attention (GQA) + RoPE** → Efficient multi-head attention with rotary embeddings for longer context
+- **Sliding Window Attention** → Reduces computation while maintaining context (alternating layers)
 - **Sink Slots in Attention** → Learned aggregation slots for global context stability
-- **RMSNorm** → More stable normalization layer
+- **RMSNorm** → More stable normalization layer (replaces LayerNorm)
+- **Encoder-Decoder Architecture** → NEW! Bidirectional encoder with causal decoder for Q&A tasks
+- **SVD Compression** → Efficient encoder output compression for cross-attention
+- **Cross-Attention Layers** → Decoder attends to encoder representations
 
 ### 📊 Performance Improvements
 - **Lower Training Loss** → Better convergence during training
@@ -111,10 +114,10 @@ pip install -r requirements.txt
 
 ## 🏋️ Training
 
-The system will automatically detect and utilize available GPU resources. We provide two model variants:
+The system will automatically detect and utilize available GPU resources. We provide three training variants:
 
-### 🔹 Standard Model (gptoss.py)
-Traditional transformer architecture with MoE and sliding window attention.
+### 🔹 Standard Decoder (train.py)
+Traditional decoder-only transformer architecture with MoE and sliding window attention.
 
 **Training:**
 ```bash
@@ -130,8 +133,8 @@ python train.py --model_size toy --batch_size 8 --block_size 512 --lr 3e-4
 
 **Available model sizes:** `toy`, `medium`, `large`
 
-### 🔹 Context-Aware Model (gptoss_context.py)
-**NEW!** Enhanced transformer with persistent context vector that maintains memory across predictions within documents.
+### 🔹 Context-Aware Decoder (train_context.py)
+**Enhanced transformer with persistent context vector** that maintains memory across predictions within documents.
 
 **Key Features:**
 - Context vector automatically resets at document boundaries
@@ -143,11 +146,11 @@ python train.py --model_size toy --batch_size 8 --block_size 512 --lr 3e-4
 # Basic training
 python train_context.py
 
-# Medium model with TensorBoard
-python train_context.py --model_size medium --max_iters 5000 --use_tensorboard
+# Medium model with TensorBoard and LSI cross-attention
+python train_context.py --model_size medium --lsi --use_tensorboard
 
-# Custom configuration
-python train_context.py --model_size toy --batch_size 4 --block_size 1024
+# Custom configuration with context embedding
+python train_context.py --model_size toy --batch_size 4 --context-embed
 ```
 
 **How it works:**
@@ -156,25 +159,77 @@ python train_context.py --model_size toy --batch_size 4 --block_size 1024
 - Automatically updates with last token output
 - Resets to zero at the start of each new document/story
 
+### 🔹 Encoder-Decoder for Question Answering (train_squad.py)
+**NEW!** Encoder-decoder architecture with cross-attention for extractive question answering on SQuAD dataset.
+
+**Architecture:**
+- **Encoder**: Bidirectional attention over context passages (SVD compression for efficiency)
+- **Decoder**: Causal generation with cross-attention to encoder
+- **Training**: Loss computed only on answer tokens (questions masked)
+
+**Training from scratch:**
+```bash
+# Basic toy model
+python train_squad.py --model_size toy --batch_size 4 --max_iters 10000
+
+# Medium model with longer contexts
+python train_squad.py --model_size medium --batch_size 8 --max_context_len 512 --max_qa_len 128
+```
+
+**Fine-tuning with pretrained decoder:**
+```bash
+# Load TinyStories pretrained weights, fine-tune on SQuAD
+python train_squad.py \
+  --model_size small \
+  --pretrained_decoder_path "out/tinystories_checkpoint.pt" \
+  --decoder_lr 1e-5 \
+  --new_layers_lr 3e-4 \
+  --batch_size 8 \
+  --max_iters 10000 \
+  --use_tensorboard
+
+# Fine-tune with custom learning rates
+python train_squad.py \
+  --pretrained_decoder_path "model/checkpoint_5000.pt" \
+  --decoder_lr 5e-6 \
+  --new_layers_lr 1e-3 \
+  --out_dir model_squad_finetuned
+```
+
+**What gets loaded vs trained:**
+- ✓ **Loaded**: Pretrained decoder (embeddings, self-attention, MLPs)
+- ✗ **Trained from scratch**: Encoder (all layers), cross-attention layers
+
+**Key arguments:**
+- `--pretrained_decoder_path`: Path to decoder checkpoint (optional)
+- `--decoder_lr`: Lower LR for pretrained decoder layers (preserves knowledge)
+- `--new_layers_lr`: Higher LR for encoder + cross-attention (fast adaptation)
+- `--max_context_len`: Maximum context passage length (default: 512)
+- `--max_qa_len`: Maximum question+answer length (default: 128)
+
 ### 📊 Monitoring Training
 
 **TensorBoard (Recommended):**
 ```bash
-# Start training with TensorBoard
+# Standard decoder
 python train.py --use_tensorboard
-
-# View logs in another terminal
 tensorboard --logdir=runs
 
-# For context model
+# Context-aware decoder
+python train_context.py --use_tensorboard
 tensorboard --logdir=runs_context
+
+# Encoder-decoder (SQuAD)
+python train_squad.py --use_tensorboard
+tensorboard --logdir=runs_squad
 ```
 
 **Training outputs:**
 - Standard model: `model/` directory
 - Context model: `model_context/` directory
-- Checkpoints saved every 500 iterations
-- Config saved as `config.json`
+- SQuAD model: `model_squad/` directory (default)
+- Checkpoints saved every 500-1000 iterations
+- Config saved as `config.json` (encoder_config.json + decoder_config.json for SQuAD)
 
 
 ### Why nano GPT-OSS is better than nano GPT2
@@ -330,54 +385,117 @@ python architecture/open-gpt-oss/download_weights.py --output_dir gpt_oss_weight
 ## 📁 Project Structure
 
 ```
-chatspace/
-├── train.py                      # Standard model training script
-├── train_context.py              # Context-aware model training script
+contextaispace/
+├── train.py                      # Standard decoder training script
+├── train_context.py              # Context-aware decoder training script
+├── train_squad.py                # Encoder-decoder Q&A training (NEW!)
 ├── inference.py                  # Inference utilities
 ├── server.py                     # Streamlit web interface
 ├── requirements.txt              # Python dependencies
 │
 ├── architecture/
-│   ├── gptoss.py                # Standard transformer architecture
-│   ├── gptoss_context.py        # Context-aware transformer (NEW!)
+│   ├── transformer.py           # Main decoder (renamed from gptoss_context.py)
+│   ├── encoder.py               # Bidirectional encoder with SVD compression (NEW!)
+│   ├── attention_components.py  # Shared attention modules (NEW!)
+│   ├── config.py                # ModelConfig dataclass (NEW!)
+│   ├── token_generator.py       # Token generation interface (NEW!)
 │   ├── tokenizer.py             # Tokenizer utilities
+│   ├── gpt2.py                  # GPT-2 baseline model
+│   ├── gptoss.py                # Standard GPT-OSS decoder
 │   └── open-gpt-oss/
 │       ├── download_weights.py  # Download pre-trained models
 │       └── model.py             # GPT-OSS 20B model
 │
-└── training/
-    ├── data_loader.py           # Standard data loader
-    ├── data_loader_context.py   # Document-aware data loader (NEW!)
-    └── trainer.py               # Training utilities
+├── training/
+│   ├── data_loader.py           # Standard data loader
+│   ├── data_loader_context.py   # Document-aware data loader
+│   └── trainer.py               # Training utilities
+│
+└── test/                         # Test suite (NEW!)
+    ├── test_encoder_decoder.py  # Integration tests
+    ├── test_squad_workflow.py   # End-to-end SQuAD tests
+    ├── test_components.py       # Component unit tests
+    ├── run_all_tests.py         # Test runner
+    └── README.md                # Test documentation
 ```
 
 ---
 
 ## 🎯 Quick Start Examples
 
-### Example 1: Train a toy model quickly
+### Example 1: Train a toy decoder quickly
 ```bash
 python train.py --model_size toy --max_iters 1000 --use_tensorboard
 ```
 
 ### Example 2: Train context-aware model for coherent stories
 ```bash
-python train_context.py --model_size medium --batch_size 4 --use_tensorboard
+python train_context.py --model_size medium --batch_size 4 --lsi --use_tensorboard
 ```
 
-### Example 3: Launch web interface
+### Example 3: Train encoder-decoder on SQuAD from scratch
+```bash
+python train_squad.py --model_size small --batch_size 8 --max_iters 10000 --use_tensorboard
+```
+
+### Example 4: Fine-tune pretrained decoder on SQuAD
+```bash
+python train_squad.py \
+  --model_size small \
+  --pretrained_decoder_path "out/tinystories_checkpoint.pt" \
+  --decoder_lr 1e-5 \
+  --new_layers_lr 3e-4 \
+  --batch_size 8 \
+  --use_tensorboard
+```
+
+### Example 5: Launch web interface
 ```bash
 streamlit run server.py
 ```
 
-### Example 4: Generate text programmatically
+### Example 6: Generate text programmatically
 ```python
 from inference import generate_text
-from architecture.gptoss import Transformer
+from architecture.transformer import Transformer
 
 model = Transformer.from_checkpoint("model/checkpoint_5000.pt", device="cuda:0")
 text = generate_text(model, "Once upon a time", max_tokens=100, temperature=0.8)
 print(text)
+```
+
+### Example 7: Question Answering with encoder-decoder
+```python
+from architecture.encoder import BidirectionalEncoder
+from architecture.transformer import Transformer
+from architecture.tokenizer import get_tokenizer
+import torch
+
+# Load models
+tokenizer = get_tokenizer()
+encoder = BidirectionalEncoder.from_checkpoint("model_squad/checkpoint_10000.pt")
+decoder = Transformer.from_checkpoint("model_squad/checkpoint_10000.pt")
+
+# Encode context
+context = "The Eiffel Tower is located in Paris, France."
+context_tokens = torch.tensor(tokenizer.encode(context), device="cuda:0")
+encoder_k, encoder_v = encoder(context_tokens, return_compressed_kv=True)
+
+# Generate answer
+question = "Where is the Eiffel Tower?"
+q_tokens = tokenizer.encode("<Q>") + tokenizer.encode(question) + tokenizer.encode("<SEP>")
+tokens = torch.tensor(q_tokens, device="cuda:0")
+
+decoder.reset_context()
+for _ in range(20):  # Generate up to 20 answer tokens
+    logits = decoder(tokens, encoder_k=encoder_k, encoder_v=encoder_v)
+    next_token = torch.argmax(logits[-1]).item()
+    tokens = torch.cat([tokens, torch.tensor([next_token], device="cuda:0")])
+    if next_token == 0:  # Stop at EOS
+        break
+
+answer = tokenizer.decode(tokens.tolist())
+print(answer)  # Output: "<Q> Where is the Eiffel Tower? <SEP> Paris, France"
 ```
 
 ---

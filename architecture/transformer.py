@@ -452,106 +452,6 @@ class CrossAttentionLayer(torch.nn.Module):
         return residual + output
 
 
-class EncoderDecoderCrossAttention(torch.nn.Module):
-    """
-    Cross-attention layer between encoder and decoder context embeddings.
-    
-    Operates on chunk-level context vectors:
-    - Q: decoder context embeddings (num_decoder_chunks, hidden_size)
-    - K, V: encoder context embeddings (num_encoder_chunks, hidden_size)
-    """
-    def __init__(
-        self,
-        config: ModelConfig,
-        device: torch.device | None = None,
-    ):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        
-        assert self.hidden_size == self.num_heads * self.head_dim
-        
-        # Q projection (from decoder contexts)
-        self.q_proj = torch.nn.Linear(
-            config.hidden_size, 
-            self.num_heads * self.head_dim,
-            device=device,
-            dtype=torch.bfloat16
-        )
-        
-        # K, V projections (from encoder contexts)
-        self.k_proj = torch.nn.Linear(
-            config.hidden_size,
-            self.num_heads * self.head_dim,
-            device=device,
-            dtype=torch.bfloat16
-        )
-        self.v_proj = torch.nn.Linear(
-            config.hidden_size,
-            self.num_heads * self.head_dim,
-            device=device,
-            dtype=torch.bfloat16
-        )
-        
-        # Output projection
-        self.out_proj = torch.nn.Linear(
-            self.num_heads * self.head_dim,
-            config.hidden_size,
-            device=device,
-            dtype=torch.bfloat16
-        )
-        
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-    
-    def forward(
-        self, 
-        decoder_contexts: torch.Tensor, 
-        encoder_contexts: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Cross-attention between decoder and encoder context embeddings.
-        
-        Args:
-            decoder_contexts: Decoder chunk contexts (num_decoder_chunks, hidden_size)
-            encoder_contexts: Encoder chunk contexts (num_encoder_chunks, hidden_size)
-        
-        Returns:
-            Cross-attended decoder contexts (num_decoder_chunks, hidden_size)
-        """
-        num_dec_chunks = decoder_contexts.shape[0]
-        num_enc_chunks = encoder_contexts.shape[0]
-        
-        # Project to Q, K, V
-        Q = self.q_proj(decoder_contexts)  # (num_dec_chunks, num_heads * head_dim)
-        K = self.k_proj(encoder_contexts)  # (num_enc_chunks, num_heads * head_dim)
-        V = self.v_proj(encoder_contexts)  # (num_enc_chunks, num_heads * head_dim)
-        
-        # Reshape for multi-head attention
-        # (num_chunks, num_heads, head_dim)
-        Q = Q.view(num_dec_chunks, self.num_heads, self.head_dim)
-        K = K.view(num_enc_chunks, self.num_heads, self.head_dim)
-        V = V.view(num_enc_chunks, self.num_heads, self.head_dim)
-        
-        # Compute attention: (num_dec_chunks, num_heads, num_enc_chunks)
-        attn_scores = torch.einsum('qhd,khd->qhk', Q, K) * self.scale
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        
-        # Apply attention to values: (num_dec_chunks, num_heads, head_dim)
-        attn_output = torch.einsum('qhk,khd->qhd', attn_weights, V)
-        
-        # Reshape and project back
-        attn_output = attn_output.reshape(num_dec_chunks, self.num_heads * self.head_dim)
-        attn_output = self.out_proj(attn_output)
-        
-        # Residual connection and normalization
-        output = decoder_contexts + attn_output
-        output = self.norm(output)
-        
-        return output
-
-
 class Transformer(torch.nn.Module):
     """
     Context-aware GPT model where output from previous prediction is fed back as input.
@@ -584,12 +484,6 @@ class Transformer(torch.nn.Module):
             )
         else:
             self.lsi_cross_attn = None
-        
-        # Encoder-decoder cross-attention block
-        if config.use_encoder_decoder_cross_attention:
-            self.enc_dec_cross_attn = EncoderDecoderCrossAttention(config, device)
-        else:
-            self.enc_dec_cross_attn = None
         
         self.norm = RMSNorm(config.hidden_size, device=device)
         self.unembedding = torch.nn.Linear(

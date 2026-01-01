@@ -37,6 +37,8 @@ class EncoderConfig:
     rope_ntk_beta: float = 32.0
     dropout: float = 0.1
     use_moe: bool = False  # Use Mixture of Experts or standard FFN
+    use_lsi_compression: bool = False  # Use LSI cross-attention for compression instead of SVD
+    num_compression_slots: int = 64  # Number of latent slots for LSI compression
 
 
 def bidirectional_sdpa(Q, K, V, sm_scale, attention_mask=None):
@@ -215,6 +217,112 @@ class EncoderMLPBlock(nn.Module):
         return x + t
 
 
+class LSICompressionLayer(nn.Module):
+    """
+    LSI Cross-Attention Compression Layer.
+    Compresses variable-length encoder outputs to fixed-size representation using
+    learnable latent slots that attend to the full encoder output.
+    """
+    def __init__(
+        self,
+        config: EncoderConfig,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_slots = config.num_compression_slots
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        
+        # Learnable latent slots - these learn to "query" for important information
+        self.latent_slots = nn.Parameter(
+            torch.randn(config.num_compression_slots, config.hidden_size, device=device, dtype=torch.bfloat16) * 0.02
+        )
+        
+        # Projection layers for cross-attention
+        self.query_proj = nn.Linear(
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        self.key_proj = nn.Linear(
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        self.value_proj = nn.Linear(
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        self.out_proj = nn.Linear(
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        self.dropout = nn.Dropout(config.dropout)
+        
+        self.sm_scale = 1 / math.sqrt(config.head_dim)
+    
+    def forward(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        """
+        Compress encoder output using LSI cross-attention.
+        
+        Args:
+            encoder_output: Full encoder output (seq_len, hidden_size)
+        
+        Returns:
+            Compressed output (num_slots, hidden_size)
+        """
+        seq_len, hidden_size = encoder_output.shape
+        
+        # Normalize encoder output
+        encoder_output = self.norm(encoder_output)
+        
+        # Expand latent slots (no batch dimension here, single sequence)
+        Q_input = self.latent_slots  # (num_slots, hidden_size)
+        
+        # Project to Q, K, V
+        Q = self.query_proj(Q_input)  # (num_slots, num_heads * head_dim)
+        K = self.key_proj(encoder_output)  # (seq_len, num_heads * head_dim)
+        V = self.value_proj(encoder_output)  # (seq_len, num_heads * head_dim)
+        
+        # Reshape for multi-head attention
+        Q = Q.view(self.num_slots, self.num_heads, self.head_dim)  # (num_slots, num_heads, head_dim)
+        K = K.view(seq_len, self.num_heads, self.head_dim)  # (seq_len, num_heads, head_dim)
+        V = V.view(seq_len, self.num_heads, self.head_dim)  # (seq_len, num_heads, head_dim)
+        
+        # Compute attention scores: Q @ K^T
+        # Q: (num_slots, num_heads, head_dim)
+        # K: (seq_len, num_heads, head_dim)
+        scores = torch.einsum("qhd,khd->hqk", Q, K)  # (num_heads, num_slots, seq_len)
+        scores = scores * self.sm_scale
+        
+        # Softmax over seq_len dimension (each slot attends to all encoder tokens)
+        attn_weights = torch.softmax(scores, dim=-1)  # (num_heads, num_slots, seq_len)
+        
+        # Apply attention to values
+        # attn_weights: (num_heads, num_slots, seq_len)
+        # V: (seq_len, num_heads, head_dim)
+        output = torch.einsum("hqk,khd->qhd", attn_weights, V)  # (num_slots, num_heads, head_dim)
+        
+        # Reshape and project
+        output = output.reshape(self.num_slots, self.num_heads * self.head_dim)  # (num_slots, num_heads * head_dim)
+        output = self.out_proj(output)  # (num_slots, hidden_size)
+        output = self.dropout(output)
+        
+        # Residual connection with latent slots
+        output = self.latent_slots + output
+        
+        return output
+
+
 class EncoderMoEBlock(nn.Module):
     """
     Mixture of Experts MLP block for encoder.
@@ -341,6 +449,7 @@ class BidirectionalEncoder(nn.Module):
     - Masked language modeling
     
     Supports chunking for long sequences with context embedding propagation.
+    Supports LSI cross-attention compression for fixed-size encoder output.
     """
     def __init__(
         self,
@@ -360,6 +469,25 @@ class BidirectionalEncoder(nn.Module):
             EncoderBlock(config, layer_idx, device)
             for layer_idx in range(config.num_hidden_layers)
         ])
+        
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        
+        # LSI compression layer (optional)
+        if config.use_lsi_compression:
+            self.lsi_compression = LSICompressionLayer(config, device=device)
+        else:
+            self.lsi_compression = None
+        
+        # Learnable start token embedding for chunking
+        self.start_token_embedding = nn.Parameter(
+            torch.randn(config.hidden_size, device=device, dtype=torch.bfloat16) * 0.02
+        )
+        
+        # Buffer for context from previous chunk
+        self.register_buffer(
+            'chunk_context',
+            torch.zeros(config.hidden_size, device=device, dtype=torch.bfloat16)
+        )
         
         self.norm = RMSNorm(config.hidden_size, device=device)
         
@@ -630,17 +758,16 @@ class BidirectionalEncoder(nn.Module):
         # Stack all outputs: (total_tokens, hidden_size)
         stacked_outputs = torch.cat(all_outputs, dim=0)  # (seq_len, hidden_size)
         
-        # Generate Q, K, V from stacked outputs
-        # For simplicity, we use the outputs directly as Q, K, V
-        # In practice, you might want projection layers
-        Q = stacked_outputs  # (seq_len, hidden_size)
-        K = stacked_outputs  # (seq_len, hidden_size)
-        V = stacked_outputs  # (seq_len, hidden_size)
-        
-        # Apply SVD compression to reduce from seq_len to chunk_size
-        # SVD on K: K = U @ S @ V^T, we keep top chunk_size components
-        K_compressed = self._compress_with_svd(K, chunk_size)  # (chunk_size, hidden_size)
-        V_compressed = self._compress_with_svd(V, chunk_size)  # (chunk_size, hidden_size)
+        # Apply compression
+        if self.config.use_lsi_compression:
+            # Use LSI cross-attention for learned compression
+            compressed = self.lsi_compression(stacked_outputs)  # (num_slots, hidden_size)
+            K_compressed = compressed
+            V_compressed = compressed
+        else:
+            # Use SVD for deterministic compression
+            K_compressed = self._compress_with_svd(stacked_outputs, chunk_size)  # (chunk_size, hidden_size)
+            V_compressed = self._compress_with_svd(stacked_outputs, chunk_size)  # (chunk_size, hidden_size)
         
         return K_compressed, V_compressed
     
