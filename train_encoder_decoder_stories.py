@@ -74,7 +74,7 @@ def get_args():
     ap.add_argument("--log_dir", type=str, default="runs_enc_dec_stories")
     # encoder compression
     ap.add_argument("--use_lsi_compression", action="store_true", default=False, help="Use LSI cross-attention for encoder compression instead of SVD")
-    ap.add_argument("--num_compression_slots", type=int, default=64, help="Number of latent slots for LSI compression")
+    ap.add_argument("--num_compression_slots", type=int, default=None, help="Number of latent slots for LSI compression (defaults to block_size if not specified)")
     return ap.parse_args()
 
 # ------------------------------ pretrained loading --------------------------
@@ -299,11 +299,21 @@ def get_lr(it: int, warmup_iters: int, max_iters: int, lr: float, min_lr: float)
 
 @torch.no_grad()
 def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encoder_chunk_size):
-    """Evaluate encoder-decoder on validation data"""
+    """Evaluate encoder-decoder on validation data
+    
+    Architecture flow:
+    1. Encoder: Processes entire document context, compresses to fixed sequence length (block_size)
+    2. Decoder: Generates current sequence, attending to fixed-length encoder K/V
+    
+    For each document:
+    - First sequence: Split it (first half -> encoder, second half -> decoder)
+    - Subsequent sequences: Encoder gets full document, decoder generates current sequence
+    """
     encoder.eval()
     decoder.eval()
     
     losses = []
+    document_context = []  # Accumulate all sequences from current document
     
     for i, batch in enumerate(val_loader):
         if i >= eval_iters:
@@ -315,10 +325,6 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
         
         batch_losses = []
         for j in range(inputs.shape[0]):
-            if doc_starts[j]:
-                encoder.reset_context() if hasattr(encoder, 'reset_context') else None
-                decoder.reset_context()
-            
             seq_input = inputs[j]
             seq_target = targets[j]
             seq_len = lengths[j].item()
@@ -327,24 +333,39 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
                 seq_input = seq_input[:seq_len]
                 seq_target = seq_target[:seq_len]
             
-            # Split into encoder context and decoder target
-            if seq_len > encoder_chunk_size:
-                encoder_input = seq_input[:encoder_chunk_size]
-                decoder_input = seq_input[encoder_chunk_size:]
-                decoder_target = seq_target[encoder_chunk_size:]
+            if doc_starts[j]:
+                # New document: reset everything
+                decoder.reset_context()
+                document_context = []
+                
+                # For first sequence, split it
+                if seq_len > encoder_chunk_size:
+                    encoder_input = seq_input[:encoder_chunk_size]
+                    decoder_input = seq_input[encoder_chunk_size:]
+                    decoder_target = seq_target[encoder_chunk_size:]
+                else:
+                    mid = max(1, seq_len // 2)
+                    encoder_input = seq_input[:mid]
+                    decoder_input = seq_input[mid:]
+                    decoder_target = seq_target[mid:]
+                
+                document_context.append(encoder_input)
             else:
-                # Short sequence: use half for encoder, half for decoder
-                mid = seq_len // 2
-                encoder_input = seq_input[:mid]
-                decoder_input = seq_input[mid:]
-                decoder_target = seq_target[mid:]
+                # Continuation: encoder sees entire document up to this point
+                decoder_input = seq_input
+                decoder_target = seq_target
             
             if len(decoder_input) == 0:
                 continue
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                # Encode context
-                encoder_k, encoder_v = encoder(encoder_input, return_compressed_kv=True)
+                # Encode entire document context (encoder will chunk internally if needed)
+                if document_context:
+                    full_document_context = torch.cat(document_context, dim=0)
+                    # Pass entire context - encoder handles chunking internally
+                    encoder_k, encoder_v = encoder(full_document_context, return_compressed_kv=True)
+                else:
+                    encoder_k, encoder_v = None, None
                 
                 # Decode with cross-attention
                 decoder.reset_context()
@@ -357,6 +378,10 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
                 )
             
             batch_losses.append(loss.item())
+            
+            # Add current sequence to document context for next iteration
+            if not doc_starts[j]:
+                document_context.append(seq_input)
         
         if batch_losses:
             losses.append(sum(batch_losses) / len(batch_losses))
@@ -430,11 +455,19 @@ def main():
     # Create configs
     print(f"Building {args.model_size} encoder-decoder configs...")
     encoder_config = build_config(args.model_size, vocab_size, is_encoder=True, use_lsi_compression=args.use_lsi_compression)
+    
+    # Set encoder compression to match decoder sequence length
+    # This ensures encoder K/V has the same sequence length as decoder expects
+    target_compression_length = args.block_size
+    
     if args.use_lsi_compression:
-        encoder_config.num_compression_slots = args.num_compression_slots
-        print(f"Using LSI compression with {args.num_compression_slots} latent slots")
+        encoder_config.num_compression_slots = target_compression_length
+        print(f"Using LSI compression with {target_compression_length} latent slots (matching decoder block_size)")
     else:
-        print("Using SVD compression")
+        # For SVD, we'll need to project to target length after compression
+        encoder_config.num_compression_slots = target_compression_length
+        print(f"Using SVD compression, projecting to {target_compression_length} sequence length")
+    
     decoder_config = build_config(args.model_size, vocab_size, is_encoder=False)
     
     # Save configs
@@ -535,6 +568,7 @@ def main():
     running_loss = 0.0
     log_loss_count = 0
     best_val_loss = float('inf')
+    document_context = []  # Accumulate all sequences from current document
     
     t0 = time.time()
     
@@ -566,11 +600,6 @@ def main():
         valid_samples = 0
         
         for j in range(inputs.shape[0]):
-            if doc_starts[j]:
-                if hasattr(encoder, 'reset_context'):
-                    encoder.reset_context()
-                decoder.reset_context()
-            
             seq_input = inputs[j]
             seq_target = targets[j]
             seq_len = lengths[j].item()
@@ -579,23 +608,39 @@ def main():
                 seq_input = seq_input[:seq_len]
                 seq_target = seq_target[:seq_len]
             
-            # Split into encoder context and decoder target
-            if seq_len > args.encoder_chunk_size:
-                encoder_input = seq_input[:args.encoder_chunk_size]
-                decoder_input = seq_input[args.encoder_chunk_size:]
-                decoder_target = seq_target[args.encoder_chunk_size:]
+            if doc_starts[j]:
+                # New document: reset everything
+                decoder.reset_context()
+                document_context = []
+                
+                # For first sequence, split it
+                if seq_len > args.encoder_chunk_size:
+                    encoder_input = seq_input[:args.encoder_chunk_size]
+                    decoder_input = seq_input[args.encoder_chunk_size:]
+                    decoder_target = seq_target[args.encoder_chunk_size:]
+                else:
+                    mid = max(1, seq_len // 2)
+                    encoder_input = seq_input[:mid]
+                    decoder_input = seq_input[mid:]
+                    decoder_target = seq_target[mid:]
+                
+                document_context.append(encoder_input)
             else:
-                mid = seq_len // 2
-                encoder_input = seq_input[:mid]
-                decoder_input = seq_input[mid:]
-                decoder_target = seq_target[mid:]
+                # Continuation: encoder sees entire document up to this point
+                decoder_input = seq_input
+                decoder_target = seq_target
             
             if len(decoder_input) == 0:
                 continue
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                # Encode context
-                encoder_k, encoder_v = encoder(encoder_input, return_compressed_kv=True)
+                # Encode entire document context (encoder will chunk internally if needed)
+                if document_context:
+                    full_document_context = torch.cat(document_context, dim=0)
+                    # Pass entire context - encoder handles chunking internally
+                    encoder_k, encoder_v = encoder(full_document_context, return_compressed_kv=True)
+                else:
+                    encoder_k, encoder_v = None, None
                 
                 # Decode with cross-attention
                 decoder.reset_context()
@@ -609,6 +654,10 @@ def main():
             
             total_loss += loss
             valid_samples += 1
+            
+            # Add current sequence to document context for next iteration
+            if not doc_starts[j]:
+                document_context.append(seq_input)
         
         if valid_samples == 0:
             continue
