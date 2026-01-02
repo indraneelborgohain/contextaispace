@@ -323,10 +323,13 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
         inputs = inputs.to(device)
         targets = targets.to(device)
         
-        # Reset document context at start of each batch
-        document_context = []
+        # Track document sequences
+        current_doc_id = None
+        seq_inputs_list = []
+        seq_targets_list = []
         
         batch_losses = []
+        
         for j in range(inputs.shape[0]):
             seq_input = inputs[j]
             seq_target = targets[j]
@@ -336,55 +339,64 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
                 seq_input = seq_input[:seq_len]
                 seq_target = seq_target[:seq_len]
             
+            # Determine document ID (new doc if doc_starts[j] is True)
             if doc_starts[j]:
-                # New document: reset everything
-                decoder.reset_context()
-                document_context = []
+                # New document started
                 
-                # For first sequence, split it
-                if seq_len > encoder_chunk_size:
-                    encoder_input = seq_input[:encoder_chunk_size]
-                    decoder_input = seq_input[encoder_chunk_size:]
-                    decoder_target = seq_target[encoder_chunk_size:]
-                else:
-                    mid = max(1, seq_len // 2)
-                    encoder_input = seq_input[:mid]
-                    decoder_input = seq_input[mid:]
-                    decoder_target = seq_target[mid:]
+                # First, process accumulated sequences from previous document
+                if seq_inputs_list:
+                    # Concatenate all sequences from previous document
+                    full_doc_input = torch.cat(seq_inputs_list, dim=0)
+                    
+                    # Encode entire document once
+                    with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
+                        encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
+                    
+                    # Decode each sequence with cross-attention to encoder K/V
+                    decoder.reset_context()
+                    for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
+                        with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
+                            logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
+                            
+                            loss = F.cross_entropy(
+                                logits.view(-1, logits.size(-1)),
+                                seq_tgt.view(-1),
+                                ignore_index=-100
+                            )
+                        
+                        batch_losses.append(loss.item())
                 
-                document_context.append(encoder_input)
-            else:
-                # Continuation: encoder sees entire document up to this point
-                decoder_input = seq_input
-                decoder_target = seq_target
+                # Clear lists for new document
+                seq_inputs_list = []
+                seq_targets_list = []
+                current_doc_id = j  # Use batch index as simple doc ID
             
-            if len(decoder_input) == 0:
-                continue
+            # Append current sequence to lists
+            seq_inputs_list.append(seq_input)
+            seq_targets_list.append(seq_target)
+        
+        # Process remaining sequences (last document in batch)
+        if seq_inputs_list:
+            # Concatenate all sequences from last document
+            full_doc_input = torch.cat(seq_inputs_list, dim=0)
             
+            # Encode entire document once
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                # Encode entire document context (encoder will chunk internally if needed)
-                if document_context:
-                    full_document_context = torch.cat(document_context, dim=0)
-                    # Pass entire context - encoder handles chunking internally
-                    encoder_k, encoder_v = encoder(full_document_context, return_compressed_kv=True)
-                else:
-                    encoder_k, encoder_v = None, None
-                
-                # Decode with cross-attention
-                decoder.reset_context()
-                logits = decoder(decoder_input, encoder_k=encoder_k, encoder_v=encoder_v)
-                
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    decoder_target.view(-1),
-                    ignore_index=-100
-                )
+                encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
             
-            batch_losses.append(loss.item())
-            
-            # Add current sequence to document context for next iteration
-            if not doc_starts[j]:
-                document_context.append(seq_input)
+            # Decode each sequence with cross-attention to encoder K/V
+            decoder.reset_context()
+            for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
+                with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
+                    logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
+                    
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        seq_tgt.view(-1),
+                        ignore_index=-100
+                    )
+                
+                batch_losses.append(loss.item())
         
         if batch_losses:
             losses.append(sum(batch_losses) / len(batch_losses))
@@ -586,10 +598,6 @@ def main():
         inputs = inputs.to(device)
         targets = targets.to(device)
         
-        # Reset document context at start of each batch
-        # Each batch should be self-contained to avoid context leaking
-        document_context = []
-        
         # Update learning rate
         if args.pretrained_decoder_path and (decoder_lr != new_layers_lr):
             pretrained_lr = get_lr(iter_num, args.warmup_iters, args.max_iters, decoder_lr, args.min_lr)
@@ -602,7 +610,11 @@ def main():
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
         
-        # Forward pass
+        # Track document sequences
+        current_doc_id = None
+        seq_inputs_list = []
+        seq_targets_list = []
+        
         total_loss = 0.0
         valid_samples = 0
         
@@ -615,56 +627,66 @@ def main():
                 seq_input = seq_input[:seq_len]
                 seq_target = seq_target[:seq_len]
             
+            # Determine document ID (new doc if doc_starts[j] is True)
             if doc_starts[j]:
-                # New document: reset everything
-                decoder.reset_context()
-                document_context = []
+                # New document started
                 
-                # For first sequence, split it
-                if seq_len > args.encoder_chunk_size:
-                    encoder_input = seq_input[:args.encoder_chunk_size]
-                    decoder_input = seq_input[args.encoder_chunk_size:]
-                    decoder_target = seq_target[args.encoder_chunk_size:]
-                else:
-                    mid = max(1, seq_len // 2)
-                    encoder_input = seq_input[:mid]
-                    decoder_input = seq_input[mid:]
-                    decoder_target = seq_target[mid:]
+                # First, process accumulated sequences from previous document
+                if seq_inputs_list:
+                    # Concatenate all sequences from previous document
+                    full_doc_input = torch.cat(seq_inputs_list, dim=0)
+                    
+                    # Encode entire document once
+                    with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
+                        encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
+                    
+                    # Decode each sequence with cross-attention to encoder K/V
+                    decoder.reset_context()
+                    for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
+                        with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
+                            logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
+                            
+                            loss = F.cross_entropy(
+                                logits.view(-1, logits.size(-1)),
+                                seq_tgt.view(-1),
+                                ignore_index=-100
+                            )
+                        
+                        total_loss += loss
+                        valid_samples += 1
                 
-                document_context.append(encoder_input)
-            else:
-                # Continuation: encoder sees entire document up to this point
-                decoder_input = seq_input
-                decoder_target = seq_target
+                # Clear lists for new document
+                seq_inputs_list = []
+                seq_targets_list = []
+                current_doc_id = j  # Use batch index as simple doc ID
             
-            if len(decoder_input) == 0:
-                continue
+            # Append current sequence to lists
+            seq_inputs_list.append(seq_input)
+            seq_targets_list.append(seq_target)
+        
+        # Process remaining sequences (last document in batch)
+        if seq_inputs_list:
+            # Concatenate all sequences from last document
+            full_doc_input = torch.cat(seq_inputs_list, dim=0)
             
+            # Encode entire document once
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                # Encode entire document context (encoder will chunk internally if needed)
-                if document_context:
-                    full_document_context = torch.cat(document_context, dim=0)
-                    # Pass entire context - encoder handles chunking internally
-                    encoder_k, encoder_v = encoder(full_document_context, return_compressed_kv=True)
-                else:
-                    encoder_k, encoder_v = None, None
-                
-                # Decode with cross-attention
-                decoder.reset_context()
-                logits = decoder(decoder_input, encoder_k=encoder_k, encoder_v=encoder_v)
-                
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    decoder_target.view(-1),
-                    ignore_index=-100
-                )
+                encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
             
-            total_loss += loss
-            valid_samples += 1
-            
-            # Add current sequence to document context for next iteration
-            if not doc_starts[j]:
-                document_context.append(seq_input)
+            # Decode each sequence with cross-attention to encoder K/V
+            decoder.reset_context()
+            for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
+                with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
+                    logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
+                    
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        seq_tgt.view(-1),
+                        ignore_index=-100
+                    )
+                
+                total_loss += loss
+                valid_samples += 1
         
         if valid_samples == 0:
             continue
