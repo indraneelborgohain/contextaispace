@@ -323,6 +323,9 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
         inputs = inputs.to(device)
         targets = targets.to(device)
         
+        # Reset document context at start of each batch
+        document_context = []
+        
         batch_losses = []
         for j in range(inputs.shape[0]):
             seq_input = inputs[j]
@@ -582,6 +585,10 @@ def main():
         
         inputs = inputs.to(device)
         targets = targets.to(device)
+        
+        # Reset document context at start of each batch
+        # Each batch should be self-contained to avoid context leaking
+        document_context = []
         
         # Update learning rate
         if args.pretrained_decoder_path and (decoder_lr != new_layers_lr):
