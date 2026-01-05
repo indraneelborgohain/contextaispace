@@ -482,11 +482,6 @@ class Transformer(torch.nn.Module):
                 lsi_components=config.lsi_components,
                 device=device
             )
-            # Buffer to store chunk outputs for LSI cross-attention
-            self.register_buffer(
-                'chunk_outputs',
-                torch.zeros(0, config.hidden_size, device=device, dtype=torch.bfloat16)
-            )
         else:
             self.lsi_cross_attn = None
         
@@ -513,13 +508,9 @@ class Transformer(torch.nn.Module):
     def reset_context(self):
         """Reset context state to zeros for new conversation."""
         self.context_state = torch.zeros_like(self.context_state)
-        if self.lsi_cross_attn is not None:
-            self.chunk_outputs = torch.zeros(0, self.config.hidden_size, device=self.context_state.device, dtype=torch.bfloat16)
 
     def forward(
         self, 
-        x: torch.Tensor, 
-        update_context: bool = True, 
         max_seq_len: int = None,
         encoder_k: torch.Tensor | None = None,
         encoder_v: torch.Tensor | None = None
@@ -551,6 +542,7 @@ class Transformer(torch.nn.Module):
         # If input is longer than max_seq_len, process in chunks
         if input_len > max_seq_len:
             all_logits = []
+            all_chunk_outputs = []  # Collect chunk outputs for LSI
             num_chunks = (input_len + max_seq_len - 1) // max_seq_len
             
             for chunk_idx in range(num_chunks):
@@ -572,22 +564,47 @@ class Transformer(torch.nn.Module):
                 
                 # First chunk gets start token, subsequent chunks use context from previous
                 is_first_chunk = (chunk_idx == 0)
-                chunk_logits = self._forward_chunk(
+                chunk_logits, chunk_output = self._forward_chunk(
                     chunk_padded, 
                     update_context=True, 
                     is_first_chunk=is_first_chunk,
                     encoder_k=encoder_k,
-                    encoder_v=encoder_v
+                    encoder_v=encoder_v,
+                    return_hidden_states=True
                 )
                 
-                # Only keep logits for actual tokens (not padding)
+                # Only keep outputs for actual tokens (not padding)
                 if chunk_len < max_seq_len:
                     chunk_logits = chunk_logits[:chunk_len]
+                    chunk_output = chunk_output[:chunk_len]
                 
                 all_logits.append(chunk_logits)
+                all_chunk_outputs.append(chunk_output)
             
-            # Concatenate all logits
-            logits = torch.cat(all_logits, dim=0)
+            # Apply LSI cross-attention if enabled
+            if self.lsi_cross_attn is not None:
+                # Stack all chunk outputs
+                stacked_outputs = torch.cat(all_chunk_outputs, dim=0)  # (total_tokens, hidden_size)
+                
+                # Apply LSI cross-attention to each chunk's logits
+                all_logits_lsi = []
+                token_offset = 0
+                for chunk_idx, chunk_output in enumerate(all_chunk_outputs):
+                    chunk_len = chunk_output.shape[0]
+                    
+                    # Apply LSI cross-attention
+                    chunk_output_lsi = self.lsi_cross_attn(chunk_output, stacked_outputs)
+                    
+                    # Re-compute logits with LSI-enhanced output
+                    chunk_logits_lsi = self.unembedding(chunk_output_lsi)
+                    all_logits_lsi.append(chunk_logits_lsi)
+                    
+                    token_offset += chunk_len
+                
+                logits = torch.cat(all_logits_lsi, dim=0)
+            else:
+                # Concatenate all logits without LSI
+                logits = torch.cat(all_logits, dim=0)
             
             return logits
         else:
@@ -597,7 +614,9 @@ class Transformer(torch.nn.Module):
                 update_context=update_context, 
                 is_first_chunk=True,
                 encoder_k=encoder_k,
-                encoder_v=encoder_v
+                encoder_v=encoder_v,
+                return_hidden_states=False
+            )
             )
             
             return chunk_logits
@@ -608,8 +627,9 @@ class Transformer(torch.nn.Module):
         update_context: bool = True, 
         is_first_chunk: bool = False,
         encoder_k: torch.Tensor | None = None,
-        encoder_v: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        encoder_v: torch.Tensor | None = None,
+        return_hidden_states: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Process a single chunk of tokens with optional encoder cross-attention.
         
@@ -619,9 +639,10 @@ class Transformer(torch.nn.Module):
             is_first_chunk: Whether this is the first chunk
             encoder_k: Optional encoder keys (enc_seq_len, hidden_size)
             encoder_v: Optional encoder values (enc_seq_len, hidden_size)
+            return_hidden_states: If True, return (logits, hidden_states) tuple
         
         Returns:
-            logits (chunk_size, vocab_size)
+            logits (chunk_size, vocab_size) or tuple of (logits, hidden_states)
         """
         token_embeds = self.embedding(x)
         
@@ -655,29 +676,6 @@ class Transformer(torch.nn.Module):
         for i in range(1, len(self.block)):
             x = self.block[i](x, encoder_k=encoder_k, encoder_v=encoder_v)
         
-        # Apply LSI cross-attention if enabled
-        if self.lsi_cross_attn is not None:
-            # Remove context offset to get actual outputs
-            if context_offset > 0:
-                x_actual = x[context_offset:]
-            else:
-                x_actual = x
-            
-            # Append to chunk_outputs buffer
-            self.chunk_outputs = torch.cat([self.chunk_outputs, x_actual.detach()], dim=0)
-            
-            # Apply LSI cross-attention using accumulated chunk outputs
-            if context_offset > 0:
-                # Apply to tokens part only
-                x_tokens = x[context_offset:]
-                x_tokens = self.lsi_cross_attn(x_tokens, self.chunk_outputs)
-                # Reconstruct with prepended token
-                x = torch.cat([x[:context_offset], x_tokens], dim=0)
-            else:
-                x = self.lsi_cross_attn(x, self.chunk_outputsq_len, hidden_size)
-            context_stack = torch.stack(context_vectors, dim=0)
-            x = self.lsi_cross_attn(x, context_stack)
-        
         x = self.norm(x)
         
         # Remove context embedding if it was prepended
@@ -692,7 +690,10 @@ class Transformer(torch.nn.Module):
         if x_tokens.shape[0] > 0 and update_context:
             self.context_state = x_tokens[-1].detach().clone()
         
-        return logits
+        if return_hidden_states:
+            return logits, x_tokens
+        else:
+            return logits
 
     @staticmethod
     def from_checkpoint(
