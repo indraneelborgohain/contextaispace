@@ -482,6 +482,11 @@ class Transformer(torch.nn.Module):
                 lsi_components=config.lsi_components,
                 device=device
             )
+            # Buffer to store chunk outputs for LSI cross-attention
+            self.register_buffer(
+                'chunk_outputs',
+                torch.zeros(0, config.hidden_size, device=device, dtype=torch.bfloat16)
+            )
         else:
             self.lsi_cross_attn = None
         
@@ -508,6 +513,8 @@ class Transformer(torch.nn.Module):
     def reset_context(self):
         """Reset context state to zeros for new conversation."""
         self.context_state = torch.zeros_like(self.context_state)
+        if self.lsi_cross_attn is not None:
+            self.chunk_outputs = torch.zeros(0, self.config.hidden_size, device=self.context_state.device, dtype=torch.bfloat16)
 
     def forward(
         self, 
@@ -641,24 +648,33 @@ class Transformer(torch.nn.Module):
         # Pass context to first block, then use standard blocks with encoder cross-attention
         context = context_vector.unsqueeze(0).expand(x.shape[0], -1)
         
-        # Collect context vectors from each transformer block
-        if self.lsi_cross_attn is not None:
-            context_vectors = []
-        
         # First block with context (ContextTransformerBlock doesn't have cross-attention)
         x = self.block[0](x, context)
-        if self.lsi_cross_attn is not None:
-            context_vectors.append(x.clone())
         
         # Remaining blocks with optional encoder cross-attention
         for i in range(1, len(self.block)):
             x = self.block[i](x, encoder_k=encoder_k, encoder_v=encoder_v)
-            if self.lsi_cross_attn is not None:
-                context_vectors.append(x.clone())
         
         # Apply LSI cross-attention if enabled
-        if self.lsi_cross_attn is not None and len(context_vectors) > 0:
-            # Stack context vectors: (num_layers, seq_len, hidden_size)
+        if self.lsi_cross_attn is not None:
+            # Remove context offset to get actual outputs
+            if context_offset > 0:
+                x_actual = x[context_offset:]
+            else:
+                x_actual = x
+            
+            # Append to chunk_outputs buffer
+            self.chunk_outputs = torch.cat([self.chunk_outputs, x_actual.detach()], dim=0)
+            
+            # Apply LSI cross-attention using accumulated chunk outputs
+            if context_offset > 0:
+                # Apply to tokens part only
+                x_tokens = x[context_offset:]
+                x_tokens = self.lsi_cross_attn(x_tokens, self.chunk_outputs)
+                # Reconstruct with prepended token
+                x = torch.cat([x[:context_offset], x_tokens], dim=0)
+            else:
+                x = self.lsi_cross_attn(x, self.chunk_outputsq_len, hidden_size)
             context_stack = torch.stack(context_vectors, dim=0)
             x = self.lsi_cross_attn(x, context_stack)
         
