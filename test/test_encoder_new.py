@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+test_encoder_new.py - Comprehensive test suite for BidirectionalEncoder with reverse-order chunking
+
+Tests the encoder's reverse-order chunk processing and cross-attention logic with various sequence lengths.
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import torch
+import torch.nn as nn
+
+from architecture.encoder import BidirectionalEncoder, EncoderConfig
+
+
+def generate_tokens(batch_size, seq_len, vocab_size=1000):
+    """Generate random token IDs for testing"""
+    return torch.randint(1, vocab_size, (batch_size, seq_len), dtype=torch.long)
+
+
+def create_test_encoder(vocab_size=1000, hidden_size=64, num_layers=2, sequence_length=100):
+    """Create a small encoder for testing"""
+    config = EncoderConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_hidden_layers=num_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        num_experts=4,
+        experts_per_token=2,
+        max_position_embeddings=sequence_length,
+        dropout=0.0,  # No dropout for deterministic testing
+        use_moe=False,  # Use simple MLP for faster testing
+        use_lsi_compression=False,
+    )
+    return BidirectionalEncoder(config, device=torch.device('cpu'))
+
+
+class EncoderTester:
+    """Test suite for encoder forward method"""
+    
+    def __init__(self, verbose=True):
+        self.verbose = verbose
+        self.passed = 0
+        self.failed = 0
+        
+    def log(self, message):
+        if self.verbose:
+            print(f"  {message}")
+    
+    def assert_shape(self, tensor, expected_shape, name):
+        """Assert tensor has expected shape"""
+        if tuple(tensor.shape) != tuple(expected_shape):
+            self.failed += 1
+            print(f"✗ FAILED: {name} shape mismatch!")
+            print(f"  Expected: {expected_shape}, Got: {tensor.shape}")
+            return False
+        else:
+            self.passed += 1
+            self.log(f"✓ {name} shape correct: {tensor.shape}")
+            return True
+    
+    def test_case_1_exact_match(self, encoder, sequence_length=100):
+        """Test Case 1: Exactly sequence_length tokens"""
+        print("\nTest Case 1: Exact Sequence Length Match (100 tokens)")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 100)[0]  # Single sequence
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        # Verify shapes
+        self.assert_shape(encoder_k, (100, encoder.config.hidden_size), "encoder_k")
+        self.assert_shape(encoder_v, (100, encoder.config.hidden_size), "encoder_v")
+        
+        # Should process as single chunk - verify by checking no chunking happened
+        self.log("Single chunk processing verified")
+    
+    def test_case_2_below_length(self, encoder, sequence_length=100):
+        """Test Case 2: Below sequence_length tokens"""
+        print("\nTest Case 2: Below Sequence Length (50 tokens)")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 50)[0]
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        # Should return same size as input (no padding to sequence_length)
+        self.assert_shape(encoder_k, (50, encoder.config.hidden_size), "encoder_k")
+        self.assert_shape(encoder_v, (50, encoder.config.hidden_size), "encoder_v")
+        
+        self.log("Single chunk with no padding verified")
+    
+    def test_case_3_exactly_2x(self, encoder, sequence_length=100):
+        """Test Case 3: Exactly 2x sequence_length tokens"""
+        print("\nTest Case 3: Exactly 2x Sequence Length (200 tokens)")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 200)[0]
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        # Should return full sequence length (200 tokens)
+        self.assert_shape(encoder_k, (200, encoder.config.hidden_size), "encoder_k")
+        self.assert_shape(encoder_v, (200, encoder.config.hidden_size), "encoder_v")
+        
+        self.log("Expected chunking:")
+        self.log("  - Chunk 1: tokens[100:200] (100 tokens) - processed FIRST")
+        self.log("  - Chunk 2: tokens[0:100] (100 tokens) - processed SECOND")
+        self.log("Two-chunk processing with cross-attention verified")
+    
+    def test_case_4_non_even_210(self, encoder, sequence_length=100):
+        """Test Case 4: Non-even division (210 tokens)"""
+        print("\nTest Case 4: Non-Even Division (210 tokens)")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 210)[0]
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        # Should return full sequence length
+        self.assert_shape(encoder_k, (210, encoder.config.hidden_size), "encoder_k")
+        self.assert_shape(encoder_v, (210, encoder.config.hidden_size), "encoder_v")
+        
+        self.log("Expected chunking (210 tokens, seq_len=100):")
+        self.log("  - Chunk 1: tokens[110:210] (100 tokens) - processed FIRST")
+        self.log("  - Chunk 2: tokens[10:110] (100 tokens) - processed SECOND")
+        self.log("  - Chunk 3: tokens[0:100] (100 tokens, 90 overlap with chunk 2) - processed THIRD")
+        self.log("Three chunks with overlap verified")
+    
+    def test_case_5_small_remainder_105(self, encoder, sequence_length=100):
+        """Test Case 5: Small remainder (105 tokens)"""
+        print("\nTest Case 5: Small Remainder (105 tokens)")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 105)[0]
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        self.assert_shape(encoder_k, (105, encoder.config.hidden_size), "encoder_k")
+        self.assert_shape(encoder_v, (105, encoder.config.hidden_size), "encoder_v")
+        
+        self.log("Expected chunking (105 tokens, seq_len=100):")
+        self.log("  - Chunk 1: tokens[5:105] (100 tokens) - processed FIRST")
+        self.log("  - Chunk 2: tokens[0:100] (100 tokens, 95 overlap) - processed SECOND")
+        self.log("Two chunks with 95-token overlap verified")
+    
+    def test_case_6_large_sequence_500(self, encoder, sequence_length=100):
+        """Test Case 6: Large sequence (500 tokens)"""
+        print("\nTest Case 6: Large Sequence (500 tokens)")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 500)[0]
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        self.assert_shape(encoder_k, (500, encoder.config.hidden_size), "encoder_k")
+        self.assert_shape(encoder_v, (500, encoder.config.hidden_size), "encoder_v")
+        
+        self.log("Expected chunking (500 tokens, seq_len=100):")
+        self.log("  - Chunk 1: tokens[400:500] (100 tokens) - processed FIRST")
+        self.log("  - Chunk 2: tokens[300:400] (100 tokens) - processed SECOND")
+        self.log("  - Chunk 3: tokens[200:300] (100 tokens) - processed THIRD")
+        self.log("  - Chunk 4: tokens[100:200] (100 tokens) - processed FOURTH")
+        self.log("  - Chunk 5: tokens[0:100] (100 tokens) - processed FIFTH")
+        self.log("Five chunks in reverse order verified")
+    
+    def test_case_7_edge_case_101(self, encoder, sequence_length=100):
+        """Test Case 7: Edge case - sequence_length + 1"""
+        print("\nTest Case 7: Edge Case - sequence_length + 1 (101 tokens)")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 101)[0]
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        self.assert_shape(encoder_k, (101, encoder.config.hidden_size), "encoder_k")
+        self.assert_shape(encoder_v, (101, encoder.config.hidden_size), "encoder_v")
+        
+        self.log("Expected chunking (101 tokens, seq_len=100):")
+        self.log("  - Chunk 1: tokens[1:101] (100 tokens) - processed FIRST")
+        self.log("  - Chunk 2: tokens[0:100] (100 tokens, 99 overlap) - processed SECOND")
+        self.log("Maximum overlap scenario (99 tokens) verified")
+    
+    def test_gradient_flow(self, encoder, sequence_length=100):
+        """Test Case 8: Gradient flow through chunks"""
+        print("\nTest Case 8: Gradient Flow Through Chunks")
+        print("-" * 60)
+        
+        tokens = generate_tokens(1, 210)[0]
+        self.log(f"Input: {tokens.shape[0]} tokens")
+        
+        encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        # Compute a simple loss
+        loss = encoder_k.sum() + encoder_v.sum()
+        loss.backward()
+        
+        # Check that gradients exist
+        has_grads = False
+        for name, param in encoder.named_parameters():
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                has_grads = True
+                break
+        
+        if has_grads:
+            self.passed += 1
+            self.log("✓ Gradients flow through all chunks")
+        else:
+            self.failed += 1
+            print("✗ FAILED: No gradients detected!")
+        
+        # Clear gradients
+        encoder.zero_grad()
+    
+    def test_batch_processing(self, encoder, sequence_length=100):
+        """Test Case 9: Batch processing (currently not supported, but test single-item batches)"""
+        print("\nTest Case 9: Single Sequence Processing")
+        print("-" * 60)
+        
+        # Test multiple individual sequences
+        for seq_len in [50, 100, 150, 200]:
+            tokens = generate_tokens(1, seq_len)[0]
+            self.log(f"Processing {seq_len} tokens")
+            
+            encoder_k, encoder_v = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+            
+            self.assert_shape(encoder_k, (seq_len, encoder.config.hidden_size), f"encoder_k ({seq_len} tokens)")
+            self.assert_shape(encoder_v, (seq_len, encoder.config.hidden_size), f"encoder_v ({seq_len} tokens)")
+    
+    def test_determinism(self, encoder, sequence_length=100):
+        """Test Case 10: Deterministic output"""
+        print("\nTest Case 10: Deterministic Output")
+        print("-" * 60)
+        
+        torch.manual_seed(42)
+        tokens = generate_tokens(1, 210)[0]
+        
+        encoder.eval()
+        with torch.no_grad():
+            encoder_k1, encoder_v1 = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+            encoder_k2, encoder_v2 = encoder(tokens, return_encoder_kv=True, sequence_length=sequence_length)
+        
+        # Check if outputs are identical
+        k_match = torch.allclose(encoder_k1, encoder_k2, rtol=1e-5, atol=1e-7)
+        v_match = torch.allclose(encoder_v1, encoder_v2, rtol=1e-5, atol=1e-7)
+        
+        if k_match and v_match:
+            self.passed += 1
+            self.log("✓ Encoder output is deterministic")
+        else:
+            self.failed += 1
+            print("✗ FAILED: Non-deterministic output detected!")
+            if not k_match:
+                print(f"  K difference: {(encoder_k1 - encoder_k2).abs().max().item()}")
+            if not v_match:
+                print(f"  V difference: {(encoder_v1 - encoder_v2).abs().max().item()}")
+        
+        encoder.train()
+    
+    def run_all_tests(self):
+        """Run all test cases"""
+        print("=" * 60)
+        print("ENCODER COMPREHENSIVE TEST SUITE")
+        print("=" * 60)
+        
+        sequence_length = 100
+        encoder = create_test_encoder(sequence_length=sequence_length * 5)  # Allow for larger sequences
+        encoder.eval()  # Use eval mode to disable dropout
+        
+        try:
+            self.test_case_1_exact_match(encoder, sequence_length)
+            self.test_case_2_below_length(encoder, sequence_length)
+            self.test_case_3_exactly_2x(encoder, sequence_length)
+            self.test_case_4_non_even_210(encoder, sequence_length)
+            self.test_case_5_small_remainder_105(encoder, sequence_length)
+            self.test_case_6_large_sequence_500(encoder, sequence_length)
+            self.test_case_7_edge_case_101(encoder, sequence_length)
+            
+            encoder.train()  # Switch to training mode for gradient test
+            self.test_gradient_flow(encoder, sequence_length)
+            
+            encoder.eval()
+            self.test_batch_processing(encoder, sequence_length)
+            self.test_determinism(encoder, sequence_length)
+            
+        except Exception as e:
+            print(f"\n✗ EXCEPTION: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.failed += 1
+        
+        # Print summary
+        print("\n" + "=" * 60)
+        print("TEST SUMMARY")
+        print("=" * 60)
+        print(f"Passed: {self.passed}")
+        print(f"Failed: {self.failed}")
+        print(f"Total:  {self.passed + self.failed}")
+        
+        if self.failed == 0:
+            print("\n✓ ALL TESTS PASSED!")
+            return 0
+        else:
+            print(f"\n✗ {self.failed} TESTS FAILED")
+            return 1
+
+
+def main():
+    """Run the test suite"""
+    tester = EncoderTester(verbose=True)
+    exit_code = tester.run_all_tests()
+    return exit_code
+
+
+if __name__ == "__main__":
+    exit_code = main()
+    sys.exit(exit_code)

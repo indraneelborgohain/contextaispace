@@ -1,15 +1,10 @@
-"""
-Context-Aware GPT Implementation with LSI Cross-Attention
+"""Context-Aware GPT Implementation
 
 This module implements a nano-GPT OSS variant where the output context vector 
 from the previous prediction is fed back as input to the model.
 
 The context state (shape: hidden_size) stores the output from the previous token 
 prediction and is fed into each transformer layer through context projection layers.
-
-Additionally, context vectors from all transformer blocks are stacked and passed
-through an LSI module to extract Q, K, V matrices, which are then used in a 
-cross-attention layer before final prediction.
 """
 
 import json
@@ -21,7 +16,6 @@ import torch.distributed as dist
 import numpy as np
 from .config import ModelConfig
 from .lsi import LatentSemanticIndexing, LSIConfig
-from .lsi_cross_attention import LSICrossAttentionBlock
 from .attention_components import RMSNorm, RotaryEmbedding, ContextAttentionBlock, sdpa
 
 
@@ -474,17 +468,7 @@ class Transformer(torch.nn.Module):
         self.block.append(ContextTransformerBlock(config, 0, device))
         for layer_idx in range(1, config.num_hidden_layers):
             self.block.append(TransformerBlock(config, layer_idx, device))
-        
-        # LSI cross-attention block
-        if config.use_lsi_cross_attention:
-            self.lsi_cross_attn = LSICrossAttentionBlock(
-                hidden_size=config.hidden_size,
-                lsi_components=config.lsi_components,
-                device=device
-            )
-        else:
-            self.lsi_cross_attn = None
-        
+       
         self.norm = RMSNorm(config.hidden_size, device=device)
         self.unembedding = torch.nn.Linear(
             config.hidden_size,
@@ -510,7 +494,9 @@ class Transformer(torch.nn.Module):
         self.context_state = torch.zeros_like(self.context_state)
 
     def forward(
-        self, 
+        self,
+        x: torch.Tensor,
+        update_context: bool = True,
         max_seq_len: int = None,
         encoder_k: torch.Tensor | None = None,
         encoder_v: torch.Tensor | None = None
@@ -522,7 +508,6 @@ class Transformer(torch.nn.Module):
         1. If input is longer than max_seq_len, process in chunks
         2. Each chunk: self-attention → cross-attention (if encoder K,V provided) → MLP
         3. Collect context from last token of each chunk
-        4. Apply LSI cross-attention on final output (if enabled)
         
         Args:
             x: Input token IDs (seq_len,)
@@ -542,7 +527,7 @@ class Transformer(torch.nn.Module):
         # If input is longer than max_seq_len, process in chunks
         if input_len > max_seq_len:
             all_logits = []
-            all_chunk_outputs = []  # Collect chunk outputs for LSI
+            all_chunk_outputs = []  # Collect chunk outputs
             num_chunks = (input_len + max_seq_len - 1) // max_seq_len
             
             for chunk_idx in range(num_chunks):
@@ -577,35 +562,10 @@ class Transformer(torch.nn.Module):
                 if chunk_len < max_seq_len:
                     chunk_logits = chunk_logits[:chunk_len]
                     chunk_output = chunk_output[:chunk_len]
-                
                 all_logits.append(chunk_logits)
                 all_chunk_outputs.append(chunk_output)
             
-            # Apply LSI cross-attention if enabled
-            if self.lsi_cross_attn is not None:
-                # Stack all chunk outputs
-                stacked_outputs = torch.cat(all_chunk_outputs, dim=0)  # (total_tokens, hidden_size)
-                
-                # Apply LSI cross-attention to each chunk's logits
-                all_logits_lsi = []
-                token_offset = 0
-                for chunk_idx, chunk_output in enumerate(all_chunk_outputs):
-                    chunk_len = chunk_output.shape[0]
-                    
-                    # Apply LSI cross-attention
-                    chunk_output_lsi = self.lsi_cross_attn(chunk_output, stacked_outputs)
-                    
-                    # Re-compute logits with LSI-enhanced output
-                    chunk_logits_lsi = self.unembedding(chunk_output_lsi)
-                    all_logits_lsi.append(chunk_logits_lsi)
-                    
-                    token_offset += chunk_len
-                
-                logits = torch.cat(all_logits_lsi, dim=0)
-            else:
-                # Concatenate all logits without LSI
-                logits = torch.cat(all_logits, dim=0)
-            
+            logits = torch.cat(all_logits, dim=0)
             return logits
         else:
             # Normal processing for short sequences - this is always a first chunk
@@ -616,7 +576,6 @@ class Transformer(torch.nn.Module):
                 encoder_k=encoder_k,
                 encoder_v=encoder_v,
                 return_hidden_states=False
-            )
             )
             
             return chunk_logits

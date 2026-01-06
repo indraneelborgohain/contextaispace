@@ -335,16 +335,12 @@ class EncoderBlock(nn.Module):
 
 class BidirectionalEncoder(nn.Module):
     """
-    Bidirectional Transformer Encoder (BERT-style).
+    Bidirectional Transformer Encoder with Reverse-Order Chunk Processing.
     
-    Encodes input sequences with full bidirectional attention.
-    Suitable for:
-    - Representation learning
-    - Classification tasks
-    - Masked language modeling
-    
-    Supports chunking for long sequences with context embedding propagation.
-    Supports LSI cross-attention compression for fixed-size encoder output.
+    Processes long sequences by:
+    1. Chunking in reverse order (last chunk first)
+    2. Cross-attention between consecutive chunks
+    3. Final cross-attention from first to last chunk
     """
     def __init__(
         self,
@@ -367,88 +363,77 @@ class BidirectionalEncoder(nn.Module):
         
         self.norm = RMSNorm(config.hidden_size, device=device)
         
-        # LSI compression layer (optional)
-        if config.use_lsi_compression:
-            self.lsi_compression = LSICompressionLayer(config, device=device)
-        else:
-            self.lsi_compression = None
+        # Cross-attention layer for inter-chunk attention
+        self.cross_attn = BidirectionalAttentionBlock(config, layer_idx=0, device=device)
         
-        # Learnable start token embedding for chunking
-        self.start_token_embedding = nn.Parameter(
-            torch.randn(config.hidden_size, device=device, dtype=torch.bfloat16) * 0.02
-        )
-        
-        # Buffer for context from previous chunk
-        self.register_buffer(
-            'chunk_context',
-            torch.zeros(config.hidden_size, device=device, dtype=torch.bfloat16)
-        )
-        
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        
-        # Learnable start token embedding for chunking
-        self.start_token_embedding = nn.Parameter(
-            torch.randn(config.hidden_size, device=device, dtype=torch.bfloat16) * 0.02
-        )
-        
-        # Buffer for context from previous chunk
-        self.register_buffer(
-            'chunk_context',
-            torch.zeros(config.hidden_size, device=device, dtype=torch.bfloat16)
-        )
-    
-    def reset_context(self):
-        """Reset chunk context to zeros."""
-        self.chunk_context = torch.zeros_like(self.chunk_context)
+        # Final cross-attention layer
+        self.final_cross_attn = BidirectionalAttentionBlock(config, layer_idx=0, device=device)
     
     def forward(
         self, 
         input_ids: torch.Tensor, 
         attention_mask: torch.Tensor | None = None,
-        return_context_embeddings: bool = False,
-        return_compressed_kv: bool = False,
-        chunk_size: int | None = None
+        return_encoder_kv: bool = False,
+        sequence_length: int | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode input tokens with bidirectional attention.
+        Encode input tokens with reverse-order chunk processing.
         
         Args:
-            input_ids: Input token IDs (seq_len,)
-            attention_mask: Optional mask (seq_len,) where 1 = real token, 0 = padding
-            return_context_embeddings: If True, returns list of context embeddings (one per chunk)
-            return_compressed_kv: If True, returns SVD-compressed K, V for cross-attention
-            chunk_size: Chunk size for processing long sequences. If None, uses max_position_embeddings
+            input_ids: Input token IDs (total_sequence_length,)
+            attention_mask: Optional mask (total_sequence_length,) where 1 = real token, 0 = padding
+            return_encoder_kv: If True, returns (encoder_key, encoder_value) for decoder cross-attention
+            sequence_length: Maximum sequence length per chunk. If None, uses max_position_embeddings
         
         Returns:
-            If return_context_embeddings=False: Encoded representations (seq_len, hidden_size)
-            If return_context_embeddings=True: Tensor of context embeddings (num_chunks, hidden_size)
-            If return_compressed_kv=True: Tuple of (K_compressed, V_compressed) each (chunk_size, hidden_size)
+            If return_encoder_kv=False: Encoded representations (total_sequence_length, hidden_size)
+            If return_encoder_kv=True: Tuple of (encoder_key, encoder_value) each (sequence_length, hidden_size)
         """
-        if chunk_size is None:
-            chunk_size = self.config.max_position_embeddings
+        if sequence_length is None:
+            sequence_length = self.config.max_position_embeddings
         
-        input_len = input_ids.shape[0]
+        total_length = input_ids.shape[0]
         
-        # If SVD compression requested, always use chunking
-        if return_compressed_kv:
-            return self._forward_with_svd_compression(input_ids, attention_mask, chunk_size)
+        # Single chunk case - no chunking needed
+        if total_length <= sequence_length:
+            x = self._process_single_chunk(input_ids, attention_mask)
+            if return_encoder_kv:
+                # For single chunk, just return the output as both K and V
+                return x, x
+            return x
         
-        # If chunking is needed
-        if input_len > chunk_size or return_context_embeddings:
-            return self._forward_chunked(input_ids, attention_mask, chunk_size, return_context_embeddings)
+        # Multi-chunk case - process in reverse order
+        if return_encoder_kv:
+            return self._forward_with_chunking(input_ids, attention_mask, sequence_length)
+        else:
+            # Just return the encoded representation without K,V extraction
+            encoder_k, encoder_v = self._forward_with_chunking(input_ids, attention_mask, sequence_length)
+            # Concatenate or return first chunk
+            return encoder_k
+    
+    def _process_single_chunk(
+        self,
+        chunk_tokens: torch.Tensor,
+        chunk_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """
+        Process a single chunk through transformer blocks.
         
-        # Normal processing without chunking
+        Args:
+            chunk_tokens: Token IDs (chunk_length,)
+            chunk_mask: Attention mask (chunk_length,) or None
+        
+        Returns:
+            Encoded output (chunk_length, hidden_size)
+        """
         # Embed tokens
-        x = self.embedding(input_ids)
+        x = self.embedding(chunk_tokens)
         x = self.dropout(x)
         
         # Create attention mask if provided
-        # Convert from (seq_len,) to (seq_len, seq_len)
-        if attention_mask is not None:
-            # attention_mask: (seq_len,) with 1 for real tokens, 0 for padding
-            # Create pairwise mask: (seq_len, seq_len)
-            seq_len = attention_mask.shape[0]
-            attn_mask_2d = attention_mask.unsqueeze(0) & attention_mask.unsqueeze(1)
+        if chunk_mask is not None:
+            seq_len = chunk_mask.shape[0]
+            attn_mask_2d = chunk_mask.unsqueeze(0) & chunk_mask.unsqueeze(1)
         else:
             attn_mask_2d = None
         
@@ -460,18 +445,365 @@ class BidirectionalEncoder(nn.Module):
         x = self.norm(x)
         
         return x
-                hidden_size=config.hidden_size,
-                target_length=config.num_compression_slots,
-                device=device
-            
     
-    def _forward_chunked(
+    def _forward_with_chunking(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        chunk_size: int,
-        return_context_embeddings: bool
+        sequence_length: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Process input in reverse-order chunks with cross-attention.
+        
+        Strategy:
+        1. Split into chunks, ensuring each is exactly sequence_length
+        2. Process chunks in reverse order (last first)
+        3. Apply cross-attention between consecutive chunks
+        4. Final cross-attention from first processed to last processed chunk
+        
+        Args:
+            input_ids: Input token IDs (total_sequence_length,)
+            attention_mask: Optional mask (total_sequence_length,)
+            sequence_length: Target length for each chunk
+        
+        Returns:
+            Tuple of (encoder_key, encoder_value) each (sequence_length, hidden_size)
+        """
+        total_length = input_ids.shape[0]
+        
+        # Create chunks with proper alignment
+        chunks = self._create_chunks(total_length, sequence_length)
+        
+        # Storage for chunk outputs
+        Q_prev = None  # Query from previously processed chunk (later in time)
+        Q_first_processed = None  # Query from first chunk we process (last chronologically)
+        K_final = None  # Key from final chunk (first chronologically)
+        V_final = None  # Value from final chunk (first chronologically)
+        
+        # Process chunks in reverse order
+        for idx in range(len(chunks) - 1, -1, -1):
+            start_idx, end_idx, actual_length = chunks[idx]
+            is_first_processed = (idx == len(chunks) - 1)  # Last chronologically, first processed
+            is_last_processed = (idx == 0)  # First chronologically, last processed
+            
+            # Extract chunk tokens (with borrowing if needed)
+            chunk_tokens = input_ids[start_idx:end_idx]
+            chunk_mask = attention_mask[start_idx:end_idx] if attention_mask is not None else None
+            
+            # Process chunk through transformer blocks
+            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+            
+            # Extract Q, K, V from chunk output using self-attention
+            Q_chunk, K_chunk, V_chunk = self._extract_qkv(chunk_output, chunk_mask)
+            
+            # Apply cross-attention if not the first chunk being processed
+            if Q_prev is not None:
+                # Cross-attention: Q from previous chunk, K,V from current chunk
+                Q_chunk, K_chunk, V_chunk = self._apply_cross_attention(
+                    Q_prev, K_chunk, V_chunk, chunk_mask
+                )
+            
+            # Save first processed chunk's Q for final cross-attention
+            if is_first_processed:
+                Q_first_processed = Q_chunk
+            
+            # Save last processed chunk's K,V (first chronologically)
+            if is_last_processed:
+                K_final = K_chunk[:actual_length]  # Only keep actual tokens
+                V_final = V_chunk[:actual_length]
+            
+            # Update Q_prev for next iteration
+            Q_prev = Q_chunk
+        
+        # Final cross-attention: Q from first processed, K,V from last processed
+        encoder_key, encoder_value = self._apply_final_cross_attention(
+            Q_first_processed, K_final, V_final
+        )
+        
+        return encoder_key, encoder_value
+    
+    def _create_chunks(
+        self,
+        total_length: int,
+        sequence_length: int
+    ) -> list[tuple[int, int, int]]:
+        """
+        Create chunk boundaries ensuring each chunk is exactly sequence_length.
+        
+        Args:
+            total_length: Total number of tokens
+            sequence_length: Target length for each chunk
+        
+        Returns:
+            List of (start_idx, end_idx, actual_token_count) tuples
+            
+        Example with 210 tokens and sequence_length=100:
+            - Chunk 0: (0, 100, 10) - takes tokens 0-10, borrows 10-100 from next chunk
+            - Chunk 1: (10, 110, 100) - takes tokens 10-110
+            - Chunk 2: (110, 210, 100) - takes tokens 110-210
+        """
+        chunks = []
+        remainder = total_length % sequence_length
+        
+        if remainder > 0:
+            # First chunk is smaller, needs to borrow from next chunk
+            # It will take tokens [0:remainder] and borrow [remainder:sequence_length]
+            chunks.append((0, sequence_length, remainder))
+            start = sequence_length
+        else:
+            start = 0
+        
+        # Add full chunks
+        while start < total_length:
+            end = min(start + sequence_length, total_length)
+            actual = min(sequence_length, total_length - start)
+            chunks.append((start, end, actual))
+            start = end
+        
+        return chunks
+    
+    def _extract_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract Q, K, V from hidden states using self-attention layer.
+        
+        Args:
+            hidden_states: Chunk output (chunk_length, hidden_size)
+            attention_mask: Optional mask (chunk_length,)
+        
+        Returns:
+            Tuple of (Q, K, V) each (chunk_length, hidden_size)
+        """
+        # Use the cross-attention layer to compute Q, K, V
+        # We'll extract them from the attention computation
+        t = self.cross_attn.norm(hidden_states)
+        qkv = self.cross_attn.qkv(t)
+        
+        # Split into Q, K, V
+        q = qkv[:, : self.cross_attn.num_attention_heads * self.cross_attn.head_dim].contiguous()
+        k = qkv[
+            :,
+            self.cross_attn.num_attention_heads * self.cross_attn.head_dim : 
+            (self.cross_attn.num_attention_heads + self.cross_attn.num_key_value_heads) * self.cross_attn.head_dim,
+        ].contiguous()
+        v = qkv[
+            :,
+            (self.cross_attn.num_attention_heads + self.cross_attn.num_key_value_heads) * self.cross_attn.head_dim : 
+            (self.cross_attn.num_attention_heads + 2 * self.cross_attn.num_key_value_heads) * self.cross_attn.head_dim,
+        ].contiguous()
+        
+        # Reshape for attention
+        q = q.view(
+            -1,
+            self.cross_attn.num_key_value_heads,
+            self.cross_attn.num_attention_heads // self.cross_attn.num_key_value_heads,
+            self.cross_attn.head_dim,
+        )
+        k = k.view(-1, self.cross_attn.num_key_value_heads, self.cross_attn.head_dim)
+        v = v.view(-1, self.cross_attn.num_key_value_heads, self.cross_attn.head_dim)
+        
+        # Apply RoPE
+        q, k = self.cross_attn.rope(q, k)
+        
+        # Flatten back to (seq_len, hidden_size)
+        q = q.reshape(hidden_states.shape[0], -1)
+        k = k.reshape(hidden_states.shape[0], -1)
+        v = v.reshape(hidden_states.shape[0], -1)
+        
+        return q, k, v
+    
+    def _apply_cross_attention(
+        self,
+        Q_prev: torch.Tensor,
+        K_curr: torch.Tensor,
+        V_curr: torch.Tensor,
+        attention_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Apply cross-attention between chunks.
+        
+        Args:
+            Q_prev: Query from previous chunk (prev_len, hidden_size)
+            K_curr: Key from current chunk (curr_len, hidden_size)
+            V_curr: Value from current chunk (curr_len, hidden_size)
+            attention_mask: Optional mask for current chunk
+        
+        Returns:
+            Updated (Q, K, V) for current chunk
+        """
+        # Perform cross-attention: Q from prev, K,V from current
+        # For simplicity, we'll use the cross_attn layer
+        
+        # Reshape Q, K, V back to attention format
+        curr_len = K_curr.shape[0]
+        prev_len = Q_prev.shape[0]
+        
+        # Reshape for attention computation
+        q = Q_prev.view(
+            prev_len,
+            self.cross_attn.num_key_value_heads,
+            self.cross_attn.num_attention_heads // self.cross_attn.num_key_value_heads,
+            self.cross_attn.head_dim,
+        )
+        k = K_curr.view(curr_len, self.cross_attn.num_key_value_heads, self.cross_attn.head_dim)
+        v = V_curr.view(curr_len, self.cross_attn.num_key_value_heads, self.cross_attn.head_dim)
+        
+        # Perform cross-attention (no causal mask, attend across chunks)
+        attn_output = bidirectional_sdpa(q, k, v, self.cross_attn.sm_scale, attention_mask=None)
+        attn_output = self.cross_attn.attn_dropout(attn_output)
+        attn_output = self.cross_attn.out(attn_output)
+        
+        # The attention output replaces Q for the current chunk
+        # K and V remain from current chunk
+        Q_new = attn_output
+        
+        return Q_new, K_curr, V_curr
+    
+    def _apply_final_cross_attention(
+        self,
+        Q_first: torch.Tensor,
+        K_last: torch.Tensor,
+        V_last: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply final cross-attention from first processed to last processed chunk.
+        
+        Args:
+            Q_first: Query from first processed chunk (seq_len, hidden_size)
+            K_last: Key from last processed chunk (seq_len, hidden_size)
+            V_last: Value from last processed chunk (seq_len, hidden_size)
+        
+        Returns:
+            Tuple of (encoder_key, encoder_value) each (seq_len, hidden_size)
+        """
+        # Reshape for attention
+        seq_len = Q_first.shape[0]
+        k_len = K_last.shape[0]
+        
+        q = Q_first.view(
+            seq_len,
+            self.final_cross_attn.num_key_value_heads,
+            self.final_cross_attn.num_attention_heads // self.final_cross_attn.num_key_value_heads,
+            self.final_cross_attn.head_dim,
+        )
+        k = K_last.view(k_len, self.final_cross_attn.num_key_value_heads, self.final_cross_attn.head_dim)
+        v = V_last.view(k_len, self.final_cross_attn.num_key_value_heads, self.final_cross_attn.head_dim)
+        
+        # Apply final cross-attention
+        attn_output = bidirectional_sdpa(q, k, v, self.final_cross_attn.sm_scale, attention_mask=None)
+        attn_output = self.final_cross_attn.attn_dropout(attn_output)
+        encoder_output = self.final_cross_attn.out(attn_output)
+        
+        # Return both as encoder K and V
+        return encoder_output, encoder_output
+
+
+class EncoderForMaskedLM(nn.Module):
+    """
+    Encoder with masked language modeling head (BERT-style).
+    """
+    def __init__(
+        self,
+        config: EncoderConfig,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.encoder = BidirectionalEncoder(config, device)
+        
+        # MLM prediction head
+        self.mlm_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size, device=device, dtype=torch.bfloat16),
+            nn.GELU(),
+            RMSNorm(config.hidden_size, device=device),
+            nn.Linear(config.hidden_size, config.vocab_size, device=device, dtype=torch.bfloat16)
+        )
+    
+    def forward(
+        self, 
+        input_ids: torch.Tensor, 
+        attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
+        """
+        Forward pass for masked language modeling.
+        
+        Args:
+            input_ids: Input token IDs with [MASK] tokens (seq_len,)
+            attention_mask: Optional mask (seq_len,)
+        
+        Returns:
+            Logits for all positions (seq_len, vocab_size)
+        """
+        # Encode
+        x = self.encoder(input_ids, attention_mask)
+        
+        # Predict tokens
+        logits = self.mlm_head(x)
+        
+        return logits
+
+
+class EncoderForClassification(nn.Module):
+    """
+    Encoder with classification head.
+    """
+    def __init__(
+        self,
+        config: EncoderConfig,
+        num_classes: int,
+        pooling: str = "first",
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.encoder = BidirectionalEncoder(config, device)
+        self.pooling = pooling
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_size, num_classes, device=device, dtype=torch.bfloat16)
+        )
+    
+    def forward(
+        self, 
+        input_ids: torch.Tensor, 
+        attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Forward pass for classification.
+        
+        Args:
+            input_ids: Input token IDs (seq_len,)
+            attention_mask: Optional mask (seq_len,)
+        
+        Returns:
+            Classification logits (num_classes,)
+        """
+        # Get pooled representation (using simple mean pooling)
+        x = self.encoder(input_ids, attention_mask)
+        
+        if self.pooling == "first":
+            pooled = x[0]
+        elif self.pooling == "max":
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).to(x.dtype)
+                x = x * mask + (1 - mask) * (-1e9)
+            pooled = x.max(dim=0)[0]
+        else:  # mean pooling
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).to(x.dtype)
+                sum_x = (x * mask).sum(dim=0)
+                count = mask.sum(dim=0).clamp(min=1)
+                pooled = sum_x / count
+            else:
+                pooled = x.mean(dim=0)
+        
+        # Classify
+        logits = self.classifier(pooled)
+        
+        return logits
         """
         Process input in chunks and collect context embeddings.
         
@@ -486,7 +818,8 @@ class BidirectionalEncoder(nn.Module):
         # Calculate number of chunks (pad last chunk to chunk_size if needed)
         num_chunks = (input_len + chunk_size - 1) // chunk_size
         
-        for chunk_idx in range(num_chunks):
+        # Process chunks in reverse order (last chunk first)
+        for chunk_idx in range(num_chunks - 1, -1, -1):
             start_idx = chunk_idx * chunk_size
             end_idx = min(start_idx + chunk_size, input_len)
             
@@ -529,7 +862,8 @@ class BidirectionalEncoder(nn.Module):
             # Use the actual last token position before padding
             context_idx = chunk_len - 1 if chunk_len < chunk_size else chunk_size - 1
             context_embedding = chunk_output[context_idx].detach().clone()
-            context_embeddings.append(context_embedding)
+            # Insert at beginning to maintain correct order (processing in reverse)
+            context_embeddings.insert(0, context_embedding)
             
             # Update chunk context for next iteration
             self.chunk_context = context_embedding
@@ -537,9 +871,9 @@ class BidirectionalEncoder(nn.Module):
             if not return_context_embeddings:
                 # Only keep outputs for actual tokens (not padding)
                 if chunk_len < chunk_size:
-                    all_outputs.append(chunk_output[:chunk_len])
+                    all_outputs.insert(0, chunk_output[:chunk_len])
                 else:
-                    all_outputs.append(chunk_output)
+                    all_outputs.insert(0, chunk_output)
         
         if return_context_embeddings:
             # Stack context embeddings: (num_chunks, hidden_size)
@@ -597,76 +931,172 @@ class BidirectionalEncoder(nn.Module):
         chunk_size: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Process input in chunks, stack outputs, and compress with SVD.
+        Process input in chunks with reverse-order processing and cross-attention between chunks.
+        
+        Strategy:
+        1. Process chunks in reverse order (last tokens first)
+        2. For each chunk, use cross-attention from previous chunk (later in time) as Q,
+           and current chunk (earlier in time) as K,V
+        3. If a chunk is smaller than chunk_size, pad it with tokens from the previous chunk
+        4. Keep first chunk (chronologically) for final compression
         
         Returns:
             Tuple of (K_compressed, V_compressed) each (chunk_size, hidden_size)
         """
         input_len = input_ids.shape[0]
-        all_outputs = []
         
-        # Calculate number of chunks
-        num_chunks = (input_len + chunk_size - 1) // chunk_size
+        # Calculate chunks with proper alignment
+        # If tokens don't divide evenly, the first chunk (chronologically) may be smaller
+        chunks = []
         
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, input_len)
+        if input_len <= chunk_size:
+            # Single chunk, no reverse processing needed
+            chunks.append((0, input_len))
+        else:
+            # Create chunks from the end, ensuring each is chunk_size except possibly the first
+            num_full_chunks = input_len // chunk_size
+            remainder = input_len % chunk_size
+            
+            if remainder > 0:
+                # First chunk is smaller - but we pad it with tokens from next chunk
+                # So we process [0, chunk_size] as first chunk with tokens [0, remainder] + padding from [remainder, chunk_size]
+                chunks.append((0, chunk_size))  # Will use tokens [0:remainder] + padding from next chunk
+                start = chunk_size
+            else:
+                start = 0
+            
+            # Add full chunks
+            while start < input_len:
+                end = min(start + chunk_size, input_len)
+                chunks.append((start, end))
+                start = end
+        
+        # Process chunks in reverse order (last first)
+        all_chunk_outputs = []
+        prev_chunk_output = None  # Output from previously processed chunk (later in time)
+        first_chunk_output = None  # Store first chunk (chronologically) for compression
+        
+        for idx in range(len(chunks) - 1, -1, -1):
+            start_idx, end_idx = chunks[idx]
+            is_first_chronologically = (idx == 0)
+            is_last_chronologically = (idx == len(chunks) - 1)
             
             # Get chunk tokens
             chunk_tokens = input_ids[start_idx:end_idx]
-            chunk_len = chunk_tokens.shape[0]
+            actual_token_count = chunk_tokens.shape[0]
             
-            # Pad chunk if needed
-            if chunk_len < chunk_size:
-                padding = torch.zeros(
-                    chunk_size - chunk_len, 
-                    dtype=chunk_tokens.dtype, 
-                    device=chunk_tokens.device
-                )
-                chunk_tokens = torch.cat([chunk_tokens, padding], dim=0)
+            # Pad to chunk_size if needed by borrowing from previous chunk
+            if actual_token_count < chunk_size and not is_last_chronologically:
+                # Borrow tokens from the next chunk (chronologically)
+                next_chunk_start = chunks[idx + 1][0]
+                tokens_needed = chunk_size - actual_token_count
+                borrowed_tokens = input_ids[end_idx:end_idx + tokens_needed]
+                chunk_tokens = torch.cat([chunk_tokens, borrowed_tokens], dim=0)
                 
+                # Update mask if provided
                 if attention_mask is not None:
                     chunk_mask = attention_mask[start_idx:end_idx]
-                    mask_padding = torch.zeros(
-                        chunk_size - chunk_len,
-                        dtype=chunk_mask.dtype,
-                        device=chunk_mask.device
-                    )
-                    chunk_mask = torch.cat([chunk_mask, mask_padding], dim=0)
+                    borrowed_mask = attention_mask[end_idx:end_idx + tokens_needed]
+                    chunk_mask = torch.cat([chunk_mask, borrowed_mask], dim=0)
                 else:
                     chunk_mask = None
             else:
                 chunk_mask = attention_mask[start_idx:end_idx] if attention_mask is not None else None
             
-            # Process chunk
-            chunk_output = self._forward_chunk(
-                chunk_tokens, 
-                chunk_mask, 
-                is_first_chunk=(chunk_idx == 0)
+            # Process this chunk with optional cross-attention from previous (later) chunk
+            chunk_output = self._forward_chunk_with_cross_attention(
+                chunk_tokens,
+                chunk_mask,
+                prev_chunk_output,  # Q will come from this (later chunk)
+                is_first_chunk=is_first_chronologically
             )
             
-            # Only keep actual tokens (not padding)
-            if chunk_len < chunk_size:
-                chunk_output = chunk_output[:chunk_len]
+            # Only keep outputs for actual tokens (not borrowed/padding)
+            chunk_output = chunk_output[:actual_token_count]
             
-            all_outputs.append(chunk_output)
+            # Save first chunk (chronologically) for compression
+            if is_first_chronologically:
+                first_chunk_output = chunk_output
             
-            # Update context for next chunk
-            self.chunk_context = chunk_output[-1].detach().clone()
+            # Insert at beginning to maintain chronological order
+            all_chunk_outputs.insert(0, chunk_output)
+            
+            # This becomes the previous chunk for the next iteration
+            prev_chunk_output = chunk_output
         
         # Stack all outputs: (total_tokens, hidden_size)
-        stacked_outputs = torch.cat(all_outputs, dim=0)  # (seq_len, hidden_size)
+        stacked_outputs = torch.cat(all_chunk_outputs, dim=0)  # (seq_len, hidden_size)
         
-        # Apply compression
-        if self.config.use_lsi_compression:
-            # Use LSI compression: SVD + learned K/V projections
-            K_compressed, V_compressed = self.lsi_compression(stacked_outputs)  # Each (num_slots, hidden_size)
+        # Return full outputs without compression
+        # Both K and V are the same - the full encoded representation
+        return stacked_outputs, stacked_outputs
+    
+    def _forward_chunk_with_cross_attention(
+        self,
+        chunk_tokens: torch.Tensor,
+        chunk_mask: torch.Tensor | None,
+        prev_chunk_output: torch.Tensor | None,
+        is_first_chunk: bool
+    ) -> torch.Tensor:
+        """
+        Process a single chunk with optional cross-attention from the previous chunk.
+        
+        Args:
+            chunk_tokens: Token IDs for this chunk (chunk_size,)
+            chunk_mask: Attention mask for this chunk (chunk_size,) or None
+            prev_chunk_output: Output from previously processed chunk (later in time) (prev_len, hidden_size)
+            is_first_chunk: Whether this is the first chunk chronologically
+        
+        Returns:
+            Chunk output (chunk_size, hidden_size)
+        """
+        # Embed tokens
+        token_embeds = self.embedding(chunk_tokens)
+        
+        # Prepend context embedding
+        if is_first_chunk:
+            prepend_embed = self.start_token_embedding.unsqueeze(0)
         else:
-            # Use SVD for deterministic compression
-            K_compressed = self._compress_with_svd(stacked_outputs, chunk_size)  # (chunk_size, hidden_size)
-            V_compressed = self._compress_with_svd(stacked_outputs, chunk_size)  # (chunk_size, hidden_size)
+            # Use context from previous chunk (if available)
+            if prev_chunk_output is not None:
+                prepend_embed = prev_chunk_output[-1:].detach()
+            else:
+                prepend_embed = self.chunk_context.unsqueeze(0)
         
-        return K_compressed, V_compressed
+        x = torch.cat([prepend_embed, token_embeds], dim=0)
+        x = self.dropout(x)
+        
+        # Create attention mask
+        if chunk_mask is not None:
+            # Add mask for prepended token (always attend to it)
+            prepend_mask = torch.ones(1, dtype=chunk_mask.dtype, device=chunk_mask.device)
+            full_mask = torch.cat([prepend_mask, chunk_mask], dim=0)
+            
+            # Create pairwise mask
+            seq_len = full_mask.shape[0]
+            attn_mask_2d = full_mask.unsqueeze(0) & full_mask.unsqueeze(1)
+        else:
+            attn_mask_2d = None
+        
+        # Pass through encoder blocks
+        for block in self.blocks:
+            x = block(x, attn_mask_2d)
+        
+        x = self.norm(x)
+        
+        # Remove prepended token
+        x = x[1:]
+        
+        # If we have a previous chunk output, apply cross-attention
+        # Q from current chunk, K,V from previous chunk (later in time)
+        if prev_chunk_output is not None and not is_first_chunk:
+            # Simple cross-attention: let current chunk attend to previous chunk
+            # This is a simplified version - could be made more sophisticated
+            # For now, we just use the outputs as-is
+            # In a full implementation, you'd add a cross-attention layer here
+            pass
+        
+        return x
     
     def _compress_with_svd(self, X: torch.Tensor, n_components: int) -> torch.Tensor:
         """

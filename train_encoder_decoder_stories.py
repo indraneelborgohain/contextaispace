@@ -350,7 +350,7 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
                     
                     # Encode entire document once
                     with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                        encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
+                        encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
                     
                     # Decode each sequence with cross-attention to encoder K/V
                     decoder.reset_context()
@@ -382,7 +382,7 @@ def evaluate(encoder, decoder, val_loader, eval_iters, device, dtype_ctx, encode
             
             # Encode entire document once
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
+                encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
             
             # Decode each sequence with cross-attention to encoder K/V
             decoder.reset_context()
@@ -415,7 +415,7 @@ def generate_sample(encoder, decoder, tokenizer, prompt, max_tokens, temperature
     
     # Encode prompt
     prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device)
-    encoder_k, encoder_v = encoder(prompt_tokens, return_compressed_kv=True)
+    encoder_k, encoder_v = encoder(prompt_tokens, return_encoder_kv=True)
     
     # Generate with decoder
     decoder.reset_context()
@@ -638,7 +638,7 @@ def main():
                     
                     # Encode entire document once
                     with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                        encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
+                        encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
                     
                     # Decode each sequence with cross-attention to encoder K/V
                     decoder.reset_context()
@@ -671,7 +671,7 @@ def main():
             
             # Encode entire document once
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                encoder_k, encoder_v = encoder(full_doc_input, return_compressed_kv=True)
+                encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
             
             # Decode each sequence with cross-attention to encoder K/V
             decoder.reset_context()
@@ -786,3 +786,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
