@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-train_multitask.py - Multi-task training on TinyStories and SQuAD
+train_multitask.py - Multi-task training on SQuAD and MS MARCO
 
-Combines training from both datasets to create a more robust encoder-decoder model:
-- TinyStories: Story continuation (encoder processes context, decoder generates next chunk)
-- SQuAD: Question answering (encoder processes passage, decoder generates answer)
+Combines training from both QA datasets to create a robust encoder-decoder model:
+- SQuAD: Extractive QA from Wikipedia passages
+- MS MARCO: Abstractive QA from Bing search passages
 
 Training modes:
 1. Alternating: Alternate between datasets each batch
 2. Mixed: Randomly sample from combined dataset pool
 3. Sequential: Train on one dataset first, then fine-tune on the other
-4. Curriculum: Start with simpler task (stories) then add QA
+4. Curriculum: Start with simpler task then add complexity
 
 Architecture:
-- Shared encoder: Bidirectional attention for context understanding
-- Shared decoder: Generates output while attending to encoder via cross-attention
+- Encoder: Context <SEP> Question (question-aware encoding)
+- Decoder: <A> Answer (generates answer with cross-attention to encoder)
 """
 import argparse
 import json
@@ -35,7 +35,6 @@ from architecture.config import ModelConfig
 from architecture.encoder import BidirectionalEncoder
 from architecture.tokenizer import get_tokenizer
 from dataloader.trainer import clear_gpu_memory
-from dataloader.data_loader_context import create_context_dataloaders
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -55,11 +54,11 @@ class TrainingMode(Enum):
 # ------------------------------- args ----------------------------------------
 def get_args():
     ap = argparse.ArgumentParser(
-        description="Multi-task training on TinyStories and SQuAD datasets"
+        description="Multi-task training on SQuAD and MS MARCO datasets"
     )
     
     # Output
-    ap.add_argument("--out_dir", type=str, default="model_multitask")
+    ap.add_argument("--out_dir", type=str, default="model_multitask_qa")
     ap.add_argument("--model_size", type=str, choices=["toy", "small", "medium", "large"], default="medium")
     
     # Training mode
@@ -67,27 +66,23 @@ def get_args():
                     choices=["alternating", "mixed", "sequential", "curriculum"],
                     default="alternating",
                     help="How to combine the two datasets during training")
-    ap.add_argument("--stories_weight", type=float, default=0.5,
-                    help="Weight for TinyStories in mixed mode (0-1)")
+    ap.add_argument("--squad_weight", type=float, default=0.5,
+                    help="Weight for SQuAD in mixed mode (0-1), MS MARCO gets 1-squad_weight")
     ap.add_argument("--curriculum_switch_iter", type=int, default=2500,
-                    help="Iteration to switch from stories-only to mixed (curriculum mode)")
+                    help="Iteration to switch from first dataset to mixed (curriculum mode)")
     ap.add_argument("--sequential_switch_iter", type=int, default=5000,
                     help="Iteration to switch from first to second dataset (sequential mode)")
     
-    # Dataset selection for sequential mode
-    ap.add_argument("--sequential_first", type=str, choices=["stories", "squad"], default="stories",
-                    help="Which dataset to train on first in sequential mode")
+    # Dataset selection for sequential/curriculum mode
+    ap.add_argument("--first_dataset", type=str, choices=["squad", "msmarco"], default="squad",
+                    help="Which dataset to train on first in sequential/curriculum mode")
     
     # Training hyperparameters
     ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--block_size", type=int, default=512,
-                    help="Max sequence length for TinyStories")
-    ap.add_argument("--encoder_chunk_size", type=int, default=512,
-                    help="Size of encoder context chunks (should match block_size)")
     ap.add_argument("--max_context_len", type=int, default=512,
-                    help="Max context length for SQuAD")
+                    help="Max context length for encoder")
     ap.add_argument("--max_answer_len", type=int, default=128,
-                    help="Max answer length for SQuAD")
+                    help="Max answer length for decoder")
     ap.add_argument("--max_iters", type=int, default=10000)
     ap.add_argument("--log_interval", type=int, default=10)
     ap.add_argument("--eval_interval", type=int, default=200)
@@ -97,8 +92,6 @@ def get_args():
     ap.add_argument("--save_every", type=int, default=500)
     ap.add_argument("--sample_every", type=int, default=250)
     ap.add_argument("--sample_tokens", type=int, default=100)
-    ap.add_argument("--top_k", type=int, default=200)
-    ap.add_argument("--temperature", type=float, default=0.8)
     
     # Optimizer
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -130,10 +123,9 @@ def get_args():
     
     # TensorBoard
     ap.add_argument("--use_tensorboard", action="store_true", default=False)
-    ap.add_argument("--log_dir", type=str, default="runs_multitask")
+    ap.add_argument("--log_dir", type=str, default="runs_multitask_qa")
     
-    # Special tokens for SQuAD
-    ap.add_argument("--question_token", type=str, default="<Q>")
+    # Special tokens
     ap.add_argument("--sep_token", type=str, default="<SEP>")
     
     # Encoder compression
@@ -145,8 +137,25 @@ def get_args():
     # Task-specific loss weighting
     ap.add_argument("--squad_loss_weight", type=float, default=1.0,
                     help="Weight for SQuAD loss")
-    ap.add_argument("--stories_loss_weight", type=float, default=1.0,
-                    help="Weight for TinyStories loss")
+    ap.add_argument("--msmarco_loss_weight", type=float, default=1.0,
+                    help="Weight for MS MARCO loss")
+    
+    # MS MARCO specific
+    ap.add_argument("--msmarco_version", type=str, default="v2.1",
+                    choices=["v1.1", "v2.1"],
+                    help="MS MARCO dataset version")
+    ap.add_argument("--use_all_passages", action="store_true", default=False,
+                    help="Concatenate all passages (vs just selected passage)")
+    ap.add_argument("--max_passages", type=int, default=3,
+                    help="Max number of passages to use if use_all_passages")
+    ap.add_argument("--skip_no_answer", action="store_true", default=True,
+                    help="Skip examples with 'No Answer Present' label")
+    
+    # Data limits (for faster iteration)
+    ap.add_argument("--max_train_examples", type=int, default=None,
+                    help="Limit training examples per dataset (None = use all)")
+    ap.add_argument("--max_val_examples", type=int, default=None,
+                    help="Limit validation examples per dataset (None = use all)")
     
     return ap.parse_args()
 
@@ -157,7 +166,6 @@ def load_pretrained_decoder(decoder, pretrained_path, device):
     print(f"Loading pretrained decoder from {pretrained_path}...")
     checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
     
-    # Extract decoder state dict
     if 'model' in checkpoint:
         pretrained_state = checkpoint['model']
     elif 'decoder' in checkpoint:
@@ -370,10 +378,10 @@ def build_config(name: str, vocab_size: int, is_encoder: bool = False,
 
 
 # ------------------------------ SQuAD data ----------------------------------
-def format_squad_example(example, tokenizer, max_context_len, max_answer_len, q_token, sep_token):
+def format_squad_example(example, tokenizer, max_context_len, max_answer_len, sep_token):
     """Format a SQuAD example for encoder-decoder training
     
-    New Architecture:
+    Architecture:
     - Encoder: Context <SEP> Question (question-aware context encoding)
     - Decoder: <A> Answer (generates answer with cross-attention to encoder)
     """
@@ -417,7 +425,8 @@ def format_squad_example(example, tokenizer, max_context_len, max_answer_len, q_
     }
 
 
-def load_squad_data(tokenizer, max_context_len, max_answer_len, q_token, sep_token):
+def load_squad_data(tokenizer, max_context_len, max_answer_len, sep_token, 
+                    max_train=None, max_val=None):
     """Load and format SQuAD dataset"""
     print("Loading SQuAD dataset...")
     dataset = load_dataset("squad")
@@ -425,16 +434,20 @@ def load_squad_data(tokenizer, max_context_len, max_answer_len, q_token, sep_tok
     train_examples = []
     val_examples = []
     
-    for example in dataset['train']:
+    for i, example in enumerate(dataset['train']):
+        if max_train and len(train_examples) >= max_train:
+            break
         formatted = format_squad_example(
-            example, tokenizer, max_context_len, max_answer_len, q_token, sep_token
+            example, tokenizer, max_context_len, max_answer_len, sep_token
         )
         if formatted is not None:
             train_examples.append(formatted)
     
-    for example in dataset['validation']:
+    for i, example in enumerate(dataset['validation']):
+        if max_val and len(val_examples) >= max_val:
+            break
         formatted = format_squad_example(
-            example, tokenizer, max_context_len, max_answer_len, q_token, sep_token
+            example, tokenizer, max_context_len, max_answer_len, sep_token
         )
         if formatted is not None:
             val_examples.append(formatted)
@@ -443,8 +456,145 @@ def load_squad_data(tokenizer, max_context_len, max_answer_len, q_token, sep_tok
     return train_examples, val_examples
 
 
-def get_squad_batch(examples, batch_size, device):
-    """Get a random batch from SQuAD examples"""
+# ------------------------------ MS MARCO data -------------------------------
+def format_msmarco_example(example, tokenizer, max_context_len, max_answer_len, 
+                           sep_token, use_all_passages, max_passages, skip_no_answer):
+    """Format a MS MARCO example for encoder-decoder training
+    
+    Architecture:
+    - Encoder: Context <SEP> Query (query-aware context encoding)
+    - Decoder: <A> Answer (generates answer with cross-attention to encoder)
+    """
+    query = example.get('query', '')
+    
+    # Get passages
+    passages_data = example.get('passages', {})
+    passage_texts = passages_data.get('passage_text', [])
+    is_selected = passages_data.get('is_selected', [])
+    
+    # Get answers
+    answers = example.get('answers', [])
+    well_formed = example.get('wellFormedAnswers', [])
+    
+    # Skip if no valid answer
+    if not answers or (len(answers) == 1 and answers[0].lower() == 'no answer present.'):
+        if skip_no_answer:
+            return None
+        answer = "No answer available."
+    else:
+        # Prefer well-formed answers if available
+        if well_formed and len(well_formed) > 0 and well_formed[0]:
+            answer = well_formed[0]
+        else:
+            answer = answers[0]
+    
+    # Build context from passages
+    if use_all_passages and len(passage_texts) > 1:
+        selected_passages = []
+        # First add selected passages
+        for text, selected in zip(passage_texts, is_selected):
+            if selected == 1 and len(selected_passages) < max_passages:
+                selected_passages.append(text)
+        # If not enough, add others
+        for text, selected in zip(passage_texts, is_selected):
+            if selected != 1 and len(selected_passages) < max_passages:
+                selected_passages.append(text)
+        context = " [SEP] ".join(selected_passages)
+    else:
+        selected_passages = [
+            text for text, selected in zip(passage_texts, is_selected) 
+            if selected == 1
+        ]
+        if selected_passages:
+            context = selected_passages[0]
+        elif passage_texts:
+            context = passage_texts[0]
+        else:
+            return None
+    
+    # Tokenize
+    context_tokens = tokenizer.encode(context)
+    query_tokens = tokenizer.encode(query)
+    answer_tokens = tokenizer.encode(answer)
+    sep_marker = tokenizer.encode(sep_token)
+    a_marker = tokenizer.encode("<A>")
+    
+    # Build encoder input: Context <SEP> Query
+    max_context_space = max_context_len - len(query_tokens) - len(sep_marker)
+    if max_context_space < 50:
+        return None
+    
+    if len(context_tokens) > max_context_space:
+        context_tokens = context_tokens[:max_context_space]
+    
+    encoder_tokens = context_tokens + sep_marker + query_tokens
+    
+    # Build decoder input: <A> Answer
+    if len(answer_tokens) > max_answer_len - len(a_marker):
+        answer_tokens = answer_tokens[:max_answer_len - len(a_marker)]
+    
+    decoder_tokens = a_marker + answer_tokens
+    target_tokens = answer_tokens + [0]
+    
+    return {
+        'encoder_tokens': encoder_tokens,
+        'decoder_tokens': decoder_tokens,
+        'target_tokens': target_tokens,
+        'task': 'msmarco',
+        'question': query,
+        'answer': answer,
+    }
+
+
+def load_msmarco_data(tokenizer, max_context_len, max_answer_len, sep_token,
+                      version, use_all_passages, max_passages, skip_no_answer,
+                      max_train=None, max_val=None):
+    """Load and format MS MARCO dataset"""
+    print("Loading MS MARCO dataset...")
+    print("(This may take a while on first download)")
+    
+    try:
+        dataset = load_dataset("ms_marco", version)
+    except Exception as e:
+        print(f"Error loading ms_marco: {e}")
+        print("Trying alternative dataset name...")
+        try:
+            dataset = load_dataset("microsoft/ms_marco", version)
+        except Exception as e2:
+            print(f"Error: {e2}")
+            raise
+    
+    print("Formatting MS MARCO examples...")
+    train_examples = []
+    val_examples = []
+    
+    for i, example in enumerate(dataset['train']):
+        if max_train and len(train_examples) >= max_train:
+            break
+        formatted = format_msmarco_example(
+            example, tokenizer, max_context_len, max_answer_len,
+            sep_token, use_all_passages, max_passages, skip_no_answer
+        )
+        if formatted is not None:
+            train_examples.append(formatted)
+    
+    for i, example in enumerate(dataset['validation']):
+        if max_val and len(val_examples) >= max_val:
+            break
+        formatted = format_msmarco_example(
+            example, tokenizer, max_context_len, max_answer_len,
+            sep_token, use_all_passages, max_passages, skip_no_answer
+        )
+        if formatted is not None:
+            val_examples.append(formatted)
+    
+    print(f"MS MARCO - Train: {len(train_examples)}, Val: {len(val_examples)}")
+    return train_examples, val_examples
+
+
+# ------------------------------ batching ------------------------------------
+def get_batch(examples, batch_size, device):
+    """Get a random batch from examples (works for both SQuAD and MS MARCO)"""
     batch = random.sample(examples, min(batch_size, len(examples)))
     
     max_encoder = max(len(ex['encoder_tokens']) for ex in batch)
@@ -470,25 +620,21 @@ def get_squad_batch(examples, batch_size, device):
     )
 
 
-# ------------------------------ training helpers ----------------------------
-def get_lr(it: int, warmup_iters: int, max_iters: int, lr: float, min_lr: float) -> float:
-    """Cosine learning rate schedule with warmup"""
+# ------------------------------ LR schedule ---------------------------------
+def get_lr(it, warmup_iters, lr_decay_iters, max_lr, min_lr):
+    """Learning rate decay schedule with warmup"""
     if it < warmup_iters:
-        return lr * it / warmup_iters
-    if it > max_iters:
+        return max_lr * it / warmup_iters
+    if it > lr_decay_iters:
         return min_lr
-    decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (lr - min_lr)
+    return min_lr + coeff * (max_lr - min_lr)
 
 
-def train_squad_step(encoder, decoder, batch, device, dtype_ctx, loss_weight=1.0):
-    """Single training step on SQuAD data
-    
-    New Architecture:
-    - Encoder: Context <SEP> Question
-    - Decoder: <A> Answer (cross-attends to encoder)
-    """
+# ------------------------------ training step -------------------------------
+def train_step(encoder, decoder, batch, device, dtype_ctx, loss_weight=1.0):
+    """Single training step on QA data (works for both SQuAD and MS MARCO)"""
     encoder_batch, decoder_batch, target_batch = batch
     
     total_loss = 0.0
@@ -508,7 +654,7 @@ def train_squad_step(encoder, decoder, batch, device, dtype_ctx, loss_weight=1.0
             decoder.reset_context()
             logits = decoder(decoder_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
             
-            # Loss on answer tokens (logits from <A> and answer predict answer tokens)
+            # Loss on answer tokens
             loss = F.cross_entropy(
                 logits[:-1].view(-1, logits.size(-1)),
                 targets[:len(logits)-1].view(-1),
@@ -520,86 +666,15 @@ def train_squad_step(encoder, decoder, batch, device, dtype_ctx, loss_weight=1.0
     return (total_loss / encoder_batch.shape[0]) * loss_weight
 
 
-def train_stories_step(encoder, decoder, batch, device, dtype_ctx, loss_weight=1.0):
-    """Single training step on TinyStories data"""
-    inputs, targets, doc_starts, lengths = batch
-    inputs = inputs.to(device)
-    targets = targets.to(device)
-    
-    seq_inputs_list = []
-    seq_targets_list = []
-    total_loss = 0.0
-    valid_samples = 0
-    
-    for j in range(inputs.shape[0]):
-        seq_input = inputs[j]
-        seq_target = targets[j]
-        seq_len = lengths[j].item()
-        
-        if seq_len < seq_input.shape[0]:
-            seq_input = seq_input[:seq_len]
-            seq_target = seq_target[:seq_len]
-        
-        if doc_starts[j]:
-            # Process accumulated sequences from previous document
-            if seq_inputs_list:
-                full_doc_input = torch.cat(seq_inputs_list, dim=0)
-                
-                with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                    encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
-                
-                decoder.reset_context()
-                for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
-                    with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                        logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
-                        loss = F.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            seq_tgt.view(-1),
-                            ignore_index=-100
-                        )
-                    total_loss += loss
-                    valid_samples += 1
-            
-            seq_inputs_list = []
-            seq_targets_list = []
-        
-        seq_inputs_list.append(seq_input)
-        seq_targets_list.append(seq_target)
-    
-    # Process remaining sequences
-    if seq_inputs_list:
-        full_doc_input = torch.cat(seq_inputs_list, dim=0)
-        
-        with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-            encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
-        
-        decoder.reset_context()
-        for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
-            with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    seq_tgt.view(-1),
-                    ignore_index=-100
-                )
-            total_loss += loss
-            valid_samples += 1
-    
-    if valid_samples == 0:
-        return None
-    
-    return (total_loss / valid_samples) * loss_weight
-
-
 @torch.no_grad()
-def evaluate_squad(encoder, decoder, val_examples, eval_iters, device, dtype_ctx, batch_size):
-    """Evaluate on SQuAD validation set"""
+def evaluate(encoder, decoder, val_examples, eval_iters, device, dtype_ctx, batch_size):
+    """Evaluate on validation set"""
     encoder.eval()
     decoder.eval()
     
     losses = []
     for _ in range(eval_iters):
-        batch = get_squad_batch(val_examples, batch_size, device)
+        batch = get_batch(val_examples, batch_size, device)
         encoder_batch, decoder_batch, target_batch = batch
         
         batch_loss = 0.0
@@ -632,120 +707,8 @@ def evaluate_squad(encoder, decoder, val_examples, eval_iters, device, dtype_ctx
 
 
 @torch.no_grad()
-def evaluate_stories(encoder, decoder, val_loader, eval_iters, device, dtype_ctx):
-    """Evaluate on TinyStories validation set"""
-    encoder.eval()
-    decoder.eval()
-    
-    losses = []
-    for i, batch in enumerate(val_loader):
-        if i >= eval_iters:
-            break
-        
-        inputs, targets, doc_starts, lengths = batch
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        
-        seq_inputs_list = []
-        seq_targets_list = []
-        batch_losses = []
-        
-        for j in range(inputs.shape[0]):
-            seq_input = inputs[j]
-            seq_target = targets[j]
-            seq_len = lengths[j].item()
-            
-            if seq_len < seq_input.shape[0]:
-                seq_input = seq_input[:seq_len]
-                seq_target = seq_target[:seq_len]
-            
-            if doc_starts[j] and seq_inputs_list:
-                full_doc_input = torch.cat(seq_inputs_list, dim=0)
-                
-                with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                    encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
-                
-                decoder.reset_context()
-                for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
-                    with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                        logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
-                        loss = F.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            seq_tgt.view(-1),
-                            ignore_index=-100
-                        )
-                    batch_losses.append(loss.item())
-                
-                seq_inputs_list = []
-                seq_targets_list = []
-            
-            seq_inputs_list.append(seq_input)
-            seq_targets_list.append(seq_target)
-        
-        # Process remaining
-        if seq_inputs_list:
-            full_doc_input = torch.cat(seq_inputs_list, dim=0)
-            with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                encoder_k, encoder_v = encoder(full_doc_input, return_encoder_kv=True)
-            
-            decoder.reset_context()
-            for seq_in, seq_tgt in zip(seq_inputs_list, seq_targets_list):
-                with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                    logits = decoder(seq_in, encoder_k=encoder_k, encoder_v=encoder_v)
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        seq_tgt.view(-1),
-                        ignore_index=-100
-                    )
-                batch_losses.append(loss.item())
-        
-        if batch_losses:
-            losses.append(sum(batch_losses) / len(batch_losses))
-    
-    encoder.train()
-    decoder.train()
-    clear_gpu_memory()
-    return sum(losses) / len(losses) if losses else float('inf')
-
-
-@torch.no_grad()
-def generate_story_sample(encoder, decoder, tokenizer, prompt, max_tokens, temperature, top_k, device):
-    """Generate story continuation"""
-    encoder.eval()
-    decoder.eval()
-    
-    prompt_tokens = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device)
-    encoder_k, encoder_v = encoder(prompt_tokens, return_encoder_kv=True)
-    
-    decoder.reset_context()
-    tokens = prompt_tokens[-50:] if len(prompt_tokens) > 50 else prompt_tokens
-    
-    for _ in range(max_tokens):
-        logits = decoder(tokens, encoder_k=encoder_k, encoder_v=encoder_v)
-        logits = logits[-1] / temperature
-        
-        if top_k > 0:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[-1]] = -float('inf')
-        
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        tokens = torch.cat([tokens, next_token])
-    
-    result = tokenizer.decode(tokens.tolist())
-    encoder.train()
-    decoder.train()
-    return result
-
-
-@torch.no_grad()
-def generate_squad_sample(encoder, decoder, tokenizer, context, question, max_tokens, device, q_token, sep_token):
-    """Generate QA answer
-    
-    New Architecture:
-    - Encoder: Context <SEP> Question
-    - Decoder: Start with <A>, generate answer with cross-attention to encoder
-    """
+def generate_answer(encoder, decoder, tokenizer, context, question, max_tokens, device, sep_token):
+    """Generate answer given context and question"""
     encoder.eval()
     decoder.eval()
     
@@ -859,30 +822,28 @@ def main():
     print("Loading datasets...")
     print("="*60)
     
-    # TinyStories
-    print("\n--- TinyStories ---")
-    stories_train_loader, stories_val_loader = create_context_dataloaders(
-        batch_size=args.batch_size,
-        max_length=args.block_size,
-        num_workers=4,
-        shuffle_train=True
-    )
-    stories_train_iter = iter(stories_train_loader)
-    
     # SQuAD
     print("\n--- SQuAD ---")
     squad_train, squad_val = load_squad_data(
-        tokenizer, args.max_context_len, args.max_answer_len,
-        args.question_token, args.sep_token
+        tokenizer, args.max_context_len, args.max_answer_len, args.sep_token,
+        args.max_train_examples, args.max_val_examples
+    )
+    
+    # MS MARCO
+    print("\n--- MS MARCO ---")
+    msmarco_train, msmarco_val = load_msmarco_data(
+        tokenizer, args.max_context_len, args.max_answer_len, args.sep_token,
+        args.msmarco_version, args.use_all_passages, args.max_passages, 
+        args.skip_no_answer, args.max_train_examples, args.max_val_examples
     )
     
     print(f"\nTraining mode: {training_mode.value}")
     if training_mode == TrainingMode.MIXED:
-        print(f"Stories weight: {args.stories_weight}, SQuAD weight: {1 - args.stories_weight}")
+        print(f"SQuAD weight: {args.squad_weight}, MS MARCO weight: {1 - args.squad_weight}")
     elif training_mode == TrainingMode.CURRICULUM:
-        print(f"Curriculum switch at iteration: {args.curriculum_switch_iter}")
+        print(f"Start with {args.first_dataset}, switch to mixed at iter {args.curriculum_switch_iter}")
     elif training_mode == TrainingMode.SEQUENTIAL:
-        print(f"Sequential: {args.sequential_first} first, switch at iter {args.sequential_switch_iter}")
+        print(f"Sequential: {args.first_dataset} first, switch at iter {args.sequential_switch_iter}")
     
     # Setup optimizer
     print("\nSetting up optimizer...")
@@ -933,15 +894,17 @@ def main():
     
     # Training loop
     print("\n" + "="*60)
-    print("Starting multi-task training...")
+    print("Starting multi-task QA training...")
     print(f"Max iterations: {args.max_iters}")
     print("="*60 + "\n")
     
     iter_num = start_iter
     running_loss = 0.0
-    running_stories_loss = 0.0
     running_squad_loss = 0.0
+    running_msmarco_loss = 0.0
     log_count = 0
+    squad_count = 0
+    msmarco_count = 0
     best_val_loss = float('inf')
     
     t0 = time.time()
@@ -949,26 +912,25 @@ def main():
     while iter_num < args.max_iters:
         # Determine which task to train on this iteration
         if training_mode == TrainingMode.ALTERNATING:
-            train_stories = (iter_num % 2 == 0)
-            train_squad = (iter_num % 2 == 1)
+            train_squad = (iter_num % 2 == 0)
+            train_msmarco = (iter_num % 2 == 1)
         elif training_mode == TrainingMode.MIXED:
-            train_stories = random.random() < args.stories_weight
-            train_squad = not train_stories
+            train_squad = random.random() < args.squad_weight
+            train_msmarco = not train_squad
         elif training_mode == TrainingMode.SEQUENTIAL:
-            if args.sequential_first == "stories":
-                train_stories = (iter_num < args.sequential_switch_iter)
-                train_squad = not train_stories
-            else:
+            if args.first_dataset == "squad":
                 train_squad = (iter_num < args.sequential_switch_iter)
-                train_stories = not train_squad
-        elif training_mode == TrainingMode.CURRICULUM:
-            # Start with stories only, then mix in SQuAD
-            if iter_num < args.curriculum_switch_iter:
-                train_stories = True
-                train_squad = False
+                train_msmarco = not train_squad
             else:
-                train_stories = random.random() < args.stories_weight
-                train_squad = not train_stories
+                train_msmarco = (iter_num < args.sequential_switch_iter)
+                train_squad = not train_msmarco
+        elif training_mode == TrainingMode.CURRICULUM:
+            if iter_num < args.curriculum_switch_iter:
+                train_squad = (args.first_dataset == "squad")
+                train_msmarco = not train_squad
+            else:
+                train_squad = random.random() < args.squad_weight
+                train_msmarco = not train_squad
         
         # Update learning rate
         if use_differential_lr:
@@ -987,30 +949,21 @@ def main():
         loss = None
         task_name = ""
         
-        if train_stories:
-            try:
-                stories_batch = next(stories_train_iter)
-            except StopIteration:
-                stories_train_iter = iter(stories_train_loader)
-                stories_batch = next(stories_train_iter)
-            
-            loss = train_stories_step(
-                encoder, decoder, stories_batch, device, dtype_ctx, 
-                args.stories_loss_weight
-            )
-            task_name = "stories"
-            if loss is not None:
-                running_stories_loss += loss.item()
-        
         if train_squad:
-            squad_batch = get_squad_batch(squad_train, args.batch_size, device)
-            loss = train_squad_step(
-                encoder, decoder, squad_batch, device, dtype_ctx,
-                args.squad_loss_weight
-            )
+            batch = get_batch(squad_train, args.batch_size, device)
+            loss = train_step(encoder, decoder, batch, device, dtype_ctx, args.squad_loss_weight)
             task_name = "squad"
             if loss is not None:
                 running_squad_loss += loss.item()
+                squad_count += 1
+        
+        elif train_msmarco:
+            batch = get_batch(msmarco_train, args.batch_size, device)
+            loss = train_step(encoder, decoder, batch, device, dtype_ctx, args.msmarco_loss_weight)
+            task_name = "msmarco"
+            if loss is not None:
+                running_msmarco_loss += loss.item()
+                msmarco_count += 1
         
         if loss is None:
             continue
@@ -1035,46 +988,48 @@ def main():
             t1 = time.time()
             dt = t1 - t0
             
-            stories_avg = running_stories_loss / max(1, log_count // 2) if running_stories_loss > 0 else 0
-            squad_avg = running_squad_loss / max(1, log_count // 2) if running_squad_loss > 0 else 0
+            squad_avg = running_squad_loss / max(1, squad_count)
+            msmarco_avg = running_msmarco_loss / max(1, msmarco_count)
             
             print(f"iter {iter_num + 1:5d} | loss {avg_loss:.4f} | "
-                  f"stories {stories_avg:.4f} | squad {squad_avg:.4f} | "
+                  f"squad {squad_avg:.4f} | msmarco {msmarco_avg:.4f} | "
                   f"lr {lr:.6f} | {dt*1000:.2f}ms")
             
             if writer:
                 writer.add_scalar('Loss/train', avg_loss, iter_num + 1)
-                writer.add_scalar('Loss/stories', stories_avg, iter_num + 1)
                 writer.add_scalar('Loss/squad', squad_avg, iter_num + 1)
+                writer.add_scalar('Loss/msmarco', msmarco_avg, iter_num + 1)
                 writer.add_scalar('Learning_rate', lr, iter_num + 1)
             
             running_loss = 0.0
-            running_stories_loss = 0.0
             running_squad_loss = 0.0
+            running_msmarco_loss = 0.0
             log_count = 0
+            squad_count = 0
+            msmarco_count = 0
             t0 = time.time()
         
         # Evaluation
         if (iter_num + 1) % args.eval_interval == 0:
             print(f"\n--- Evaluation at iter {iter_num + 1} ---")
             
-            stories_val_loss = evaluate_stories(
-                encoder, decoder, stories_val_loader, 
-                args.eval_iters, device, dtype_ctx
-            )
-            squad_val_loss = evaluate_squad(
+            squad_val_loss = evaluate(
                 encoder, decoder, squad_val,
                 args.eval_iters, device, dtype_ctx, args.batch_size
             )
+            msmarco_val_loss = evaluate(
+                encoder, decoder, msmarco_val,
+                args.eval_iters, device, dtype_ctx, args.batch_size
+            )
             
-            combined_val_loss = (stories_val_loss + squad_val_loss) / 2
+            combined_val_loss = (squad_val_loss + msmarco_val_loss) / 2
             
-            print(f"val_loss: stories={stories_val_loss:.4f}, squad={squad_val_loss:.4f}, "
+            print(f"val_loss: squad={squad_val_loss:.4f}, msmarco={msmarco_val_loss:.4f}, "
                   f"combined={combined_val_loss:.4f}")
             
             if writer:
-                writer.add_scalar('Loss/val_stories', stories_val_loss, iter_num + 1)
                 writer.add_scalar('Loss/val_squad', squad_val_loss, iter_num + 1)
+                writer.add_scalar('Loss/val_msmarco', msmarco_val_loss, iter_num + 1)
                 writer.add_scalar('Loss/val_combined', combined_val_loss, iter_num + 1)
             
             if combined_val_loss < best_val_loss:
@@ -1085,8 +1040,8 @@ def main():
                     'decoder': decoder.state_dict(),
                     'iter': iter_num + 1,
                     'val_loss': combined_val_loss,
-                    'stories_val_loss': stories_val_loss,
                     'squad_val_loss': squad_val_loss,
+                    'msmarco_val_loss': msmarco_val_loss,
                 }, best_path)
                 print(f"Saved best model (val_loss={combined_val_loss:.4f})")
             print()
@@ -1097,39 +1052,46 @@ def main():
             print(f"Samples at iter {iter_num + 1}")
             print('='*60)
             
-            # Story sample
-            story = generate_story_sample(
-                encoder, decoder, tokenizer, "Once upon a time",
-                args.sample_tokens, args.temperature, args.top_k, device
-            )
-            print(f"\n[STORY CONTINUATION]\n{story}")
-            
-            # QA sample - show question and generate answer
+            # SQuAD sample
             if squad_val:
                 sample_ex = random.choice(squad_val)
-                # Decode the encoder input (context + sep + question) for display
-                encoder_text = tokenizer.decode(sample_ex['encoder_tokens'])
                 question = sample_ex.get('question', 'N/A')
-                expected_answer = sample_ex.get('answer', 'N/A')
+                expected = sample_ex.get('answer', 'N/A')
                 
-                # Generate answer using the model
-                generated = generate_squad_sample(
+                # Get context from encoder tokens (just first part before SEP)
+                context = tokenizer.decode(sample_ex['encoder_tokens'][:256])
+                
+                generated = generate_answer(
                     encoder, decoder, tokenizer,
-                    tokenizer.decode(sample_ex['encoder_tokens'][:256]),  # truncated context
-                    question,
-                    args.sample_tokens, device,
-                    args.question_token, args.sep_token
+                    context, question,
+                    args.sample_tokens, device, args.sep_token
                 )
                 
-                print(f"\n[QA SAMPLE]")
+                print(f"\n[SQuAD SAMPLE]")
                 print(f"Question: {question}")
-                print(f"Expected: {expected_answer}")
+                print(f"Expected: {expected}")
+                print(f"Generated: {generated}")
+            
+            # MS MARCO sample
+            if msmarco_val:
+                sample_ex = random.choice(msmarco_val)
+                question = sample_ex.get('question', 'N/A')
+                expected = sample_ex.get('answer', 'N/A')
+                
+                context = tokenizer.decode(sample_ex['encoder_tokens'][:256])
+                
+                generated = generate_answer(
+                    encoder, decoder, tokenizer,
+                    context, question,
+                    args.sample_tokens, device, args.sep_token
+                )
+                
+                print(f"\n[MS MARCO SAMPLE]")
+                print(f"Question: {question}")
+                print(f"Expected: {expected}")
                 print(f"Generated: {generated}")
             
             print('='*60 + "\n")
-            
-            if writer:
-                writer.add_text('Samples/story', story, iter_num + 1)
         
         # Save checkpoint
         if (iter_num + 1) % args.save_every == 0:
