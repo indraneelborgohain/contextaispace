@@ -284,14 +284,18 @@ def build_config(name: str, vocab_size: int, use_lsi_compression: bool = False, 
     return encoder_config, decoder_config
 
 # ------------------------------ data ----------------------------------------
-def format_squad_example(example, tokenizer, max_context_len, max_qa_len, q_token, sep_token):
+def format_squad_example(example, tokenizer, max_context_len, max_answer_len, q_token, sep_token):
     """
     Format a single SQuAD example into encoder input and decoder input/target.
     
+    New Architecture:
+    - Encoder: Context <SEP> Question (bidirectional, question-aware context encoding)
+    - Decoder: <A> Answer (generates answer with cross-attention to encoder)
+    
     Returns:
-        context_tokens: Encoder input (truncated to max_context_len)
-        qa_tokens: Decoder input (<Q> question <SEP> answer)
-        target_tokens: Decoder target (question and SEP masked with -100, only answer tokens for loss)
+        encoder_tokens: Context + <SEP> + Question (for encoder)
+        decoder_tokens: <A> + Answer (for decoder input during training)
+        target_tokens: Answer tokens (for loss computation)
     """
     context = example['context']
     question = example['question']
@@ -307,43 +311,40 @@ def format_squad_example(example, tokenizer, max_context_len, max_qa_len, q_toke
     question_tokens = tokenizer.encode(question)
     answer_tokens = tokenizer.encode(answer)
     
-    # Add special tokens for question marker and separator
-    q_marker = tokenizer.encode(q_token)
+    # Special tokens
     sep_marker = tokenizer.encode(sep_token)
+    a_marker = tokenizer.encode("<A>")
     
-    # Truncate context if too long
-    if len(context_tokens) > max_context_len:
-        context_tokens = context_tokens[:max_context_len]
+    # Build encoder input: Context <SEP> Question
+    # Reserve space for question and separator
+    max_context_space = max_context_len - len(question_tokens) - len(sep_marker)
+    if max_context_space < 50:  # Need at least some context
+        return None
     
-    # Build decoder input: <Q> question <SEP> answer
-    qa_tokens = q_marker + question_tokens + sep_marker + answer_tokens
+    if len(context_tokens) > max_context_space:
+        context_tokens = context_tokens[:max_context_space]
     
-    # Truncate Q&A if too long
-    if len(qa_tokens) > max_qa_len:
-        # Preserve question and markers, truncate answer
-        max_answer_len = max_qa_len - len(q_marker) - len(question_tokens) - len(sep_marker)
-        if max_answer_len > 0:
-            answer_tokens = answer_tokens[:max_answer_len]
-            qa_tokens = q_marker + question_tokens + sep_marker + answer_tokens
-        else:
-            return None  # Question too long, skip
+    encoder_tokens = context_tokens + sep_marker + question_tokens
     
-    # Build target: mask question and SEP tokens, only compute loss on answer
-    # -100 tells cross_entropy to ignore these tokens
-    target_tokens = (
-        [-100] * len(q_marker) +
-        [-100] * len(question_tokens) +
-        [-100] * len(sep_marker) +
-        answer_tokens
-    )
+    # Build decoder input: <A> Answer (teacher forcing)
+    if len(answer_tokens) > max_answer_len - len(a_marker):
+        answer_tokens = answer_tokens[:max_answer_len - len(a_marker)]
+    
+    decoder_tokens = a_marker + answer_tokens
+    
+    # Target: Answer tokens only (shift by 1 for next-token prediction)
+    # The decoder predicts answer tokens after seeing <A>
+    target_tokens = answer_tokens + [tokenizer.encode("<|endoftext|>")[0] if hasattr(tokenizer, 'encode') else 0]
     
     return {
-        'context_tokens': context_tokens,
-        'qa_tokens': qa_tokens,
+        'encoder_tokens': encoder_tokens,
+        'decoder_tokens': decoder_tokens,
         'target_tokens': target_tokens,
+        'question': question,
+        'answer': answer,
     }
 
-def create_squad_dataloaders(tokenizer, max_context_len, max_qa_len, batch_size, q_token, sep_token):
+def create_squad_dataloaders(tokenizer, max_context_len, max_answer_len, batch_size, q_token, sep_token):
     """Create SQuAD dataloaders"""
     print("Loading SQuAD dataset...")
     dataset = load_dataset("squad")
@@ -355,7 +356,7 @@ def create_squad_dataloaders(tokenizer, max_context_len, max_qa_len, batch_size,
     # Process training set
     for example in dataset['train']:
         formatted = format_squad_example(
-            example, tokenizer, max_context_len, max_qa_len, q_token, sep_token
+            example, tokenizer, max_context_len, max_answer_len, q_token, sep_token
         )
         if formatted is not None:
             train_examples.append(formatted)
@@ -363,7 +364,7 @@ def create_squad_dataloaders(tokenizer, max_context_len, max_qa_len, batch_size,
     # Process validation set
     for example in dataset['validation']:
         formatted = format_squad_example(
-            example, tokenizer, max_context_len, max_qa_len, q_token, sep_token
+            example, tokenizer, max_context_len, max_answer_len, q_token, sep_token
         )
         if formatted is not None:
             val_examples.append(formatted)
@@ -379,30 +380,31 @@ def get_batch(examples, batch_size, device):
     batch = random.sample(examples, min(batch_size, len(examples)))
     
     # Find max lengths in batch
-    max_context = max(len(ex['context_tokens']) for ex in batch)
-    max_qa = max(len(ex['qa_tokens']) for ex in batch)
+    max_encoder = max(len(ex['encoder_tokens']) for ex in batch)
+    max_decoder = max(len(ex['decoder_tokens']) for ex in batch)
+    max_target = max(len(ex['target_tokens']) for ex in batch)
     
     # Prepare batch tensors
-    context_batch = []
-    qa_batch = []
+    encoder_batch = []
+    decoder_batch = []
     target_batch = []
     
     for ex in batch:
-        # Pad context
-        context = ex['context_tokens'] + [0] * (max_context - len(ex['context_tokens']))
-        context_batch.append(context)
+        # Pad encoder (context + question)
+        encoder = ex['encoder_tokens'] + [0] * (max_encoder - len(ex['encoder_tokens']))
+        encoder_batch.append(encoder)
         
-        # Pad Q&A
-        qa = ex['qa_tokens'] + [0] * (max_qa - len(ex['qa_tokens']))
-        qa_batch.append(qa)
+        # Pad decoder (<A> + answer)
+        decoder = ex['decoder_tokens'] + [0] * (max_decoder - len(ex['decoder_tokens']))
+        decoder_batch.append(decoder)
         
         # Pad targets
-        target = ex['target_tokens'] + [-100] * (max_qa - len(ex['target_tokens']))
+        target = ex['target_tokens'] + [-100] * (max_target - len(ex['target_tokens']))
         target_batch.append(target)
     
     return (
-        torch.tensor(context_batch, dtype=torch.long, device=device),
-        torch.tensor(qa_batch, dtype=torch.long, device=device),
+        torch.tensor(encoder_batch, dtype=torch.long, device=device),
+        torch.tensor(decoder_batch, dtype=torch.long, device=device),
         torch.tensor(target_batch, dtype=torch.long, device=device),
     )
 
@@ -426,38 +428,39 @@ def evaluate(encoder, decoder, val_examples, eval_iters, device, dtype_ctx, batc
     losses = []
     
     for _ in range(eval_iters):
-        context_batch, qa_batch, target_batch = get_batch(val_examples, batch_size, device)
+        encoder_batch, decoder_batch, target_batch = get_batch(val_examples, batch_size, device)
         
         batch_loss = 0.0
-        for i in range(context_batch.shape[0]):
-            context_tokens = context_batch[i]
-            qa_tokens = qa_batch[i]
+        for i in range(encoder_batch.shape[0]):
+            encoder_tokens = encoder_batch[i]
+            decoder_tokens = decoder_batch[i]
             targets = target_batch[i]
             
             # Remove padding
-            context_tokens = context_tokens[context_tokens != 0]
-            qa_mask = qa_tokens != 0
-            qa_tokens = qa_tokens[qa_mask]
-            targets = targets[qa_mask]
+            encoder_tokens = encoder_tokens[encoder_tokens != 0]
+            decoder_mask = decoder_tokens != 0
+            decoder_tokens = decoder_tokens[decoder_mask]
+            targets = targets[targets != -100]
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                # Encode context
-                encoder_k, encoder_v = encoder(context_tokens, return_encoder_kv=True)
+                # Encode context + question
+                encoder_k, encoder_v = encoder(encoder_tokens, return_encoder_kv=True)
                 
-                # Decode with cross-attention
+                # Decode answer with cross-attention
                 decoder.reset_context()
-                logits = decoder(qa_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
+                logits = decoder(decoder_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
                 
-                # Compute loss (only on answer tokens)
+                # Compute loss (predict next token)
+                # logits[:-1] predicts targets (shifted by 1)
                 loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
+                    logits[:-1].view(-1, logits.size(-1)),
+                    targets[:len(logits)-1].view(-1),
                     ignore_index=-100
                 )
             
             batch_loss += loss.item()
         
-        losses.append(batch_loss / context_batch.shape[0])
+        losses.append(batch_loss / encoder_batch.shape[0])
     
     encoder.train()
     decoder.train()
@@ -470,31 +473,36 @@ def generate_sample(encoder, decoder, tokenizer, context, question, max_tokens, 
     encoder.eval()
     decoder.eval()
     
-    # Tokenize
-    context_tokens = torch.tensor(tokenizer.encode(context), dtype=torch.long, device=device)
+    # Tokenize and build encoder input: context <SEP> question
+    context_tokens = tokenizer.encode(context)
     question_tokens = tokenizer.encode(question)
-    q_marker = tokenizer.encode(q_token)
     sep_marker = tokenizer.encode(sep_token)
     
-    # Encode context
-    encoder_k, encoder_v = encoder(context_tokens, return_encoder_kv=True)
+    encoder_tokens = context_tokens + sep_marker + question_tokens
+    encoder_tokens = torch.tensor(encoder_tokens, dtype=torch.long, device=device)
     
-    # Start with <Q> question <SEP>
-    tokens = q_marker + question_tokens + sep_marker
-    tokens = torch.tensor(tokens, dtype=torch.long, device=device)
+    # Encode context + question
+    encoder_k, encoder_v = encoder(encoder_tokens, return_encoder_kv=True)
+    
+    # Start with <A> token
+    a_marker = tokenizer.encode("<A>")
+    tokens = torch.tensor(a_marker, dtype=torch.long, device=device)
     
     # Generate answer
     decoder.reset_context()
+    generated = []
+    
     for _ in range(max_tokens):
         logits = decoder(tokens, encoder_k=encoder_k, encoder_v=encoder_v)
         next_token = torch.argmax(logits[-1], dim=-1).item()
+        generated.append(next_token)
         tokens = torch.cat([tokens, torch.tensor([next_token], device=device)])
         
-        # Stop at end of sequence or newline
-        if next_token == 0:  # Assuming 0 is padding/eos
+        # Stop at end of sequence
+        if next_token == 0:
             break
     
-    result = tokenizer.decode(tokens.tolist())
+    result = tokenizer.decode(generated)
     
     encoder.train()
     decoder.train()
@@ -651,7 +659,7 @@ def main():
     
     while iter_num < args.max_iters:
         # Get batch
-        context_batch, qa_batch, target_batch = get_batch(train_examples, args.batch_size, device)
+        encoder_batch, decoder_batch, target_batch = get_batch(train_examples, args.batch_size, device)
         
         # Update learning rate with cosine schedule
         if args.pretrained_decoder_path and (decoder_lr != new_layers_lr):
@@ -669,36 +677,36 @@ def main():
         
         # Forward pass
         total_loss = 0.0
-        for i in range(context_batch.shape[0]):
-            context_tokens = context_batch[i]
-            qa_tokens = qa_batch[i]
+        for i in range(encoder_batch.shape[0]):
+            encoder_tokens = encoder_batch[i]
+            decoder_tokens = decoder_batch[i]
             targets = target_batch[i]
             
             # Remove padding
-            context_tokens = context_tokens[context_tokens != 0]
-            qa_mask = qa_tokens != 0
-            qa_tokens = qa_tokens[qa_mask]
-            targets = targets[qa_mask]
+            encoder_tokens = encoder_tokens[encoder_tokens != 0]
+            decoder_mask = decoder_tokens != 0
+            decoder_tokens = decoder_tokens[decoder_mask]
+            targets = targets[targets != -100]
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                # Encode context
-                encoder_k, encoder_v = encoder(context_tokens, return_encoder_kv=True)
+                # Encode context + question
+                encoder_k, encoder_v = encoder(encoder_tokens, return_encoder_kv=True)
                 
-                # Decode with cross-attention
+                # Decode answer with cross-attention
                 decoder.reset_context()
-                logits = decoder(qa_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
+                logits = decoder(decoder_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
                 
-                # Compute loss (only on answer tokens)
+                # Compute loss (predict next token)
                 loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
+                    logits[:-1].view(-1, logits.size(-1)),
+                    targets[:len(logits)-1].view(-1),
                     ignore_index=-100
                 )
             
             total_loss += loss
         
         # Average loss over batch
-        loss = total_loss / context_batch.shape[0]
+        loss = total_loss / encoder_batch.shape[0]
         
         # Backward pass
         optimizer.zero_grad(set_to_none=True)
@@ -753,13 +761,25 @@ def main():
             # Take a random validation example
             import random
             sample_ex = random.choice(val_examples)
-            context = tokenizer.decode(sample_ex['context_tokens'])
-            # Extract question from qa_tokens (between <Q> and <A>)
-            qa_decoded = tokenizer.decode(sample_ex['qa_tokens'])
+            
+            # Decode tokens for display
+            encoder_text = tokenizer.decode(sample_ex['encoder_tokens'])
+            gold_answer = sample_ex.get('answer', tokenizer.decode(sample_ex['target_tokens']))
+            
+            # Generate answer
+            generated = generate_sample(
+                encoder, decoder, tokenizer,
+                tokenizer.decode(sample_ex['encoder_tokens'][:256]),  # Use partial context
+                sample_ex.get('question', ''),
+                max_tokens=50, device=device,
+                q_token=args.question_token, sep_token=args.sep_token
+            )
             
             print(f"\n{'='*80}\nSample at iter {iter_num + 1}:")
-            print(f"Context: {context[:200]}...")
-            print(f"Full Q&A: {qa_decoded}")
+            print(f"Question: {sample_ex.get('question', 'N/A')}")
+            print(f"Gold Answer: {gold_answer}")
+            print(f"Generated: {generated}")
+            print(f"Context: {encoder_text[:200]}...")
             print(f"{'='*80}\n")
         
         # Save checkpoint
