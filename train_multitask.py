@@ -82,6 +82,8 @@ def get_args():
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--block_size", type=int, default=512,
                     help="Max sequence length for TinyStories")
+    ap.add_argument("--encoder_chunk_size", type=int, default=512,
+                    help="Size of encoder context chunks (should match block_size)")
     ap.add_argument("--max_context_len", type=int, default=512,
                     help="Max context length for SQuAD")
     ap.add_argument("--max_qa_len", type=int, default=128,
