@@ -442,7 +442,7 @@ def evaluate(encoder, decoder, val_examples, eval_iters, device, dtype_ctx, batc
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
                 # Encode context
-                encoder_k, encoder_v = encoder(context_tokens, return_compressed_kv=True)
+                encoder_k, encoder_v = encoder(context_tokens, return_encoder_kv=True)
                 
                 # Decode with cross-attention
                 decoder.reset_context()
@@ -477,7 +477,7 @@ def generate_sample(encoder, decoder, tokenizer, context, question, max_tokens, 
     sep_marker = tokenizer.encode(sep_token)
     
     # Encode context
-    encoder_k, encoder_v = encoder(context_tokens, return_compressed_kv=True)
+    encoder_k, encoder_v = encoder(context_tokens, return_encoder_kv=True)
     
     # Start with <Q> question <SEP>
     tokens = q_marker + question_tokens + sep_marker
@@ -682,7 +682,7 @@ def main():
             
             with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
                 # Encode context
-                encoder_k, encoder_v = encoder(context_tokens, return_compressed_kv=True)
+                encoder_k, encoder_v = encoder(context_tokens, return_encoder_kv=True)
                 
                 # Decode with cross-attention
                 decoder.reset_context()

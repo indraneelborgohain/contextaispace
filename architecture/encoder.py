@@ -15,7 +15,6 @@ from dataclasses import dataclass
 
 from .attention_components import RMSNorm, RotaryEmbedding, _apply_rotary_emb
 from .transformer import swiglu
-from .lsi_compression import LSICompressionLayer
 
 
 @dataclass
