@@ -333,10 +333,10 @@ def main():
 def test_chunking_visualization():
     """
     Test that visualizes the chunking logic by printing each chunk.
-    Creates a context larger than sequence length and shows how it's split.
+    Creates a context larger than sequence length and shows how it's split at <SEP>.
     """
     print("=" * 80)
-    print("CHUNKING VISUALIZATION TEST")
+    print("CHUNKING VISUALIZATION TEST (Option 1: Split at <SEP>)")
     print("=" * 80)
     
     from architecture.tokenizer import get_tokenizer
@@ -363,8 +363,32 @@ def test_chunking_visualization():
     tokens = tokenizer.encode(context)
     total_tokens = len(tokens)
     
-    print(f"\n📝 CONTEXT DETAILS:")
+    # Find <SEP> position
+    sep_text = "<SEP>"
+    sep_tokens = tokenizer.encode(sep_text)
+    sep_token_id = sep_tokens[0] if len(sep_tokens) == 1 else None
+    
+    # Find <SEP> in tokens
+    sep_idx = None
+    for i, t in enumerate(tokens):
+        if t == sep_token_id:
+            sep_idx = i
+            break
+    
+    # If <SEP> is multiple tokens, search for the sequence
+    if sep_idx is None and len(sep_tokens) > 1:
+        for i in range(len(tokens) - len(sep_tokens) + 1):
+            if tokens[i:i+len(sep_tokens)] == sep_tokens:
+                sep_idx = i
+                break
+    
+    print(f"\n📝 INPUT DETAILS:")
     print(f"   Total tokens: {total_tokens}")
+    print(f"   <SEP> token(s): {sep_tokens}")
+    print(f"   <SEP> position: {sep_idx}")
+    if sep_idx:
+        print(f"   Context tokens (before <SEP>): {sep_idx}")
+        print(f"   Question tokens (after <SEP>): {total_tokens - sep_idx - len(sep_tokens)}")
     print(f"   First 50 chars: {context[:50]}...")
     print(f"   Last 50 chars: ...{context[-50:]}")
     
@@ -374,64 +398,70 @@ def test_chunking_visualization():
         print(f"🔧 SEQUENCE LENGTH: {sequence_length}")
         print(f"{'─' * 80}")
         
-        # Calculate chunks
-        chunks = calculate_chunks(total_tokens, sequence_length)
+        if sep_idx is None:
+            print(f"   ⚠️  No <SEP> found - using legacy last-chunk-as-question logic")
+            continue
         
-        print(f"\n📦 NUMBER OF CHUNKS: {len(chunks)}")
-        print(f"   Processing order: REVERSE (last chunk first)\n")
+        # Split at <SEP>
+        context_tokens_list = tokens[:sep_idx]
+        question_tokens_list = tokens[sep_idx + len(sep_tokens):]
+        context_length = len(context_tokens_list)
+        question_length = len(question_tokens_list)
         
-        # Print each chunk
-        processing_order = list(range(len(chunks) - 1, -1, -1))
+        print(f"\n📦 SPLIT AT <SEP> (Option 1):")
+        print(f"   Context tokens: {context_length}")
+        print(f"   Question tokens: {question_length}")
         
-        for proc_idx, chunk_idx in enumerate(processing_order):
-            start_idx, end_idx, actual_length = chunks[chunk_idx]
-            
-            # Get chunk tokens
-            chunk_tokens = tokens[start_idx:end_idx]
-            chunk_text = tokenizer.decode(chunk_tokens)
-            
-            # Truncate text for display
+        # Calculate context chunks
+        context_chunks = calculate_chunks(context_length, sequence_length)
+        question_chunks = calculate_chunks(question_length, sequence_length)
+        
+        # Print CONTEXT chunks (K,V → SVD compress)
+        print(f"\n   📚 CONTEXT CHUNKS (K,V → stack → SVD compress to {sequence_length}):")
+        for idx, (start_idx, end_idx, actual_length) in enumerate(context_chunks):
+            chunk_tokens_slice = context_tokens_list[start_idx:end_idx]
+            chunk_text = tokenizer.decode(chunk_tokens_slice)
             display_text = chunk_text[:80] + "..." if len(chunk_text) > 80 else chunk_text
-            
-            # Determine chunk type
-            if chunk_idx == len(chunks) - 1:
-                chunk_type = "LAST (processed FIRST)"
-            elif chunk_idx == 0:
-                chunk_type = "FIRST (processed LAST)"
-            else:
-                chunk_type = "MIDDLE"
+            display_text = display_text.replace('\n', ' ')
             
             print(f"   ┌{'─' * 70}┐")
-            print(f"   │ CHUNK {chunk_idx} ({chunk_type})")
-            print(f"   │ Processing step: {proc_idx + 1}/{len(chunks)}")
+            print(f"   │ CONTEXT CHUNK {idx}")
             print(f"   │ Token range: [{start_idx}:{end_idx}]")
-            print(f"   │ Actual tokens: {actual_length}, Chunk size: {end_idx - start_idx}")
-            if actual_length < end_idx - start_idx:
-                print(f"   │ ⚠️  Borrowed {end_idx - start_idx - actual_length} tokens from next chunk")
-            print(f"   │ Text preview: {display_text}")
+            print(f"   │ Actual tokens: {actual_length}")
+            print(f"   │ Text: {display_text}")
             print(f"   └{'─' * 70}┘")
-            print()
         
-        # Print overlap analysis
-        print(f"   📊 OVERLAP ANALYSIS:")
-        for i in range(len(chunks) - 1):
-            curr_start, curr_end, _ = chunks[i]
-            next_start, next_end, _ = chunks[i + 1]
-            overlap = curr_end - next_start
-            if overlap > 0:
-                print(f"      Chunk {i} ↔ Chunk {i+1}: {overlap} tokens overlap")
+        # Print QUESTION chunks (Q → stack)
+        print(f"\n   ❓ QUESTION CHUNKS (Q → stack → query source):")
+        for idx, (start_idx, end_idx, actual_length) in enumerate(question_chunks):
+            chunk_tokens_slice = question_tokens_list[start_idx:end_idx]
+            chunk_text = tokenizer.decode(chunk_tokens_slice)
+            display_text = chunk_text[:80] + "..." if len(chunk_text) > 80 else chunk_text
+            display_text = display_text.replace('\n', ' ')
+            
+            print(f"   ┌{'─' * 70}┐")
+            print(f"   │ QUESTION CHUNK {idx}")
+            print(f"   │ Token range: [{start_idx}:{end_idx}]")
+            print(f"   │ Actual tokens: {actual_length}")
+            print(f"   │ Text: {display_text}")
+            print(f"   └{'─' * 70}┘")
+        
+        # Print SVD compression info
+        print(f"\n   📊 PROCESSING SUMMARY:")
+        print(f"      Context: {context_length} tokens → {len(context_chunks)} chunks → SVD → ({sequence_length}, hidden)")
+        print(f"      Question: {question_length} tokens → {len(question_chunks)} chunks → stack → ({question_length}, hidden)")
         
         # Print cross-attention flow
         print(f"\n   🔄 CROSS-ATTENTION FLOW:")
-        for proc_idx, chunk_idx in enumerate(processing_order[:-1]):
-            next_proc_idx = proc_idx + 1
-            next_chunk_idx = processing_order[next_proc_idx]
-            print(f"      Step {proc_idx + 1} → Step {next_proc_idx + 1}: "
-                  f"Q from Chunk {chunk_idx} attends to K,V from Chunk {next_chunk_idx}")
+        print(f"      Q_question: ({question_length}, hidden)")
+        print(f"              ↓ attends to ↓")
+        print(f"      K,V_context: ({sequence_length}, hidden) [SVD compressed]")
+        print(f"              ↓")
+        print(f"      Output: ({question_length}, hidden) → encoder_k, encoder_v for decoder")
     
     # Test with actual encoder
     print(f"\n{'=' * 80}")
-    print("🧪 ACTUAL ENCODER TEST WITH CHUNKING")
+    print("🧪 ACTUAL ENCODER TEST WITH <SEP> SPLITTING")
     print(f"{'=' * 80}")
     
     sequence_length = 128
@@ -445,40 +475,40 @@ def test_chunking_visualization():
     
     tokens_tensor = torch.tensor(tokens, dtype=torch.long)
     
+    # Get sep_token_id for encoder
+    sep_token_id_for_encoder = sep_tokens[0] if len(sep_tokens) == 1 else None
+    
     print(f"\n   Input: {total_tokens} tokens")
     print(f"   Sequence length: {sequence_length}")
+    print(f"   sep_token_id: {sep_token_id_for_encoder}")
     
-    # Calculate and print chunks with text
-    chunks = calculate_chunks(total_tokens, sequence_length)
-    num_chunks = len(chunks)
-    print(f"   Expected chunks: {num_chunks}")
-    
-    # Print text for each chunk (in processing order - reverse)
-    print(f"\n   📝 CHUNK TEXT CONTENT (Processing Order - REVERSE):")
-    processing_order = list(range(num_chunks - 1, -1, -1))
-    
-    for proc_idx, chunk_idx in enumerate(processing_order):
-        start_idx, end_idx, actual_length = chunks[chunk_idx]
-        chunk_tokens = tokens[start_idx:end_idx]
-        chunk_text = tokenizer.decode(chunk_tokens)
-        
-        # Truncate for display
-        display_text = chunk_text[:100] + "..." if len(chunk_text) > 100 else chunk_text
-        display_text = display_text.replace('\n', ' ').replace('\r', '')
-        
-        print(f"\n   ┌{'─' * 70}┐")
-        print(f"   │ PROCESSING STEP {proc_idx + 1}/{num_chunks} - CHUNK {chunk_idx}")
-        print(f"   │ Token range: [{start_idx}:{end_idx}] ({actual_length} actual tokens)")
-        print(f"   │ TEXT: {display_text}")
-        print(f"   └{'─' * 70}┘")
+    if sep_idx:
+        context_len = sep_idx
+        question_len = total_tokens - sep_idx - len(sep_tokens)
+        print(f"   Context length: {context_len}")
+        print(f"   Question length: {question_len}")
+        print(f"   Expected output shape: ({question_len}, hidden_size)")
     
     with torch.no_grad():
-        encoder_k, encoder_v = encoder(tokens_tensor, return_encoder_kv=True, sequence_length=sequence_length)
+        encoder_k, encoder_v = encoder(
+            tokens_tensor, 
+            return_encoder_kv=True, 
+            sequence_length=sequence_length,
+            sep_token_id=sep_token_id_for_encoder
+        )
     
     print(f"\n   ✅ Output shapes:")
     print(f"      encoder_k: {encoder_k.shape}")
     print(f"      encoder_v: {encoder_v.shape}")
-    print(f"\n   Note: Output length ({encoder_k.shape[0]}) equals input length ({total_tokens})")
+    
+    if sep_idx:
+        expected_question_len = total_tokens - sep_idx - len(sep_tokens)
+        if encoder_k.shape[0] == expected_question_len:
+            print(f"   ✓ Output length matches question length: {expected_question_len}")
+        else:
+            print(f"   ⚠️  Output length {encoder_k.shape[0]} != expected question length {expected_question_len}")
+    
+    print(f"\n   🎉 Encoder with <SEP> splitting test complete!")
 
 
 def calculate_chunks(total_length: int, sequence_length: int) -> list[tuple[int, int, int]]:

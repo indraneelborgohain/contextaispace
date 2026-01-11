@@ -375,20 +375,24 @@ class BidirectionalEncoder(nn.Module):
         input_ids: torch.Tensor, 
         attention_mask: torch.Tensor | None = None,
         return_encoder_kv: bool = False,
-        sequence_length: int | None = None
+        sequence_length: int | None = None,
+        sep_token_id: int | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode input tokens with reverse-order chunk processing.
+        Encode input tokens with chunk processing and SVD compression.
         
         Args:
             input_ids: Input token IDs (total_sequence_length,)
             attention_mask: Optional mask (total_sequence_length,) where 1 = real token, 0 = padding
             return_encoder_kv: If True, returns (encoder_key, encoder_value) for decoder cross-attention
             sequence_length: Maximum sequence length per chunk. If None, uses max_position_embeddings
+            sep_token_id: Token ID for <SEP> to split context and question. 
+                         If provided, tokens before <SEP> = context (compressed), after <SEP> = question (query).
+                         If None, falls back to last-chunk-as-question logic.
         
         Returns:
             If return_encoder_kv=False: Encoded representations (total_sequence_length, hidden_size)
-            If return_encoder_kv=True: Tuple of (encoder_key, encoder_value) each (sequence_length, hidden_size)
+            If return_encoder_kv=True: Tuple of (encoder_key, encoder_value) each (question_length, hidden_size)
         """
         if sequence_length is None:
             sequence_length = self.config.max_position_embeddings
@@ -396,20 +400,19 @@ class BidirectionalEncoder(nn.Module):
         total_length = input_ids.shape[0]
         
         # Single chunk case - no chunking needed
-        if total_length <= sequence_length:
+        if total_length <= sequence_length and sep_token_id is None:
             x = self._process_single_chunk(input_ids, attention_mask)
             if return_encoder_kv:
                 # For single chunk, just return the output as both K and V
                 return x, x
             return x
         
-        # Multi-chunk case - process in reverse order
+        # Multi-chunk case or <SEP> splitting
         if return_encoder_kv:
-            return self._forward_with_chunking(input_ids, attention_mask, sequence_length)
+            return self._forward_with_chunking(input_ids, attention_mask, sequence_length, sep_token_id)
         else:
             # Just return the encoded representation without K,V extraction
-            encoder_k, encoder_v = self._forward_with_chunking(input_ids, attention_mask, sequence_length)
-            # Concatenate or return first chunk
+            encoder_k, encoder_v = self._forward_with_chunking(input_ids, attention_mask, sequence_length, sep_token_id)
             return encoder_k
     
     def _process_single_chunk(
@@ -451,77 +454,271 @@ class BidirectionalEncoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        sequence_length: int
+        sequence_length: int,
+        sep_token_id: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Process input in reverse-order chunks with cross-attention.
+        Process input in chunks with SVD compression for cross-attention.
         
-        Strategy:
-        1. Split into chunks, ensuring each is exactly sequence_length
-        2. Process chunks in reverse order (last first)
-        3. Apply cross-attention between consecutive chunks
-        4. Final cross-attention from first processed to last processed chunk
+        Strategy (Option 1 - Split at <SEP>):
+        1. Find <SEP> token to split context and question
+        2. Context (before <SEP>) → chunk → K,V → SVD compress
+        3. Question (after <SEP>) → chunk → Q → stack
+        4. Cross-attention: Q_question → compressed K,V_context
+        5. Output: (question_length, hidden_size)
         
         Args:
             input_ids: Input token IDs (total_sequence_length,)
             attention_mask: Optional mask (total_sequence_length,)
             sequence_length: Target length for each chunk
+            sep_token_id: Token ID for <SEP>. If None, uses last chunk as question.
         
         Returns:
-            Tuple of (encoder_key, encoder_value) each (sequence_length, hidden_size)
+            Tuple of (encoder_key, encoder_value) each (question_length, hidden_size)
         """
         total_length = input_ids.shape[0]
         
-        # Create chunks with proper alignment
-        chunks = self._create_chunks(total_length, sequence_length)
+        # Find <SEP> position to split context and question
+        if sep_token_id is not None:
+            sep_positions = (input_ids == sep_token_id).nonzero(as_tuple=True)[0]
+            if len(sep_positions) > 0:
+                sep_idx = sep_positions[0].item()
+            else:
+                # No <SEP> found - treat everything as context, return as-is
+                sep_idx = total_length
+        else:
+            # No sep_token_id provided - fall back to last chunk as question
+            sep_idx = None
         
-        # Storage for chunk outputs
-        Q_prev = None  # Query from previously processed chunk (later in time)
-        Q_first_processed = None  # Query from first chunk we process (last chronologically)
-        K_final = None  # Key from final chunk (first chronologically)
-        V_final = None  # Value from final chunk (first chronologically)
+        # If no <SEP> handling, use original logic (last chunk = question)
+        if sep_idx is None or sep_idx >= total_length - 1:
+            return self._forward_with_chunking_legacy(
+                input_ids, attention_mask, sequence_length
+            )
         
-        # Process chunks in reverse order
-        for idx in range(len(chunks) - 1, -1, -1):
-            start_idx, end_idx, actual_length = chunks[idx]
-            is_first_processed = (idx == len(chunks) - 1)  # Last chronologically, first processed
-            is_last_processed = (idx == 0)  # First chronologically, last processed
+        # Split at <SEP>
+        # Context: tokens [0:sep_idx] (everything before <SEP>)
+        # Question: tokens [sep_idx+1:end] (everything after <SEP>, skip <SEP> itself)
+        context_tokens = input_ids[:sep_idx]
+        question_tokens = input_ids[sep_idx + 1:]  # Skip <SEP> token
+        
+        context_mask = attention_mask[:sep_idx] if attention_mask is not None else None
+        question_mask = attention_mask[sep_idx + 1:] if attention_mask is not None else None
+        
+        context_length = context_tokens.shape[0]
+        question_length = question_tokens.shape[0]
+        
+        # Handle edge cases
+        if context_length == 0:
+            # No context, just process question and return
+            return self._process_question_only(question_tokens, question_mask, sequence_length)
+        
+        if question_length == 0:
+            # No question, just process context and return K,V
+            return self._process_context_only(context_tokens, context_mask, sequence_length)
+        
+        # === Process CONTEXT → K, V → SVD compress ===
+        context_chunks = self._create_chunks(context_length, sequence_length)
+        all_K = []
+        all_V = []
+        
+        for start_idx, end_idx, actual_length in context_chunks:
+            # Handle chunk boundaries
+            chunk_tokens = context_tokens[start_idx:end_idx]
+            chunk_mask = context_mask[start_idx:end_idx] if context_mask is not None else None
             
-            # Extract chunk tokens (with borrowing if needed)
-            chunk_tokens = input_ids[start_idx:end_idx]
-            chunk_mask = attention_mask[start_idx:end_idx] if attention_mask is not None else None
+            # Pad if chunk is smaller than sequence_length
+            if chunk_tokens.shape[0] < sequence_length:
+                padding_len = sequence_length - chunk_tokens.shape[0]
+                chunk_tokens = torch.cat([
+                    chunk_tokens,
+                    torch.zeros(padding_len, dtype=chunk_tokens.dtype, device=chunk_tokens.device)
+                ])
+                if chunk_mask is not None:
+                    chunk_mask = torch.cat([
+                        chunk_mask,
+                        torch.zeros(padding_len, dtype=chunk_mask.dtype, device=chunk_mask.device)
+                    ])
             
             # Process chunk through transformer blocks
             chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
             
-            # Extract Q, K, V from chunk output using self-attention
-            Q_chunk, K_chunk, V_chunk = self._extract_qkv(chunk_output, chunk_mask)
+            # Extract K, V from chunk output
+            _, K_chunk, V_chunk = self._extract_qkv(chunk_output, chunk_mask)
             
-            # Apply cross-attention if not the first chunk being processed
-            if Q_prev is not None:
-                # Cross-attention: Q from previous chunk, K,V from current chunk
-                Q_chunk, K_chunk, V_chunk = self._apply_cross_attention(
-                    Q_prev, K_chunk, V_chunk, chunk_mask
-                )
-            
-            # Save first processed chunk's Q for final cross-attention
-            if is_first_processed:
-                Q_first_processed = Q_chunk
-            
-            # Save last processed chunk's K,V (first chronologically)
-            if is_last_processed:
-                K_final = K_chunk[:actual_length]  # Only keep actual tokens
-                V_final = V_chunk[:actual_length]
-            
-            # Update Q_prev for next iteration
-            Q_prev = Q_chunk
+            # Collect K and V (only actual tokens)
+            all_K.append(K_chunk[:actual_length])
+            all_V.append(V_chunk[:actual_length])
         
-        # Final cross-attention: Q from first processed, K,V from last processed
+        # Stack all K and V from context chunks
+        stacked_K = torch.cat(all_K, dim=0)  # (context_length, hidden_size)
+        stacked_V = torch.cat(all_V, dim=0)  # (context_length, hidden_size)
+        
+        # SVD compress context K, V to sequence_length
+        compressed_K = self._compress_with_svd(stacked_K, sequence_length)  # (sequence_length, hidden_size)
+        compressed_V = self._compress_with_svd(stacked_V, sequence_length)  # (sequence_length, hidden_size)
+        
+        # === Process QUESTION → Q ===
+        question_chunks = self._create_chunks(question_length, sequence_length)
+        all_Q = []
+        
+        for start_idx, end_idx, actual_length in question_chunks:
+            # Handle chunk boundaries
+            chunk_tokens = question_tokens[start_idx:end_idx]
+            chunk_mask = question_mask[start_idx:end_idx] if question_mask is not None else None
+            
+            # Pad if chunk is smaller than sequence_length
+            if chunk_tokens.shape[0] < sequence_length:
+                padding_len = sequence_length - chunk_tokens.shape[0]
+                chunk_tokens = torch.cat([
+                    chunk_tokens,
+                    torch.zeros(padding_len, dtype=chunk_tokens.dtype, device=chunk_tokens.device)
+                ])
+                if chunk_mask is not None:
+                    chunk_mask = torch.cat([
+                        chunk_mask,
+                        torch.zeros(padding_len, dtype=chunk_mask.dtype, device=chunk_mask.device)
+                    ])
+            
+            # Process chunk through transformer blocks
+            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+            
+            # Extract Q from chunk output
+            Q_chunk, _, _ = self._extract_qkv(chunk_output, chunk_mask)
+            
+            # Collect Q (only actual tokens)
+            all_Q.append(Q_chunk[:actual_length])
+        
+        # Stack all Q from question chunks
+        Q_question = torch.cat(all_Q, dim=0)  # (question_length, hidden_size)
+        
+        # === Cross-attention: Q_question → compressed K,V_context ===
         encoder_key, encoder_value = self._apply_final_cross_attention(
-            Q_first_processed, K_final, V_final
+            Q_question, compressed_K, compressed_V
+        )
+        
+        return encoder_key, encoder_value  # (question_length, hidden_size)
+    
+    def _forward_with_chunking_legacy(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        sequence_length: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Legacy chunking: last chunk = question, other chunks = context.
+        Used when no <SEP> token is found.
+        """
+        total_length = input_ids.shape[0]
+        chunks = self._create_chunks(total_length, sequence_length)
+        num_chunks = len(chunks)
+        
+        # If only one chunk, process normally without compression
+        if num_chunks == 1:
+            start_idx, end_idx, actual_length = chunks[0]
+            chunk_tokens = input_ids[start_idx:end_idx]
+            chunk_mask = attention_mask[start_idx:end_idx] if attention_mask is not None else None
+            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+            Q, K, V = self._extract_qkv(chunk_output, chunk_mask)
+            return K[:actual_length], V[:actual_length]
+        
+        # Process the LAST chunk (query source)
+        last_chunk_idx = num_chunks - 1
+        last_start, last_end, last_actual = chunks[last_chunk_idx]
+        last_chunk_tokens = input_ids[last_start:last_end]
+        last_chunk_mask = attention_mask[last_start:last_end] if attention_mask is not None else None
+        last_chunk_output = self._process_single_chunk(last_chunk_tokens, last_chunk_mask)
+        Q_last, _, _ = self._extract_qkv(last_chunk_output, last_chunk_mask)
+        
+        # Process all OTHER chunks and collect their K, V
+        all_K = []
+        all_V = []
+        
+        for idx in range(num_chunks - 1):
+            start_idx, end_idx, actual_length = chunks[idx]
+            chunk_tokens = input_ids[start_idx:end_idx]
+            chunk_mask = attention_mask[start_idx:end_idx] if attention_mask is not None else None
+            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+            _, K_chunk, V_chunk = self._extract_qkv(chunk_output, chunk_mask)
+            all_K.append(K_chunk[:actual_length])
+            all_V.append(V_chunk[:actual_length])
+        
+        stacked_K = torch.cat(all_K, dim=0)
+        stacked_V = torch.cat(all_V, dim=0)
+        compressed_K = self._compress_with_svd(stacked_K, sequence_length)
+        compressed_V = self._compress_with_svd(stacked_V, sequence_length)
+        
+        encoder_key, encoder_value = self._apply_final_cross_attention(
+            Q_last[:last_actual], compressed_K, compressed_V
         )
         
         return encoder_key, encoder_value
+    
+    def _process_question_only(
+        self,
+        question_tokens: torch.Tensor,
+        question_mask: torch.Tensor | None,
+        sequence_length: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process when there's no context, just question."""
+        question_length = question_tokens.shape[0]
+        question_chunks = self._create_chunks(question_length, sequence_length)
+        all_outputs = []
+        
+        for start_idx, end_idx, actual_length in question_chunks:
+            chunk_tokens = question_tokens[start_idx:end_idx]
+            chunk_mask = question_mask[start_idx:end_idx] if question_mask is not None else None
+            
+            if chunk_tokens.shape[0] < sequence_length:
+                padding_len = sequence_length - chunk_tokens.shape[0]
+                chunk_tokens = torch.cat([
+                    chunk_tokens,
+                    torch.zeros(padding_len, dtype=chunk_tokens.dtype, device=chunk_tokens.device)
+                ])
+            
+            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+            _, K, V = self._extract_qkv(chunk_output, chunk_mask)
+            all_outputs.append((K[:actual_length], V[:actual_length]))
+        
+        all_K = torch.cat([o[0] for o in all_outputs], dim=0)
+        all_V = torch.cat([o[1] for o in all_outputs], dim=0)
+        return all_K, all_V
+    
+    def _process_context_only(
+        self,
+        context_tokens: torch.Tensor,
+        context_mask: torch.Tensor | None,
+        sequence_length: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process when there's no question, just context."""
+        context_length = context_tokens.shape[0]
+        context_chunks = self._create_chunks(context_length, sequence_length)
+        all_K = []
+        all_V = []
+        
+        for start_idx, end_idx, actual_length in context_chunks:
+            chunk_tokens = context_tokens[start_idx:end_idx]
+            chunk_mask = context_mask[start_idx:end_idx] if context_mask is not None else None
+            
+            if chunk_tokens.shape[0] < sequence_length:
+                padding_len = sequence_length - chunk_tokens.shape[0]
+                chunk_tokens = torch.cat([
+                    chunk_tokens,
+                    torch.zeros(padding_len, dtype=chunk_tokens.dtype, device=chunk_tokens.device)
+                ])
+            
+            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+            _, K, V = self._extract_qkv(chunk_output, chunk_mask)
+            all_K.append(K[:actual_length])
+            all_V.append(V[:actual_length])
+        
+        stacked_K = torch.cat(all_K, dim=0)
+        stacked_V = torch.cat(all_V, dim=0)
+        
+        # Compress to sequence_length
+        compressed_K = self._compress_with_svd(stacked_K, sequence_length)
+        compressed_V = self._compress_with_svd(stacked_V, sequence_length)
+        return compressed_K, compressed_V
     
     def _create_chunks(
         self,
@@ -665,40 +862,46 @@ class BidirectionalEncoder(nn.Module):
     
     def _apply_final_cross_attention(
         self,
-        Q_first: torch.Tensor,
-        K_last: torch.Tensor,
-        V_last: torch.Tensor
+        Q_last: torch.Tensor,
+        K_compressed: torch.Tensor,
+        V_compressed: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply final cross-attention from first processed to last processed chunk.
+        Apply final cross-attention: Q from last chunk attends to compressed K, V.
+        
+        The output is what the decoder will use for cross-attention:
+        - encoder_k: The cross-attention output (Q_last attending to K_compressed, V_compressed)
+        - encoder_v: Same as encoder_k (the attended representation)
         
         Args:
-            Q_first: Query from first processed chunk (seq_len, hidden_size)
-            K_last: Key from last processed chunk (seq_len, hidden_size)
-            V_last: Value from last processed chunk (seq_len, hidden_size)
+            Q_last: Query from last chunk (last_seq_len, hidden_size) - contains question
+            K_compressed: SVD-compressed keys from other chunks (sequence_length, hidden_size)
+            V_compressed: SVD-compressed values from other chunks (sequence_length, hidden_size)
         
         Returns:
-            Tuple of (encoder_key, encoder_value) each (seq_len, hidden_size)
+            Tuple of (encoder_key, encoder_value) each (last_seq_len, hidden_size)
+            These are the representations the decoder will attend to.
         """
         # Reshape for attention
-        seq_len = Q_first.shape[0]
-        k_len = K_last.shape[0]
+        q_len = Q_last.shape[0]
+        k_len = K_compressed.shape[0]
         
-        q = Q_first.view(
-            seq_len,
+        q = Q_last.view(
+            q_len,
             self.final_cross_attn.num_key_value_heads,
             self.final_cross_attn.num_attention_heads // self.final_cross_attn.num_key_value_heads,
             self.final_cross_attn.head_dim,
         )
-        k = K_last.view(k_len, self.final_cross_attn.num_key_value_heads, self.final_cross_attn.head_dim)
-        v = V_last.view(k_len, self.final_cross_attn.num_key_value_heads, self.final_cross_attn.head_dim)
+        k = K_compressed.view(k_len, self.final_cross_attn.num_key_value_heads, self.final_cross_attn.head_dim)
+        v = V_compressed.view(k_len, self.final_cross_attn.num_key_value_heads, self.final_cross_attn.head_dim)
         
-        # Apply final cross-attention
+        # Apply final cross-attention: Q_last attends to compressed context
         attn_output = bidirectional_sdpa(q, k, v, self.final_cross_attn.sm_scale, attention_mask=None)
         attn_output = self.final_cross_attn.attn_dropout(attn_output)
         encoder_output = self.final_cross_attn.out(attn_output)
         
-        # Return both as encoder K and V
+        # The cross-attention output becomes both K and V for the decoder
+        # This is the "question-aware context representation"
         return encoder_output, encoder_output
 
 
