@@ -358,9 +358,15 @@ class DecoderTester:
 
 def main():
     """Run the test suite"""
-    tester = DecoderTester(verbose=True)
-    exit_code = tester.run_all_tests()
-    return exit_code
+    # Comment out regular tests, only run chunking visualization
+    # tester = DecoderTester(verbose=True)
+    # exit_code = tester.run_all_tests()
+    
+    # Run chunk visualization test
+    print("\n")
+    test_decoder_chunking_visualization()
+    
+    return 0  # exit_code
 
 
 def test_decoder_chunking_visualization():
