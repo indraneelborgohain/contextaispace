@@ -321,7 +321,171 @@ def main():
     """Run the test suite"""
     tester = EncoderTester(verbose=True)
     exit_code = tester.run_all_tests()
+    
+    # Run chunk visualization test
+    print("\n")
+    test_chunking_visualization()
+    
     return exit_code
+
+
+def test_chunking_visualization():
+    """
+    Test that visualizes the chunking logic by printing each chunk.
+    Creates a context larger than sequence length and shows how it's split.
+    """
+    print("=" * 80)
+    print("CHUNKING VISUALIZATION TEST")
+    print("=" * 80)
+    
+    from architecture.tokenizer import get_tokenizer
+    
+    # Get tokenizer
+    tokenizer = get_tokenizer()
+    
+    # Create a long context that exceeds sequence length
+    context = """<C>The quick brown fox jumps over the lazy dog. This is a test sentence to demonstrate chunking.
+    Machine learning is a subset of artificial intelligence that enables systems to learn from data.
+    Natural language processing allows computers to understand human language.
+    Deep learning uses neural networks with many layers to learn complex patterns.
+    Transformers have revolutionized NLP with their attention mechanisms.
+    The encoder processes the input sequence bidirectionally for better context understanding.
+    Cross-attention allows the decoder to focus on relevant parts of the encoded input.
+    Chunking helps process sequences longer than the model's maximum context length.
+    Each chunk is processed independently but information flows through cross-attention.
+    The reverse order processing ensures that later context can inform earlier chunks.
+    This architecture is particularly useful for question answering tasks.
+    The context provides background information that helps answer the question.
+    <SEP>What is the main advantage of using transformers in NLP?"""
+    
+    # Tokenize the context
+    tokens = tokenizer.encode(context)
+    total_tokens = len(tokens)
+    
+    print(f"\n📝 CONTEXT DETAILS:")
+    print(f"   Total tokens: {total_tokens}")
+    print(f"   First 50 chars: {context[:50]}...")
+    print(f"   Last 50 chars: ...{context[-50:]}")
+    
+    # Test with different sequence lengths
+    for sequence_length in [64, 128, 256]:
+        print(f"\n{'─' * 80}")
+        print(f"🔧 SEQUENCE LENGTH: {sequence_length}")
+        print(f"{'─' * 80}")
+        
+        # Calculate chunks
+        chunks = calculate_chunks(total_tokens, sequence_length)
+        
+        print(f"\n📦 NUMBER OF CHUNKS: {len(chunks)}")
+        print(f"   Processing order: REVERSE (last chunk first)\n")
+        
+        # Print each chunk
+        processing_order = list(range(len(chunks) - 1, -1, -1))
+        
+        for proc_idx, chunk_idx in enumerate(processing_order):
+            start_idx, end_idx, actual_length = chunks[chunk_idx]
+            
+            # Get chunk tokens
+            chunk_tokens = tokens[start_idx:end_idx]
+            chunk_text = tokenizer.decode(chunk_tokens)
+            
+            # Truncate text for display
+            display_text = chunk_text[:80] + "..." if len(chunk_text) > 80 else chunk_text
+            
+            # Determine chunk type
+            if chunk_idx == len(chunks) - 1:
+                chunk_type = "LAST (processed FIRST)"
+            elif chunk_idx == 0:
+                chunk_type = "FIRST (processed LAST)"
+            else:
+                chunk_type = "MIDDLE"
+            
+            print(f"   ┌{'─' * 70}┐")
+            print(f"   │ CHUNK {chunk_idx} ({chunk_type})")
+            print(f"   │ Processing step: {proc_idx + 1}/{len(chunks)}")
+            print(f"   │ Token range: [{start_idx}:{end_idx}]")
+            print(f"   │ Actual tokens: {actual_length}, Chunk size: {end_idx - start_idx}")
+            if actual_length < end_idx - start_idx:
+                print(f"   │ ⚠️  Borrowed {end_idx - start_idx - actual_length} tokens from next chunk")
+            print(f"   │ Text preview: {display_text}")
+            print(f"   └{'─' * 70}┘")
+            print()
+        
+        # Print overlap analysis
+        print(f"   📊 OVERLAP ANALYSIS:")
+        for i in range(len(chunks) - 1):
+            curr_start, curr_end, _ = chunks[i]
+            next_start, next_end, _ = chunks[i + 1]
+            overlap = curr_end - next_start
+            if overlap > 0:
+                print(f"      Chunk {i} ↔ Chunk {i+1}: {overlap} tokens overlap")
+        
+        # Print cross-attention flow
+        print(f"\n   🔄 CROSS-ATTENTION FLOW:")
+        for proc_idx, chunk_idx in enumerate(processing_order[:-1]):
+            next_proc_idx = proc_idx + 1
+            next_chunk_idx = processing_order[next_proc_idx]
+            print(f"      Step {proc_idx + 1} → Step {next_proc_idx + 1}: "
+                  f"Q from Chunk {chunk_idx} attends to K,V from Chunk {next_chunk_idx}")
+    
+    # Test with actual encoder
+    print(f"\n{'=' * 80}")
+    print("🧪 ACTUAL ENCODER TEST WITH CHUNKING")
+    print(f"{'=' * 80}")
+    
+    sequence_length = 128
+    encoder = create_test_encoder(
+        vocab_size=tokenizer.n_vocab,
+        hidden_size=64,
+        num_layers=2,
+        sequence_length=512  # Max position embeddings
+    )
+    encoder.eval()
+    
+    tokens_tensor = torch.tensor(tokens, dtype=torch.long)
+    
+    print(f"\n   Input: {total_tokens} tokens")
+    print(f"   Sequence length: {sequence_length}")
+    print(f"   Expected chunks: {(total_tokens + sequence_length - 1) // sequence_length}")
+    
+    with torch.no_grad():
+        encoder_k, encoder_v = encoder(tokens_tensor, return_encoder_kv=True, sequence_length=sequence_length)
+    
+    print(f"\n   ✅ Output shapes:")
+    print(f"      encoder_k: {encoder_k.shape}")
+    print(f"      encoder_v: {encoder_v.shape}")
+    print(f"\n   Note: Output length ({encoder_k.shape[0]}) equals input length ({total_tokens})")
+
+
+def calculate_chunks(total_length: int, sequence_length: int) -> list[tuple[int, int, int]]:
+    """
+    Calculate chunk boundaries (mirrors the encoder's _create_chunks logic).
+    
+    Returns:
+        List of (start_idx, end_idx, actual_token_count) tuples
+    """
+    chunks = []
+    remainder = total_length % sequence_length
+    
+    if total_length <= sequence_length:
+        # Single chunk
+        chunks.append((0, total_length, total_length))
+    else:
+        if remainder > 0:
+            # First chunk is smaller, needs to borrow from next chunk
+            chunks.append((0, sequence_length, remainder))
+            start = remainder
+        else:
+            start = 0
+        
+        # Add full chunks
+        while start < total_length:
+            end = min(start + sequence_length, total_length)
+            actual = end - start
+            chunks.append((start, end, actual))
+            start = end
+    
+    return chunks
 
 
 if __name__ == "__main__":
