@@ -38,7 +38,6 @@ def create_test_decoder(vocab_size=1000, hidden_size=64, num_layers=2, sliding_w
         use_lsi_cross_attention=False,
         use_context_embedding=True,
         use_encoder_decoder_cross_attention=True,
-        context_dim=hidden_size,
     )
     return Transformer(config, device=torch.device('cpu'))
 
