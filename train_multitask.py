@@ -382,7 +382,7 @@ def format_squad_example(example, tokenizer, max_context_len, max_answer_len, se
     """Format a SQuAD example for encoder-decoder training
     
     Architecture:
-    - Encoder: Context <SEP> Question (question-aware context encoding)
+    - Encoder: <C> Context <SEP> Question (question-aware context encoding)
     - Decoder: <A> Answer (generates answer with cross-attention to encoder)
     """
     context = example['context']
@@ -395,18 +395,19 @@ def format_squad_example(example, tokenizer, max_context_len, max_answer_len, se
     context_tokens = tokenizer.encode(context)
     question_tokens = tokenizer.encode(question)
     answer_tokens = tokenizer.encode(answer)
+    c_marker = tokenizer.encode("<C>")
     sep_marker = tokenizer.encode(sep_token)
     a_marker = tokenizer.encode("<A>")
     
-    # Build encoder input: Context <SEP> Question
-    max_context_space = max_context_len - len(question_tokens) - len(sep_marker)
+    # Build encoder input: <C> Context <SEP> Question
+    max_context_space = max_context_len - len(question_tokens) - len(sep_marker) - len(c_marker)
     if max_context_space < 50:
         return None
     
     if len(context_tokens) > max_context_space:
         context_tokens = context_tokens[:max_context_space]
     
-    encoder_tokens = context_tokens + sep_marker + question_tokens
+    encoder_tokens = c_marker + context_tokens + sep_marker + question_tokens
     
     # Build decoder input: <A> Answer
     if len(answer_tokens) > max_answer_len - len(a_marker):
@@ -516,18 +517,19 @@ def format_msmarco_example(example, tokenizer, max_context_len, max_answer_len,
     context_tokens = tokenizer.encode(context)
     query_tokens = tokenizer.encode(query)
     answer_tokens = tokenizer.encode(answer)
+    c_marker = tokenizer.encode("<C>")
     sep_marker = tokenizer.encode(sep_token)
     a_marker = tokenizer.encode("<A>")
     
-    # Build encoder input: Context <SEP> Query
-    max_context_space = max_context_len - len(query_tokens) - len(sep_marker)
+    # Build encoder input: <C> Context <SEP> Query
+    max_context_space = max_context_len - len(query_tokens) - len(sep_marker) - len(c_marker)
     if max_context_space < 50:
         return None
     
     if len(context_tokens) > max_context_space:
         context_tokens = context_tokens[:max_context_space]
     
-    encoder_tokens = context_tokens + sep_marker + query_tokens
+    encoder_tokens = c_marker + context_tokens + sep_marker + query_tokens
     
     # Build decoder input: <A> Answer
     if len(answer_tokens) > max_answer_len - len(a_marker):
@@ -712,12 +714,13 @@ def generate_answer(encoder, decoder, tokenizer, context, question, max_tokens, 
     encoder.eval()
     decoder.eval()
     
-    # Build encoder input: Context <SEP> Question
+    # Build encoder input: <C> Context <SEP> Question
+    c_marker = tokenizer.encode("<C>")
     context_tokens = tokenizer.encode(context)
     sep_marker = tokenizer.encode(sep_token)
     question_tokens = tokenizer.encode(question)
     
-    encoder_input = context_tokens + sep_marker + question_tokens
+    encoder_input = c_marker + context_tokens + sep_marker + question_tokens
     encoder_input = torch.tensor(encoder_input, dtype=torch.long, device=device)
     encoder_k, encoder_v = encoder(encoder_input, return_encoder_kv=True)
     

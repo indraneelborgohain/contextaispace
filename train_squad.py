@@ -289,11 +289,11 @@ def format_squad_example(example, tokenizer, max_context_len, max_answer_len, q_
     Format a single SQuAD example into encoder input and decoder input/target.
     
     New Architecture:
-    - Encoder: Context <SEP> Question (bidirectional, question-aware context encoding)
+    - Encoder: <C> Context <SEP> Question (bidirectional, question-aware context encoding)
     - Decoder: <A> Answer (generates answer with cross-attention to encoder)
     
     Returns:
-        encoder_tokens: Context + <SEP> + Question (for encoder)
+        encoder_tokens: <C> + Context + <SEP> + Question (for encoder)
         decoder_tokens: <A> + Answer (for decoder input during training)
         target_tokens: Answer tokens (for loss computation)
     """
@@ -312,19 +312,20 @@ def format_squad_example(example, tokenizer, max_context_len, max_answer_len, q_
     answer_tokens = tokenizer.encode(answer)
     
     # Special tokens
+    c_marker = tokenizer.encode("<C>")
     sep_marker = tokenizer.encode(sep_token)
     a_marker = tokenizer.encode("<A>")
     
-    # Build encoder input: Context <SEP> Question
-    # Reserve space for question and separator
-    max_context_space = max_context_len - len(question_tokens) - len(sep_marker)
+    # Build encoder input: <C> Context <SEP> Question
+    # Reserve space for question, separator, and context marker
+    max_context_space = max_context_len - len(question_tokens) - len(sep_marker) - len(c_marker)
     if max_context_space < 50:  # Need at least some context
         return None
     
     if len(context_tokens) > max_context_space:
         context_tokens = context_tokens[:max_context_space]
     
-    encoder_tokens = context_tokens + sep_marker + question_tokens
+    encoder_tokens = c_marker + context_tokens + sep_marker + question_tokens
     
     # Build decoder input: <A> Answer (teacher forcing)
     if len(answer_tokens) > max_answer_len - len(a_marker):
@@ -473,12 +474,13 @@ def generate_sample(encoder, decoder, tokenizer, context, question, max_tokens, 
     encoder.eval()
     decoder.eval()
     
-    # Tokenize and build encoder input: context <SEP> question
+    # Tokenize and build encoder input: <C> context <SEP> question
+    c_marker = tokenizer.encode("<C>")
     context_tokens = tokenizer.encode(context)
     question_tokens = tokenizer.encode(question)
     sep_marker = tokenizer.encode(sep_token)
     
-    encoder_tokens = context_tokens + sep_marker + question_tokens
+    encoder_tokens = c_marker + context_tokens + sep_marker + question_tokens
     encoder_tokens = torch.tensor(encoder_tokens, dtype=torch.long, device=device)
     
     # Encode context + question

@@ -392,19 +392,20 @@ def format_msmarco_example(example, tokenizer, max_context_len, max_qa_len,
     query_tokens = tokenizer.encode(query)
     answer_tokens = tokenizer.encode(answer)
     
+    c_marker = tokenizer.encode("<C>")
     a_marker = tokenizer.encode(a_token)
     sep_marker = tokenizer.encode(sep_token)
     
-    # Build encoder input: Context <SEP> Query
-    # Reserve space for query and separator
-    max_context_space = max_context_len - len(query_tokens) - len(sep_marker)
+    # Build encoder input: <C> Context <SEP> Query
+    # Reserve space for query, separator, and context marker
+    max_context_space = max_context_len - len(query_tokens) - len(sep_marker) - len(c_marker)
     if max_context_space < 50:  # Need at least some context
         return None
     
     if len(context_tokens) > max_context_space:
         context_tokens = context_tokens[:max_context_space]
     
-    encoder_tokens = context_tokens + sep_marker + query_tokens
+    encoder_tokens = c_marker + context_tokens + sep_marker + query_tokens
     
     # Build decoder input: <A> Answer (teacher forcing)
     if len(answer_tokens) > max_qa_len - len(a_marker):
@@ -584,12 +585,13 @@ def generate_answer(encoder, decoder, tokenizer, context, question, max_tokens,
     encoder.eval()
     decoder.eval()
     
-    # Build encoder input: context <SEP> question
+    # Build encoder input: <C> context <SEP> question
+    c_marker = tokenizer.encode("<C>")
     context_tokens = tokenizer.encode(context)
     question_tokens = tokenizer.encode(question)
     sep_marker = tokenizer.encode(sep_token)
     
-    encoder_tokens = context_tokens + sep_marker + question_tokens
+    encoder_tokens = c_marker + context_tokens + sep_marker + question_tokens
     encoder_tokens = torch.tensor(encoder_tokens, dtype=torch.long, device=device)
     
     # Encode context + question
@@ -878,26 +880,32 @@ def main():
         # Sample generation
         if (iter_num + 1) % args.sample_every == 0:
             sample_ex = random.choice(val_examples)
-            context = tokenizer.decode(sample_ex['context_tokens'])
+            
+            # Get query and answer (with fallback for missing keys)
+            query = sample_ex.get('query', sample_ex.get('question', 'N/A'))
+            answer = sample_ex.get('answer', 'N/A')
+            
+            # Decode encoder tokens to get context for display
+            # The encoder_tokens contain: context <SEP> question
+            encoder_text = tokenizer.decode(sample_ex['encoder_tokens'][:256])
             
             generated = generate_answer(
                 encoder, decoder, tokenizer,
-                context, sample_ex['query'], args.max_answer_len,
+                encoder_text, query, args.max_answer_len,
                 device, args.question_token, args.answer_token, args.sep_token
             )
             
             print(f"\n{'='*60}")
             print(f"Sample at iter {iter_num + 1}:")
-            print(f"Query: {sample_ex['query']}")
-            print(f"Gold Answer: {sample_ex['answer']}")
+            print(f"Query: {query}")
+            print(f"Gold Answer: {answer}")
             print(f"Generated: {generated}")
-            print(f"Context: {context[:200]}...")
             print(f"{'='*60}\n")
             
             if writer:
-                writer.add_text('Samples/query', sample_ex['query'], iter_num + 1)
+                writer.add_text('Samples/query', query, iter_num + 1)
                 writer.add_text('Samples/generated', generated, iter_num + 1)
-                writer.add_text('Samples/gold', sample_ex['answer'], iter_num + 1)
+                writer.add_text('Samples/gold', answer, iter_num + 1)
         
         # Save checkpoint
         if (iter_num + 1) % args.save_every == 0:
