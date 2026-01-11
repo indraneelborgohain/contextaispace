@@ -407,19 +407,28 @@ def format_msmarco_example(example, tokenizer, max_context_len, max_qa_len,
     
     encoder_tokens = c_marker + context_tokens + sep_marker + query_tokens
     
-    # Build decoder input: <A> Answer (teacher forcing)
-    if len(answer_tokens) > max_qa_len - len(a_marker):
-        answer_tokens = answer_tokens[:max_qa_len - len(a_marker)]
+    # Build decoder input: Query <A> Answer (question accessible via self+cross attention)
+    # Reserve space for query, <A> marker, and answer
+    max_answer_space = max_qa_len - len(query_tokens) - len(a_marker)
+    if max_answer_space < 10:  # Need space for some answer
+        return None
     
-    decoder_tokens = a_marker + answer_tokens
+    if len(answer_tokens) > max_answer_space:
+        answer_tokens = answer_tokens[:max_answer_space]
     
-    # Target: Answer tokens (for next-token prediction)
-    target_tokens = answer_tokens + [0]  # Add EOS token
+    decoder_tokens = query_tokens + a_marker + answer_tokens
+    
+    # Target: decoder_tokens shifted by 1 (next token prediction)
+    target_tokens = decoder_tokens[1:] + [0]  # Add EOS token
+    
+    # Position of <A> marker in decoder_tokens (for loss masking)
+    a_position = len(query_tokens)  # <A> is right after query
     
     return {
         'encoder_tokens': encoder_tokens,
         'decoder_tokens': decoder_tokens,
         'target_tokens': target_tokens,
+        'a_position': a_position,
         'query': query,
         'answer': answer,
     }
@@ -497,24 +506,29 @@ def get_batch(examples, batch_size, device):
     encoder_batch = []
     decoder_batch = []
     target_batch = []
+    a_position_batch = []
     
     for ex in batch:
         # Pad encoder (context + question)
         encoder = ex['encoder_tokens'] + [0] * (max_encoder - len(ex['encoder_tokens']))
         encoder_batch.append(encoder)
         
-        # Pad decoder (<A> + answer)
+        # Pad decoder (Query <A> Answer)
         decoder = ex['decoder_tokens'] + [0] * (max_decoder - len(ex['decoder_tokens']))
         decoder_batch.append(decoder)
         
         # Pad targets
         target = ex['target_tokens'] + [-100] * (max_target - len(ex['target_tokens']))
         target_batch.append(target)
+        
+        # Track position of <A> for loss masking
+        a_position_batch.append(ex['a_position'])
     
     return (
         torch.tensor(encoder_batch, dtype=torch.long, device=device),
         torch.tensor(decoder_batch, dtype=torch.long, device=device),
         torch.tensor(target_batch, dtype=torch.long, device=device),
+        a_position_batch,  # List of integers (not tensor)
     )
 
 
@@ -539,13 +553,14 @@ def evaluate(encoder, decoder, val_examples, eval_iters, device, dtype_ctx, batc
     losses = []
     
     for _ in range(eval_iters):
-        encoder_batch, decoder_batch, target_batch = get_batch(val_examples, batch_size, device)
+        encoder_batch, decoder_batch, target_batch, a_position_batch = get_batch(val_examples, batch_size, device)
         
         batch_loss = 0.0
         for i in range(encoder_batch.shape[0]):
             encoder_tokens = encoder_batch[i]
             decoder_tokens = decoder_batch[i]
             targets = target_batch[i]
+            a_position = a_position_batch[i]
             
             # Remove padding
             encoder_tokens = encoder_tokens[encoder_tokens != 0]
@@ -561,12 +576,25 @@ def evaluate(encoder, decoder, val_examples, eval_iters, device, dtype_ctx, batc
                 decoder.reset_context()
                 logits = decoder(decoder_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
                 
-                # Compute loss (predict next token)
-                loss = F.cross_entropy(
+                # Loss masking: only compute loss on answer tokens (after <A>)
+                seq_len = len(logits) - 1
+                loss_mask = torch.zeros(seq_len, device=device, dtype=torch.float)
+                # Safeguard: if a_position is invalid, compute loss on all tokens
+                if a_position is not None and 0 <= a_position < seq_len:
+                    loss_mask[a_position:] = 1.0  # Only compute loss from <A> position onwards
+                else:
+                    loss_mask[:] = 1.0  # Fallback: loss on all tokens
+                
+                # Compute cross entropy per token
+                ce_loss = F.cross_entropy(
                     logits[:-1].view(-1, logits.size(-1)),
-                    targets[:len(logits)-1].view(-1),
-                    ignore_index=-100
+                    targets[:seq_len].view(-1),
+                    reduction='none'
                 )
+                
+                # Apply mask and compute mean over answer tokens only
+                masked_loss = ce_loss * loss_mask
+                loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)
             
             batch_loss += loss.item()
         
@@ -597,9 +625,9 @@ def generate_answer(encoder, decoder, tokenizer, context, question, max_tokens,
     # Encode context + question
     encoder_k, encoder_v = encoder(encoder_tokens, return_encoder_kv=True)
     
-    # Start with <A> token
+    # Start decoder with Question <A> (same as training format)
     a_marker = tokenizer.encode(a_token)
-    tokens = torch.tensor(a_marker, dtype=torch.long, device=device)
+    tokens = torch.tensor(question_tokens + a_marker, dtype=torch.long, device=device)
     
     # Generate answer
     decoder.reset_context()
@@ -774,7 +802,7 @@ def main():
     
     while iter_num < args.max_iters:
         # Get batch
-        encoder_batch, decoder_batch, target_batch = get_batch(
+        encoder_batch, decoder_batch, target_batch, a_position_batch = get_batch(
             train_examples, args.batch_size, device
         )
         
@@ -796,6 +824,7 @@ def main():
             encoder_tokens = encoder_batch[i]
             decoder_tokens = decoder_batch[i]
             targets = target_batch[i]
+            a_position = a_position_batch[i]
             
             # Remove padding
             encoder_tokens = encoder_tokens[encoder_tokens != 0]
@@ -811,12 +840,25 @@ def main():
                 decoder.reset_context()
                 logits = decoder(decoder_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
                 
-                # Compute loss (predict next token)
-                loss = F.cross_entropy(
+                # Loss masking: only compute loss on answer tokens (after <A>)
+                seq_len = len(logits) - 1
+                loss_mask = torch.zeros(seq_len, device=device, dtype=torch.float)
+                # Safeguard: if a_position is invalid, compute loss on all tokens
+                if a_position is not None and 0 <= a_position < seq_len:
+                    loss_mask[a_position:] = 1.0  # Only compute loss from <A> position onwards
+                else:
+                    loss_mask[:] = 1.0  # Fallback: loss on all tokens
+                
+                # Compute cross entropy per token
+                ce_loss = F.cross_entropy(
                     logits[:-1].view(-1, logits.size(-1)),
-                    targets[:len(logits)-1].view(-1),
-                    ignore_index=-100
+                    targets[:seq_len].view(-1),
+                    reduction='none'
                 )
+                
+                # Apply mask and compute mean over answer tokens only
+                masked_loss = ce_loss * loss_mask
+                loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)
             
             total_loss += loss
         
