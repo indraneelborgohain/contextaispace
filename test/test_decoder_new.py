@@ -507,13 +507,13 @@ def test_decoder_chunking_visualization():
     print(f"   Sliding window: {sliding_window}")
     print(f"   Expected chunks: {(total_tokens + sliding_window - 1) // sliding_window}")
     
-    # Also test with encoder K, V
+    # Also test with encoder K, V (must be bfloat16 to match decoder)
     encoder_len = 100
-    encoder_k = torch.randn(encoder_len, 64)
-    encoder_v = torch.randn(encoder_len, 64)
+    encoder_k = torch.randn(encoder_len, 64, dtype=torch.bfloat16)
+    encoder_v = torch.randn(encoder_len, 64, dtype=torch.bfloat16)
     
-    print(f"   Encoder K shape: {encoder_k.shape}")
-    print(f"   Encoder V shape: {encoder_v.shape}")
+    print(f"   Encoder K shape: {encoder_k.shape}, dtype: {encoder_k.dtype}")
+    print(f"   Encoder V shape: {encoder_v.shape}, dtype: {encoder_v.dtype}")
     
     with torch.no_grad():
         decoder.reset_context()
