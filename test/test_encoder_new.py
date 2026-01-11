@@ -446,7 +446,30 @@ def test_chunking_visualization():
     
     print(f"\n   Input: {total_tokens} tokens")
     print(f"   Sequence length: {sequence_length}")
-    print(f"   Expected chunks: {(total_tokens + sequence_length - 1) // sequence_length}")
+    
+    # Calculate and print chunks with text
+    chunks = calculate_chunks(total_tokens, sequence_length)
+    num_chunks = len(chunks)
+    print(f"   Expected chunks: {num_chunks}")
+    
+    # Print text for each chunk (in processing order - reverse)
+    print(f"\n   📝 CHUNK TEXT CONTENT (Processing Order - REVERSE):")
+    processing_order = list(range(num_chunks - 1, -1, -1))
+    
+    for proc_idx, chunk_idx in enumerate(processing_order):
+        start_idx, end_idx, actual_length = chunks[chunk_idx]
+        chunk_tokens = tokens[start_idx:end_idx]
+        chunk_text = tokenizer.decode(chunk_tokens)
+        
+        # Truncate for display
+        display_text = chunk_text[:100] + "..." if len(chunk_text) > 100 else chunk_text
+        display_text = display_text.replace('\n', ' ').replace('\r', '')
+        
+        print(f"\n   ┌{'─' * 70}┐")
+        print(f"   │ PROCESSING STEP {proc_idx + 1}/{num_chunks} - CHUNK {chunk_idx}")
+        print(f"   │ Token range: [{start_idx}:{end_idx}] ({actual_length} actual tokens)")
+        print(f"   │ TEXT: {display_text}")
+        print(f"   └{'─' * 70}┘")
     
     with torch.no_grad():
         encoder_k, encoder_v = encoder(tokens_tensor, return_encoder_kv=True, sequence_length=sequence_length)

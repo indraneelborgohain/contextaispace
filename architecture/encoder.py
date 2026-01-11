@@ -44,20 +44,22 @@ class EncoderConfig:
 def bidirectional_sdpa(Q, K, V, sm_scale, attention_mask=None):
     """
     Scaled Dot-Product Attention WITHOUT causal masking (bidirectional).
+    Supports cross-attention where Q and K/V can have different sequence lengths.
     
     Args:
-        Q: Query tensor (n_tokens, n_heads, q_mult, d_head)
-        K: Key tensor (n_tokens, n_heads, d_head)
-        V: Value tensor (n_tokens, n_heads, d_head)
+        Q: Query tensor (q_len, n_heads, q_mult, d_head)
+        K: Key tensor (k_len, n_heads, d_head)
+        V: Value tensor (k_len, n_heads, d_head)
         sm_scale: Scaling factor for attention scores
-        attention_mask: Optional attention mask (n_tokens, n_tokens), True = keep, False = mask
+        attention_mask: Optional attention mask (q_len, k_len), True = keep, False = mask
     
     Returns:
-        Attention output (n_tokens, n_heads * q_mult * d_head)
+        Attention output (q_len, n_heads * q_mult * d_head)
     """
-    n_tokens, n_heads, q_mult, d_head = Q.shape
-    assert K.shape == (n_tokens, n_heads, d_head)
-    assert V.shape == (n_tokens, n_heads, d_head)
+    q_len, n_heads, q_mult, d_head = Q.shape
+    k_len = K.shape[0]
+    assert K.shape == (k_len, n_heads, d_head), f"K shape mismatch: expected ({k_len}, {n_heads}, {d_head}), got {K.shape}"
+    assert V.shape == (k_len, n_heads, d_head), f"V shape mismatch: expected ({k_len}, {n_heads}, {d_head}), got {V.shape}"
     
     # Expand K and V for grouped query attention
     K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
@@ -69,16 +71,16 @@ def bidirectional_sdpa(Q, K, V, sm_scale, attention_mask=None):
     
     # Apply optional attention mask (but NO causal mask)
     if attention_mask is not None:
-        # attention_mask should be (n_tokens, n_tokens) with True for positions to keep
+        # attention_mask should be (q_len, k_len) with True for positions to keep
         mask_value = torch.finfo(QK.dtype).min
-        mask = attention_mask[None, None, :, :]  # Broadcast to (1, 1, n_tokens, n_tokens)
+        mask = attention_mask[None, None, :, :]  # Broadcast to (1, 1, q_len, k_len)
         QK = QK.masked_fill(~mask, mask_value)
     
     # Softmax and compute attention
     W = torch.softmax(QK, dim=-1)
     attn = torch.einsum("hmqk,khmd->qhmd", W, V)
     
-    return attn.reshape(n_tokens, -1)
+    return attn.reshape(q_len, -1)
 
 
 class BidirectionalAttentionBlock(nn.Module):
