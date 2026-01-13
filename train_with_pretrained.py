@@ -892,7 +892,8 @@ def main():
         print(f"✓ Initialized decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
     
     # Optionally load BERT weights for encoder
-    if args.bert_model:
+    # TEMPORARILY DISABLED FOR DEBUGGING
+    if False and args.bert_model:
         print("\n" + "="*60)
         print("Hybrid Encoder Loading: BERT + Trained Model")
         print("="*60)
