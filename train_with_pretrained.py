@@ -236,6 +236,8 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
     # Load the updated state
     if loaded_count > 0:
         encoder.load_state_dict(encoder_state, strict=False)
+        # Move entire encoder to device to sync all buffers (especially RoPE)
+        encoder.to(device)
         print(f"\n✓ Loaded {loaded_count} parameters from BERT")
     else:
         print(f"\n⚠️  No matching parameters found")
@@ -377,8 +379,9 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
     print(f"\n✓ Loaded {loaded_count} GPT-2 parameters into decoder")
     print("  Note: Custom layers (context_proj, cross_attn, MoE experts) remain randomly initialized")
     
-    # Load the modified state dict
+    # Load the modified state dict and move to device
     decoder.load_state_dict(decoder_state, strict=False)
+    decoder.to(device)
     return loaded_count
 
 
@@ -634,6 +637,8 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
     
     # Load the updated state
     if loaded_count > 0:
+        # Move entire decoder to device to sync all buffers
+        decoder.to(device)
         decoder.load_state_dict(decoder_state)
         print(f"\n✓ Loaded {loaded_count} parameters from GPT-OSS")
         print(f"✓ Kept custom layers (context_proj, cross_attn, gate)")
