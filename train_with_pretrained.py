@@ -42,11 +42,11 @@ def get_args():
                     help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
     ap.add_argument("--decoder_checkpoint", type=str, default=None,
                     help="Optional: Path to checkpoint with just decoder weights (.pt file)")
-    ap.add_argument("--gptoss_weights", type=str, default="architecture/open-gpt-oss/weights",
+    ap.add_argument("--gptoss_weights", type=str, default=None,
                     help="Optional: Directory with GPT-OSS weights (will load compatible decoder layers)")
     ap.add_argument("--gpt2_model", type=str, default=None,
                     help="Optional: GPT-2 model name (e.g., 'gpt2', 'gpt2-medium', 'gpt2-large') for decoder")
-    ap.add_argument("--bert_model", type=str, default="bert-large-uncased",
+    ap.add_argument("--bert_model", type=str, default=None,
                     help="Optional: BERT model name (e.g., 'bert-base-uncased', 'roberta-base') for encoder")
     ap.add_argument("--max_decoder_layers", type=int, default=12,
                     help="Limit number of decoder layers (default: 12 for GPU-friendly GPT-OSS loading)")
@@ -893,8 +893,7 @@ def main():
         print(f"✓ Initialized decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
     
     # Optionally load BERT weights for encoder
-    # TEMPORARILY DISABLED FOR DEBUGGING
-    if False and args.bert_model:
+    if args.bert_model:
         print("\n" + "="*60)
         print("Hybrid Encoder Loading: BERT + Trained Model")
         print("="*60)
@@ -919,8 +918,7 @@ def main():
     
     # Optionally load GPT-2 weights for decoder (preferred for single GPU)
     # TEMPORARILY DISABLED FOR DEBUGGING
-    if False and args.gpt2_model:
-        print("\n" + "="*60)
+    ifn" + "="*60)
         print("Hybrid Decoder Loading: GPT-2 + Trained Model")
         print("="*60)
         print("Strategy:")
@@ -943,8 +941,7 @@ def main():
     
     # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
     # TEMPORARILY DISABLED FOR DEBUGGING
-    elif False and args.gptoss_weights:
-        print("\n" + "="*60)
+    elif + "="*60)
         print("Hybrid Decoder Loading: GPT-OSS + Trained Model")
         print("="*60)
         print("Strategy:")
