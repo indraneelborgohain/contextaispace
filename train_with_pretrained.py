@@ -48,8 +48,8 @@ def get_args():
                     help="Optional: GPT-2 model name (e.g., 'gpt2', 'gpt2-medium', 'gpt2-large') for decoder")
     ap.add_argument("--bert_model", type=str, default=None,
                     help="Optional: BERT model name (e.g., 'bert-base-uncased', 'roberta-base') for encoder")
-    ap.add_argument("--max_decoder_layers", type=int, default=None,
-                    help="Optional: Limit number of decoder layers (useful for loading partial pretrained weights)")
+    ap.add_argument("--max_decoder_layers", type=int, default=12,
+                    help="Limit number of decoder layers (default: 12 for GPU-friendly GPT-OSS loading)")
     ap.add_argument("--out_dir", type=str, default="model_finetuned")
     
     # Model size
@@ -453,6 +453,10 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
     
     # 2. Load each decoder block
     num_layers = decoder.config.num_hidden_layers
+    if max_layers:
+        num_layers = min(num_layers, max_layers)
+        print(f"\n📊 Loading only first {num_layers} layers from GPT-OSS (memory optimization)")
+    
     for layer_idx in range(num_layers):
         dec_prefix = f'block.{layer_idx}'
         
@@ -664,8 +668,8 @@ def main():
         elif args.model_size == "small":
             encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8)
         elif args.model_size == "medium":
-            # Note: Use 1024 to match gpt2-medium and bert-large
-            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12)
+            # Note: Uses 2880 to match GPT-OSS decoder (no matching BERT available)
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=2880, num_hidden_layers=12)
         else:  # large
             encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=16)
         print(f"✓ Created {args.model_size} encoder config")
@@ -702,29 +706,32 @@ def main():
             print("⚠️  No decoder config found in checkpoint, using default")
         
         # Create config based on model_size
+        num_layers = args.max_decoder_layers if args.max_decoder_layers else {"toy": 4, "small": 12, "medium": 24, "large": 36}[args.model_size]
+        
         if args.model_size == "toy":
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=256, num_hidden_layers=4,
+                vocab_size=vocab_size, hidden_size=256, num_hidden_layers=num_layers,
                 num_experts=4, num_attention_heads=8, use_encoder_decoder_cross_attention=True
             )
         elif args.model_size == "small":
             # Matches GPT-2 small (768 hidden, 12 layers)
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=768, num_hidden_layers=12,
+                vocab_size=vocab_size, hidden_size=768, num_hidden_layers=num_layers,
                 num_experts=16, num_attention_heads=12, num_key_value_heads=4,
                 use_encoder_decoder_cross_attention=True
             )
         elif args.model_size == "medium":
-            # Matches GPT-2 medium (1024 hidden, 24 layers)
+            # Matches GPT-OSS (2880 hidden, 24 layers, but only first 12 loaded by default)
+            num_layers = args.max_decoder_layers if args.max_decoder_layers else 24
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=24,
-                num_experts=32, num_attention_heads=16, num_key_value_heads=8,
+                vocab_size=vocab_size, hidden_size=2880, num_hidden_layers=num_layers,
+                num_experts=32, num_attention_heads=64, num_key_value_heads=8,
                 use_encoder_decoder_cross_attention=True
             )
         else:  # large
             # Matches GPT-2 large (1280 hidden, 36 layers)
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=36,
+                vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=num_layers,
                 num_experts=32, num_attention_heads=20, num_key_value_heads=8,
                 use_encoder_decoder_cross_attention=True
             )
@@ -734,6 +741,10 @@ def main():
     print(f"  Decoder config: {decoder_config.num_hidden_layers} layers, "
           f"{decoder_config.num_experts} experts, "
           f"{decoder_config.num_attention_heads} heads")
+    if args.max_decoder_layers and args.max_decoder_layers < 24:
+        print(f"  📊 Layer limiting enabled: Using {args.max_decoder_layers} layers (reduces memory usage)")
+    if args.max_decoder_layers and args.max_decoder_layers < 24:
+        print(f"  📊 Layer limiting enabled: Using {args.max_decoder_layers} layers (reduces memory usage)")
     
     decoder = Transformer(decoder_config)
     decoder.to(device)
@@ -830,12 +841,14 @@ def main():
         print("  - Trained weights: context projections, cross-attention (keep)")
         print()
         
-        loaded = load_gptoss_weights_partial(decoder, args.gptoss_weights, device)
+        loaded = load_gptoss_weights_partial(decoder, args.gptoss_weights, device, max_layers=args.max_decoder_layers)
         
         if loaded > 0:
             print(f"\n✓ Hybrid model created successfully!")
             print(f"  GPT-OSS provides base transformer knowledge")
             print(f"  Your trained model provides custom functionality")
+            if args.max_decoder_layers and args.max_decoder_layers < 24:
+                print(f"  📊 Loaded only first {args.max_decoder_layers} layers (saves GPU memory)")
         else:
             print(f"\n⚠️  No GPT-OSS weights loaded, using only trained model")
         print("="*60 + "\n")
