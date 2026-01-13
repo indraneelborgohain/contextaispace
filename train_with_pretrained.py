@@ -94,8 +94,6 @@ def get_args():
                     choices=["msmarco", "squad"])
     ap.add_argument("--sep_token", type=str, default="<SEP>")
     ap.add_argument("--a_token", type=str, default="<A>")
-    ap.add_argument("--sep_token", type=str, default="<SEP>")
-    ap.add_argument("--a_token", type=str, default="<A>")
     
     # TensorBoard
     ap.add_argument("--use_tensorboard", action="store_true", default=False)
