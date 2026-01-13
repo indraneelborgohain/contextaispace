@@ -226,7 +226,144 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
     return loaded_count
 
 
-def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device):
+def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None):
+    """
+    Load GPT-2 pretrained weights into decoder (only compatible base layers).
+    Skips custom context layers. Works with GPT-2 small/medium/large/xl.
+    
+    Args:
+        decoder: Transformer instance
+        gpt2_model_name: GPT-2 model name ('gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl')
+        device: torch device
+        max_layers: Optional limit on number of layers to load
+    
+    Returns:
+        Number of parameters loaded
+    """
+    try:
+        from transformers import GPT2LMHeadModel
+    except ImportError:
+        print("⚠️  transformers library required. Install with: pip install transformers")
+        return 0
+    
+    print(f"\nLoading GPT-2 weights from: {gpt2_model_name}")
+    
+    try:
+        gpt2_model = GPT2LMHeadModel.from_pretrained(gpt2_model_name)
+        gpt2_state = gpt2_model.state_dict()
+        print(f"✓ Loaded GPT-2 state dict ({len(gpt2_state)} parameters)")
+    except Exception as e:
+        print(f"❌ Failed to load GPT-2 model: {e}")
+        return 0
+    
+    decoder_state = decoder.state_dict()
+    loaded_count = 0
+    
+    print("\nMapping GPT-2 parameters to decoder:")
+    
+    # Load embedding
+    if "transformer.wte.weight" in gpt2_state and "embedding.weight" in decoder_state:
+        gpt2_emb = gpt2_state["transformer.wte.weight"]
+        dec_emb = decoder_state["embedding.weight"]
+        
+        # Use minimum vocab size
+        min_vocab = min(gpt2_emb.size(0), dec_emb.size(0))
+        if gpt2_emb.size(1) == dec_emb.size(1):
+            decoder_state["embedding.weight"][:min_vocab] = gpt2_emb[:min_vocab].clone()
+            loaded_count += 1
+            print(f"  ✓ embedding.weight [{min_vocab}/{dec_emb.size(0)} tokens, {dec_emb.size(1)} dim]")
+        else:
+            print(f"  ✗ embedding dimension mismatch: GPT-2={gpt2_emb.size(1)}, decoder={dec_emb.size(1)}")
+    
+    # Determine number of layers to load
+    num_gpt2_layers = sum(1 for k in gpt2_state.keys() if k.startswith("transformer.h.") and ".ln_1.weight" in k)
+    num_decoder_layers = sum(1 for k in decoder_state.keys() if k.startswith("block.") and ".ln1.weight" in k)
+    layers_to_load = min(num_gpt2_layers, num_decoder_layers)
+    if max_layers:
+        layers_to_load = min(layers_to_load, max_layers)
+    
+    print(f"  Loading {layers_to_load} layers (GPT-2 has {num_gpt2_layers}, decoder has {num_decoder_layers})")
+    
+    for layer_idx in range(layers_to_load):
+        layer_loaded = 0
+        
+        # Layer norm 1
+        for suffix in ["weight", "bias"]:
+            gpt2_key = f"transformer.h.{layer_idx}.ln_1.{suffix}"
+            dec_key = f"block.{layer_idx}.ln1.{suffix}"
+            if gpt2_key in gpt2_state and dec_key in decoder_state:
+                if gpt2_state[gpt2_key].shape == decoder_state[dec_key].shape:
+                    decoder_state[dec_key] = gpt2_state[gpt2_key].clone()
+                    layer_loaded += 1
+        
+        # Attention QKV (GPT-2 has c_attn which is fused QKV)
+        gpt2_key = f"transformer.h.{layer_idx}.attn.c_attn.weight"
+        dec_key = f"block.{layer_idx}.attn.qkv.weight"
+        if gpt2_key in gpt2_state and dec_key in decoder_state:
+            gpt2_qkv = gpt2_state[gpt2_key]  # [hidden_size, 3*hidden_size]
+            dec_qkv = decoder_state[dec_key]  # [3*hidden_size, hidden_size]
+            
+            # GPT-2 uses [hidden, 3*hidden] (transposed from ours)
+            if gpt2_qkv.size(1) == dec_qkv.size(0) and gpt2_qkv.size(0) == dec_qkv.size(1):
+                decoder_state[dec_key] = gpt2_qkv.t().clone()  # Transpose
+                layer_loaded += 1
+        
+        gpt2_key = f"transformer.h.{layer_idx}.attn.c_attn.bias"
+        dec_key = f"block.{layer_idx}.attn.qkv.bias"
+        if gpt2_key in gpt2_state and dec_key in decoder_state:
+            if gpt2_state[gpt2_key].shape == decoder_state[dec_key].shape:
+                decoder_state[dec_key] = gpt2_state[gpt2_key].clone()
+                layer_loaded += 1
+        
+        # Attention output projection
+        gpt2_key = f"transformer.h.{layer_idx}.attn.c_proj.weight"
+        dec_key = f"block.{layer_idx}.attn.out.weight"
+        if gpt2_key in gpt2_state and dec_key in decoder_state:
+            gpt2_out = gpt2_state[gpt2_key]  # [hidden_size, hidden_size]
+            dec_out = decoder_state[dec_key]
+            if gpt2_out.size(1) == dec_out.size(0) and gpt2_out.size(0) == dec_out.size(1):
+                decoder_state[dec_key] = gpt2_out.t().clone()  # Transpose
+                layer_loaded += 1
+        
+        gpt2_key = f"transformer.h.{layer_idx}.attn.c_proj.bias"
+        dec_key = f"block.{layer_idx}.attn.out.bias"
+        if gpt2_key in gpt2_state and dec_key in decoder_state:
+            if gpt2_state[gpt2_key].shape == decoder_state[dec_key].shape:
+                decoder_state[dec_key] = gpt2_state[gpt2_key].clone()
+                layer_loaded += 1
+        
+        # Layer norm 2
+        for suffix in ["weight", "bias"]:
+            gpt2_key = f"transformer.h.{layer_idx}.ln_2.{suffix}"
+            dec_key = f"block.{layer_idx}.ln2.{suffix}"
+            if gpt2_key in gpt2_state and dec_key in decoder_state:
+                if gpt2_state[gpt2_key].shape == decoder_state[dec_key].shape:
+                    decoder_state[dec_key] = gpt2_state[gpt2_key].clone()
+                    layer_loaded += 1
+        
+        loaded_count += layer_loaded
+        if layer_idx < 3 or layer_idx >= layers_to_load - 1:
+            print(f"  ✓ Layer {layer_idx}: {layer_loaded} params")
+        elif layer_idx == 3:
+            print(f"    ... (loading layers {layer_idx} to {layers_to_load-1})")
+    
+    # Load final layer norm if present
+    if "transformer.ln_f.weight" in gpt2_state and "ln_f.weight" in decoder_state:
+        if gpt2_state["transformer.ln_f.weight"].shape == decoder_state["ln_f.weight"].shape:
+            decoder_state["ln_f.weight"] = gpt2_state["transformer.ln_f.weight"].clone()
+            decoder_state["ln_f.bias"] = gpt2_state["transformer.ln_f.bias"].clone()
+            loaded_count += 2
+            print(f"  ✓ ln_f (final layer norm)")
+    
+    print(f"\n✓ Loaded {loaded_count} GPT-2 parameters into decoder")
+    print("  Note: Custom layers (context_proj, cross_attn, MoE experts) remain randomly initialized")
+    
+    # Load the modified state dict
+    decoder.load_state_dict(decoder_state, strict=False)
+    return loaded_count
+
+
+def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=None):
     """
     Load GPT-OSS weights for compatible decoder layers.
     Skips custom layers (context_proj, cross_attn).
