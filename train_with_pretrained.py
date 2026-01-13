@@ -894,75 +894,18 @@ def main():
     
     # Optionally load BERT weights for encoder
     if args.bert_model:
-        print("\n" + "="*60)
-        print("Hybrid Encoder Loading: BERT + Trained Model")
-        print("="*60)
-        print("Strategy:")
-        print("  - BERT weights: embedding, attention, FFN")
-        print("  - Trained weights: SVD compression, cross-attention")
-        print("  - Cross-attention handles encoder-decoder dimension differences")
-        print()
-        
-        loaded = load_bert_weights_partial(encoder, args.bert_model, device)
-        
-        if loaded > 0:
-            print(f"\n✓ Hybrid encoder created successfully!")
-            print(f"  BERT provides pretrained language understanding")
-            print(f"  Your model provides SVD compression & cross-attention")
-        else:
-            print(f"\n⚠️  No BERT weights loaded, using only trained encoder")
-        
-        # Critical: Ensure ALL encoder components (especially RoPE buffers) are on correct device
+        load_bert_weights_partial(encoder, args.bert_model, device)
         encoder = encoder.to(device)
-        print("="*60 + "\n")
     
     # Optionally load GPT-2 weights for decoder (preferred for single GPU)
     if args.gpt2_model:
-        print("\n" + "="*60)
-        print("Hybrid Decoder Loading: GPT-2 + Trained Model")
-        print("="*60)
-        print("Strategy:")
-        print("  - GPT-2 weights: embedding, attention, layer norms")
-        print("  - Trained weights: context projections, cross-attention, MoE experts")
-        print()
-        
-        loaded = load_gpt2_weights_partial(decoder, args.gpt2_model, device, max_layers=args.max_decoder_layers)
-        
-        if loaded > 0:
-            print(f"\n✓ Hybrid decoder created successfully!")
-            print(f"  GPT-2 provides pretrained language modeling")
-            print(f"  Your model provides context-awareness & MoE")
-        else:
-            print(f"\n⚠️  No GPT-2 weights loaded, using random initialization")
-        
-        # Critical: Ensure ALL decoder components are on correct device
+        load_gpt2_weights_partial(decoder, args.gpt2_model, device, max_layers=args.max_decoder_layers)
         decoder = decoder.to(device)
-        print("="*60 + "\n")
     
     # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
     if args.gptoss_weights:
-        print("\n" + "="*60)
-        print("Hybrid Decoder Loading: GPT-OSS + Trained Model")
-        print("="*60)
-        print("Strategy:")
-        print("  - GPT-OSS weights: embedding, standard attention, MLP (overwrite)")
-        print("  - Trained weights: context projections, cross-attention (keep)")
-        print()
-        
-        loaded = load_gptoss_weights_partial(decoder, args.gptoss_weights, device, max_layers=args.max_decoder_layers)
-        
-        if loaded > 0:
-            print(f"\n✓ Hybrid model created successfully!")
-            print(f"  GPT-OSS provides base transformer knowledge")
-            print(f"  Your trained model provides custom functionality")
-            if args.max_decoder_layers and args.max_decoder_layers < 24:
-                print(f"  📊 Loaded only first {args.max_decoder_layers} layers (saves GPU memory)")
-        else:
-            print(f"\n⚠️  No GPT-OSS weights loaded, using only trained model")
-        
-        # Critical: Ensure ALL decoder components are on correct device
+        load_gptoss_weights_partial(decoder, args.gptoss_weights, device, max_layers=args.max_decoder_layers)
         decoder = decoder.to(device)
-        print("="*60 + "\n")
     
     # Setup optimizer with different learning rates
     encoder_params = list(encoder.parameters())
@@ -990,21 +933,12 @@ def main():
             {'params': decoder_base_params, 'lr': args.decoder_lr, 'name': 'decoder_base'},
             {'params': decoder_custom_params, 'lr': args.cross_attn_lr, 'name': 'decoder_custom'},
         ], betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
-        
-        print(f"\nOptimizer groups (3-tier):")
-        print(f"  - Encoder: {len(encoder_params)} params, lr={args.encoder_lr:.2e}")
-        print(f"  - Decoder (base): {len(decoder_base_params)} params, lr={args.decoder_lr:.2e}")
-        print(f"  - Decoder (custom): {len(decoder_custom_params)} params, lr={args.cross_attn_lr:.2e}")
         use_three_tier = True
     else:
         optimizer = torch.optim.AdamW([
             {'params': encoder_params, 'lr': args.encoder_lr, 'name': 'encoder'},
             {'params': decoder_base_params + decoder_custom_params, 'lr': args.decoder_lr, 'name': 'decoder'},
         ], betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
-        
-        print(f"\nOptimizer groups (2-tier):")
-        print(f"  - Encoder: {len(encoder_params)} params, lr={args.encoder_lr:.2e}")
-        print(f"  - Decoder: {len(decoder_base_params) + len(decoder_custom_params)} params, lr={args.decoder_lr:.2e}")
         use_three_tier = False
     
     # TensorBoard
