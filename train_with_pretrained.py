@@ -713,16 +713,18 @@ def main():
                 num_experts=8, num_attention_heads=16, use_encoder_decoder_cross_attention=True
             )
         elif args.model_size == "medium":
-            # Matches GPT-OSS dimensions for weight loading compatibility
+            # Matches GPT-2 medium (1024 hidden, 24 layers)
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=2880, num_hidden_layers=24,
-                num_experts=32, num_attention_heads=64, num_key_value_heads=8,
+                vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=24,
+                num_experts=32, num_attention_heads=16, num_key_value_heads=8,
                 use_encoder_decoder_cross_attention=True
             )
         else:  # large
+            # Matches GPT-2 large (1280 hidden, 36 layers)
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=2048, num_hidden_layers=16,
-                num_experts=32, num_attention_heads=64, use_encoder_decoder_cross_attention=True
+                vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=36,
+                num_experts=32, num_attention_heads=20, num_key_value_heads=8,
+                use_encoder_decoder_cross_attention=True
             )
         print(f"✓ Created {args.model_size} decoder config")
     
@@ -796,8 +798,28 @@ def main():
             print(f"\n⚠️  No BERT weights loaded, using only trained encoder")
         print("="*60 + "\n")
     
+    # Optionally load GPT-2 weights for decoder (preferred for single GPU)
+    if args.gpt2_model:
+        print("\n" + "="*60)
+        print("Hybrid Decoder Loading: GPT-2 + Trained Model")
+        print("="*60)
+        print("Strategy:")
+        print("  - GPT-2 weights: embedding, attention, layer norms")
+        print("  - Trained weights: context projections, cross-attention, MoE experts")
+        print()
+        
+        loaded = load_gpt2_weights_partial(decoder, args.gpt2_model, device, max_layers=args.max_decoder_layers)
+        
+        if loaded > 0:
+            print(f"\n✓ Hybrid decoder created successfully!")
+            print(f"  GPT-2 provides pretrained language modeling")
+            print(f"  Your model provides context-awareness & MoE")
+        else:
+            print(f"\n⚠️  No GPT-2 weights loaded, using random initialization")
+        print("="*60 + "\n")
+    
     # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
-    if args.gptoss_weights:
+    elif args.gptoss_weights:
         print("\n" + "="*60)
         print("Hybrid Decoder Loading: GPT-OSS + Trained Model")
         print("="*60)
