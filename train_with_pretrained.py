@@ -57,7 +57,7 @@ def get_args():
                     choices=["toy", "small", "medium", "large"], default="medium")
     
     # Training hyperparameters
-    ap.add_argument("--batch_size", type=int, default=2)
+    ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--max_context_len", type=int, default=512)
     ap.add_argument("--max_qa_len", type=int, default=128)
     ap.add_argument("--max_iters", type=int, default=1000)
@@ -1214,6 +1214,9 @@ def main():
                               args.cross_attn_lr, args.cross_attn_lr * args.min_lr_ratio)
             optimizer.param_groups[2]['lr'] = custom_lr
         
+        # Zero gradients before accumulation
+        optimizer.zero_grad(set_to_none=True)
+        
         # Forward pass - process each example in batch separately (like other train scripts)
         total_loss = 0.0
         for i in range(batch_ctx.shape[0]):
@@ -1244,14 +1247,17 @@ def main():
                     reduction='mean'
                 )
             
-            total_loss += loss
+            # Accumulate loss value (detach to prevent memory leak)
+            total_loss += loss.detach().item()
+            
+            # Backward pass on each example separately to save memory
+            (loss / batch_ctx.shape[0]).backward()
+            
+            # Clear intermediate tensors
+            del encoder_k, encoder_v, logits, loss
         
-        # Average loss over batch
+        # Average loss over batch (for logging)
         loss = total_loss / batch_ctx.shape[0]
-        
-        # Backward pass
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
         
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -1260,6 +1266,10 @@ def main():
             )
         
         optimizer.step()
+        
+        # Clear GPU cache periodically
+        if (iter_num + 1) % 10 == 0:
+            torch.cuda.empty_cache()
         
         # Logging
         running_loss += loss.item()
