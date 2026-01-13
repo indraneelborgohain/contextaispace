@@ -769,6 +769,9 @@ def main():
     else:
         print(f"✓ Initialized encoder ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
     
+    # Ensure encoder is on device BEFORE loading any pretrained weights
+    encoder.to(device)
+    
     # Load decoder config from checkpoint
     if checkpoint and 'decoder_config' in checkpoint:
         decoder_config = checkpoint['decoder_config']
@@ -833,6 +836,7 @@ def main():
         print(f"  📊 Layer limiting enabled: Using {args.max_decoder_layers} layers (reduces memory usage)")
     
     decoder = Transformer(decoder_config)
+    # Ensure decoder is on device BEFORE loading any weights
     decoder.to(device)
     
     # Load decoder weights from checkpoint or decoder_checkpoint
