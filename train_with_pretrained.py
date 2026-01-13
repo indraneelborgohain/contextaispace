@@ -668,8 +668,8 @@ def main():
         elif args.model_size == "small":
             encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8)
         elif args.model_size == "medium":
-            # Note: Uses 2880 to match GPT-OSS decoder (no matching BERT available)
-            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=2880, num_hidden_layers=12)
+            # Use 1024 (bert-large compatible) - cross-attention handles dimension mismatch with decoder
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12)
         else:  # large
             encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=16)
         print(f"✓ Created {args.model_size} encoder config")
@@ -794,11 +794,12 @@ def main():
     # Optionally load BERT weights for encoder
     if args.bert_model:
         print("\n" + "="*60)
-        print("Hybrid Encoder Loa ding: BERT + Trained Model")
+        print("Hybrid Encoder Loading: BERT + Trained Model")
         print("="*60)
         print("Strategy:")
         print("  - BERT weights: embedding, attention, FFN")
         print("  - Trained weights: SVD compression, cross-attention")
+        print("  - Cross-attention handles encoder-decoder dimension differences")
         print()
         
         loaded = load_bert_weights_partial(encoder, args.bert_model, device)
