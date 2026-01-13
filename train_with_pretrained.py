@@ -46,7 +46,7 @@ def get_args():
                     help="Optional: Directory with GPT-OSS weights (will load compatible decoder layers)")
     ap.add_argument("--gpt2_model", type=str, default=None,
                     help="Optional: GPT-2 model name (e.g., 'gpt2', 'gpt2-medium', 'gpt2-large') for decoder")
-    ap.add_argument("--bert_model", type=str, default=None,
+    ap.add_argument("--bert_model", type=str, default="bert-large-uncased",
                     help="Optional: BERT model name (e.g., 'bert-base-uncased', 'roberta-base') for encoder")
     ap.add_argument("--max_decoder_layers", type=int, default=12,
                     help="Limit number of decoder layers (default: 12 for GPU-friendly GPT-OSS loading)")
