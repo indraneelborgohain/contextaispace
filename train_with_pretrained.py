@@ -901,8 +901,8 @@ def main():
         else:
             print(f"\n⚠️  No BERT weights loaded, using only trained encoder")
         
-        # Ensure encoder is on correct device after loading weights
-        encoder.to(device)
+        # Critical: Ensure ALL encoder components (especially RoPE buffers) are on correct device
+        encoder = encoder.to(device)
         print("="*60 + "\n")
     
     # Optionally load GPT-2 weights for decoder (preferred for single GPU)
@@ -924,8 +924,8 @@ def main():
         else:
             print(f"\n⚠️  No GPT-2 weights loaded, using random initialization")
         
-        # Ensure decoder is on correct device after loading weights
-        decoder.to(device)
+        # Critical: Ensure ALL decoder components are on correct device
+        decoder = decoder.to(device)
         print("="*60 + "\n")
     
     # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
@@ -949,8 +949,8 @@ def main():
         else:
             print(f"\n⚠️  No GPT-OSS weights loaded, using only trained model")
         
-        # Ensure decoder is on correct device after loading weights
-        decoder.to(device)
+        # Critical: Ensure ALL decoder components are on correct device
+        decoder = decoder.to(device)
         print("="*60 + "\n")
     
     # Setup optimizer with different learning rates
