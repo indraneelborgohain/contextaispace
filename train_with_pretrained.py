@@ -38,8 +38,8 @@ def get_args():
     )
     
     # Model paths
-    ap.add_argument("--checkpoint", type=str, required=True,
-                    help="Path to checkpoint with trained encoder and decoder (.pt file)")
+    ap.add_argument("--checkpoint", type=str, default=None,
+                    help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
     ap.add_argument("--gptoss_weights", type=str, default=None,
                     help="Optional: Directory with GPT-OSS weights (will load compatible decoder layers)")
     ap.add_argument("--bert_model", type=str, default=None,
