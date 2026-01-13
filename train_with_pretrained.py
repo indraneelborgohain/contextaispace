@@ -1096,27 +1096,6 @@ def main():
     encoder.to(device)
     decoder.to(device)
     
-    # Debug: Print ALL buffers to find RoPE
-    print(f"\n🔍 Debug Info:")
-    print(f"  Target device: {device}")
-    print(f"  Encoder embedding device: {next(encoder.parameters()).device}")
-    print(f"  Decoder embedding device: {next(decoder.parameters()).device}")
-    
-    # Check ALL encoder buffers
-    print(f"\n  ALL Encoder buffers (first 5):")
-    for i, (name, buf) in enumerate(encoder.named_buffers()):
-        print(f"    '{name}': {buf.device}")
-        if i >= 4:
-            break
-    
-    # Check ALL decoder buffers
-    print(f"\n  ALL Decoder buffers (first 5):")
-    for i, (name, buf) in enumerate(decoder.named_buffers()):
-        print(f"    '{name}': {buf.device}")
-        if i >= 4:
-            break
-    print()
-    
     encoder.train()
     decoder.train()
     
