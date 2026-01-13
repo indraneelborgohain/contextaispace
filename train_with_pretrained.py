@@ -40,10 +40,16 @@ def get_args():
     # Model paths
     ap.add_argument("--checkpoint", type=str, default=None,
                     help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
+    ap.add_argument("--decoder_checkpoint", type=str, default=None,
+                    help="Optional: Path to checkpoint with just decoder weights (.pt file)")
     ap.add_argument("--gptoss_weights", type=str, default=None,
                     help="Optional: Directory with GPT-OSS weights (will load compatible decoder layers)")
+    ap.add_argument("--gpt2_model", type=str, default=None,
+                    help="Optional: GPT-2 model name (e.g., 'gpt2', 'gpt2-medium', 'gpt2-large') for decoder")
     ap.add_argument("--bert_model", type=str, default=None,
                     help="Optional: BERT model name (e.g., 'bert-base-uncased', 'roberta-base') for encoder")
+    ap.add_argument("--max_decoder_layers", type=int, default=None,
+                    help="Optional: Limit number of decoder layers (useful for loading partial pretrained weights)")
     ap.add_argument("--out_dir", type=str, default="model_finetuned")
     
     # Model size
@@ -521,9 +527,10 @@ def main():
         elif args.model_size == "small":
             encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8)
         elif args.model_size == "medium":
+            # Note: Use 1024 to match gpt2-medium and bert-large
             encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12)
         else:  # large
-            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=2048, num_hidden_layers=16)
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=16)
         print(f"✓ Created {args.model_size} encoder config")
     
     encoder = BidirectionalEncoder(encoder_config)
@@ -569,9 +576,11 @@ def main():
                 num_experts=8, num_attention_heads=16, use_encoder_decoder_cross_attention=True
             )
         elif args.model_size == "medium":
+            # Matches GPT-OSS dimensions for weight loading compatibility
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12,
-                num_experts=16, num_attention_heads=32, use_encoder_decoder_cross_attention=True
+                vocab_size=vocab_size, hidden_size=2880, num_hidden_layers=24,
+                num_experts=32, num_attention_heads=64, num_key_value_heads=8,
+                use_encoder_decoder_cross_attention=True
             )
         else:  # large
             decoder_config = ModelConfig(
@@ -588,11 +597,37 @@ def main():
     decoder = Transformer(decoder_config)
     decoder.to(device)
     
-    # First, load checkpoint weights (includes custom layers)
-    if checkpoint and 'decoder' in checkpoint:
+    # Load decoder weights from checkpoint or decoder_checkpoint
+    decoder_loaded = False
+    
+    if args.decoder_checkpoint:
+        # Load from separate decoder checkpoint
+        print(f"\nLoading decoder from: {args.decoder_checkpoint}")
+        decoder_ckpt = torch.load(args.decoder_checkpoint, map_location=device, weights_only=False)
+        
+        # Handle different checkpoint formats
+        if 'decoder' in decoder_ckpt:
+            decoder_state = decoder_ckpt['decoder']
+        elif 'model' in decoder_ckpt:
+            decoder_state = decoder_ckpt['model']
+        else:
+            # Assume the checkpoint IS the state dict
+            decoder_state = decoder_ckpt
+        
+        try:
+            decoder.load_state_dict(decoder_state, strict=False)
+            print(f"✓ Loaded decoder from {args.decoder_checkpoint} ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+            decoder_loaded = True
+        except RuntimeError as e:
+            print(f"❌ Error loading decoder from {args.decoder_checkpoint}: {str(e)[:200]}")
+            print(f"⚠️  Continuing with randomly initialized decoder")
+    
+    elif checkpoint and 'decoder' in checkpoint:
+        # Load from full checkpoint
         try:
             decoder.load_state_dict(checkpoint['decoder'], strict=True)
             print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+            decoder_loaded = True
         except RuntimeError as e:
             print(f"❌ Error loading decoder weights:")
             print(f"   {str(e)[:200]}...")
@@ -600,7 +635,8 @@ def main():
             print(f"   Try checking what's in the checkpoint with:")
             print(f"   python -c \"import torch; ckpt=torch.load('{args.checkpoint}', weights_only=False); print(ckpt.keys())\"")
             raise
-    else:
+    
+    if not decoder_loaded:
         print(f"✓ Initialized decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
     
     # Optionally load BERT weights for encoder
