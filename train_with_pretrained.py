@@ -42,11 +42,11 @@ def get_args():
                     help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
     ap.add_argument("--decoder_checkpoint", type=str, default=None,
                     help="Optional: Path to checkpoint with just decoder weights (.pt file)")
-    ap.add_argument("--gptoss_weights", type=str, default=None,
+    ap.add_argument("--gptoss_weights", type=str, default="architecture/open-gpt-oss/weights",
                     help="Optional: Directory with GPT-OSS weights (will load compatible decoder layers)")
     ap.add_argument("--gpt2_model", type=str, default=None,
                     help="Optional: GPT-2 model name (e.g., 'gpt2', 'gpt2-medium', 'gpt2-large') for decoder")
-    ap.add_argument("--bert_model", type=str, default=None,
+    ap.add_argument("--bert_model", type=str, default="bert-large-uncased",
                     help="Optional: BERT model name (e.g., 'bert-base-uncased', 'roberta-base') for encoder")
     ap.add_argument("--max_decoder_layers", type=int, default=12,
                     help="Limit number of decoder layers (default: 12 for GPU-friendly GPT-OSS loading)")
@@ -54,13 +54,13 @@ def get_args():
     
     # Model size
     ap.add_argument("--model_size", type=str, 
-                    choices=["toy", "small", "medium", "large"], default="small")
+                    choices=["toy", "small", "medium", "large"], default="medium")
     
     # Training hyperparameters
-    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--batch_size", type=int, default=2)
     ap.add_argument("--max_context_len", type=int, default=512)
     ap.add_argument("--max_qa_len", type=int, default=128)
-    ap.add_argument("--max_iters", type=int, default=5000)
+    ap.add_argument("--max_iters", type=int, default=1000)
     ap.add_argument("--log_interval", type=int, default=10)
     ap.add_argument("--eval_interval", type=int, default=200)
     ap.add_argument("--eval_iters", type=int, default=20)
@@ -69,7 +69,7 @@ def get_args():
     # Learning rates
     ap.add_argument("--encoder_lr", type=float, default=1e-5,
                     help="Learning rate for encoder")
-    ap.add_argument("--decoder_lr", type=float, default=1e-5,
+    ap.add_argument("--decoder_lr", type=float, default=1e-6,
                     help="Learning rate for decoder (use 1e-6 if loading GPT-OSS)")
     ap.add_argument("--cross_attn_lr", type=float, default=3e-4,
                     help="Learning rate for custom layers (context proj, cross-attn)")
