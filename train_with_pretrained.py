@@ -708,9 +708,11 @@ def main():
                 num_experts=4, num_attention_heads=8, use_encoder_decoder_cross_attention=True
             )
         elif args.model_size == "small":
+            # Matches GPT-2 small (768 hidden, 12 layers)
             decoder_config = ModelConfig(
-                vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8,
-                num_experts=8, num_attention_heads=16, use_encoder_decoder_cross_attention=True
+                vocab_size=vocab_size, hidden_size=768, num_hidden_layers=12,
+                num_experts=16, num_attention_heads=12, num_key_value_heads=4,
+                use_encoder_decoder_cross_attention=True
             )
         elif args.model_size == "medium":
             # Matches GPT-2 medium (1024 hidden, 24 layers)
