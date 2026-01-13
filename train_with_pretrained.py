@@ -315,38 +315,47 @@ def main():
     print("="*60)
     print(f"Device: {device}")
     print(f"Vocab size: {vocab_size}")
-    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Checkpoint: {args.checkpoint if args.checkpoint else 'None (starting fresh)'}")
     print(f"Output directory: {args.out_dir}")
     print("="*60 + "\n")
     
-    # Load both encoder and decoder from checkpoint
-    print(f"Loading models from: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # Load checkpoint if provided
+    checkpoint = None
+    if args.checkpoint:
+        print(f"Loading models from: {args.checkpoint}")
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
     # Load encoder config
     from architecture.encoder import BidirectionalEncoder, EncoderConfig
-    if 'encoder_config' in checkpoint:
+    if checkpoint and 'encoder_config' in checkpoint:
         encoder_config = checkpoint['encoder_config']
+        if isinstance(encoder_config, dict):
+            encoder_config = EncoderConfig(**encoder_config)
+        print(f"✓ Loaded encoder config from checkpoint")
     else:
-        # Default config if not found
-        encoder_config = EncoderConfig(
-            vocab_size=vocab_size,
-            hidden_size=1024,
-            num_hidden_layers=8,
-        )
+        # Default config based on model_size
+        if args.model_size == "toy":
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=256, num_hidden_layers=4)
+        elif args.model_size == "small":
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8)
+        elif args.model_size == "medium":
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12)
+        else:  # large
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=2048, num_hidden_layers=16)
+        print(f"✓ Created {args.model_size} encoder config")
     
     encoder = BidirectionalEncoder(encoder_config)
     encoder.to(device)
     
     # Only load encoder weights from checkpoint if NOT using BERT
-    if not args.bert_model and 'encoder' in checkpoint:
+    if checkpoint and not args.bert_model and 'encoder' in checkpoint:
         encoder.load_state_dict(checkpoint['encoder'])
         print(f"✓ Loaded encoder from checkpoint ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
     else:
         print(f"✓ Initialized encoder ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
     
     # Load decoder config from checkpoint
-    if 'decoder_config' in checkpoint:
+    if checkpoint and 'decoder_config' in checkpoint:
         decoder_config = checkpoint['decoder_config']
         print(f"Loaded decoder config from checkpoint")
         print(f"  Config type: {type(decoder_config)}")
@@ -355,19 +364,39 @@ def main():
         if isinstance(decoder_config, dict):
             decoder_config = ModelConfig(**decoder_config)
             print(f"  Converted dict to ModelConfig")
-    elif 'config' in checkpoint:
+    elif checkpoint and 'config' in checkpoint:
         # Try alternate key
         decoder_config = checkpoint['config']
         if isinstance(decoder_config, dict):
             decoder_config = ModelConfig(**decoder_config)
     else:
-        print("⚠️  No decoder config found in checkpoint, using default")
-        decoder_config = ModelConfig(
-            vocab_size=vocab_size,
-            hidden_size=encoder_config.hidden_size,
-            num_hidden_layers=8,
-            use_encoder_decoder_cross_attention=True,
-        )
+        if not checkpoint:
+            print("No checkpoint provided, creating fresh decoder config")
+        else:
+            print("⚠️  No decoder config found in checkpoint, using default")
+        
+        # Create config based on model_size
+        if args.model_size == "toy":
+            decoder_config = ModelConfig(
+                vocab_size=vocab_size, hidden_size=256, num_hidden_layers=4,
+                num_experts=4, num_attention_heads=8, use_encoder_decoder_cross_attention=True
+            )
+        elif args.model_size == "small":
+            decoder_config = ModelConfig(
+                vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8,
+                num_experts=8, num_attention_heads=16, use_encoder_decoder_cross_attention=True
+            )
+        elif args.model_size == "medium":
+            decoder_config = ModelConfig(
+                vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12,
+                num_experts=16, num_attention_heads=32, use_encoder_decoder_cross_attention=True
+            )
+        else:  # large
+            decoder_config = ModelConfig(
+                vocab_size=vocab_size, hidden_size=2048, num_hidden_layers=16,
+                num_experts=32, num_attention_heads=64, use_encoder_decoder_cross_attention=True
+            )
+        print(f"✓ Created {args.model_size} decoder config")
     
     # Print config details
     print(f"  Decoder config: {decoder_config.num_hidden_layers} layers, "
@@ -378,7 +407,7 @@ def main():
     decoder.to(device)
     
     # First, load checkpoint weights (includes custom layers)
-    if 'decoder' in checkpoint:
+    if checkpoint and 'decoder' in checkpoint:
         try:
             decoder.load_state_dict(checkpoint['decoder'], strict=True)
             print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
