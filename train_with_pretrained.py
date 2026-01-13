@@ -1162,6 +1162,25 @@ def main():
     encoder.to(device)
     decoder.to(device)
     
+    # Debug: Print device info for BOTH encoder and decoder
+    print(f"\n🔍 Debug Info:")
+    print(f"  Target device: {device}")
+    print(f"  Encoder embedding device: {next(encoder.parameters()).device}")
+    print(f"  Decoder embedding device: {next(decoder.parameters()).device}")
+    
+    # Check encoder RoPE buffers
+    print(f"\n  Encoder buffers:")
+    for name, buf in encoder.named_buffers():
+        if 'cos' in name or 'sin' in name:
+            print(f"    '{name}': {buf.device}")
+    
+    # Check decoder RoPE buffers
+    print(f"\n  Decoder buffers:")
+    for name, buf in decoder.named_buffers():
+        if 'cos' in name or 'sin' in name:
+            print(f"    '{name}': {buf.device}")
+    print()
+    
     encoder.train()
     decoder.train()
     
@@ -1200,6 +1219,10 @@ def main():
             ctx_tokens = ctx_tokens[ctx_tokens != 0]
             qa_mask = qa_tokens != -1
             qa_tokens = qa_tokens[qa_mask]
+            
+            # Ensure tokens are on correct device
+            ctx_tokens = ctx_tokens.to(device)
+            qa_tokens = qa_tokens.to(device)
             
             with torch.autocast(device_type='cuda' if 'cuda' in str(device) else 'cpu', dtype=dtype_ctx, enabled=(args.dtype != 'float32')):
                 # Encode context and get K,V for cross-attention
