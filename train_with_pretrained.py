@@ -342,7 +342,7 @@ def main():
     
     # Get tokenizer
     tokenizer = get_tokenizer()
-    vocab_size = tokenizer.vocab_size
+    vocab_size = tokenizer.n_vocab
     
     print("="*60)
     print("Training with Pretrained Models")
