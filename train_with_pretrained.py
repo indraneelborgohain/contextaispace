@@ -769,7 +769,7 @@ def main():
                                           num_attention_heads=20, num_key_value_heads=20)
         print(f"✓ Created {args.model_size} encoder config")
     
-    encoder = BidirectionalEncoder(encoder_config)
+    encoder = BidirectionalEncoder(encoder_config, device=device)
     encoder.to(device)
     
     # Only load encoder weights from checkpoint if NOT using BERT
@@ -845,7 +845,7 @@ def main():
     if args.max_decoder_layers and args.max_decoder_layers < 24:
         print(f"  📊 Layer limiting enabled: Using {args.max_decoder_layers} layers (reduces memory usage)")
     
-    decoder = Transformer(decoder_config)
+    decoder = Transformer(decoder_config, device=device)
     # Ensure decoder is on device BEFORE loading any weights
     decoder.to(device)
     
@@ -917,7 +917,8 @@ def main():
         print("="*60 + "\n")
     
     # Optionally load GPT-2 weights for decoder (preferred for single GPU)
-    if args.gpt2_model:
+    # TEMPORARILY DISABLED FOR DEBUGGING
+    if False and args.gpt2_model:
         print("\n" + "="*60)
         print("Hybrid Decoder Loading: GPT-2 + Trained Model")
         print("="*60)
@@ -940,7 +941,8 @@ def main():
         print("="*60 + "\n")
     
     # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
-    elif args.gptoss_weights:
+    # TEMPORARILY DISABLED FOR DEBUGGING
+    elif False and args.gptoss_weights:
         print("\n" + "="*60)
         print("Hybrid Decoder Loading: GPT-OSS + Trained Model")
         print("="*60)
@@ -1162,23 +1164,25 @@ def main():
     encoder.to(device)
     decoder.to(device)
     
-    # Debug: Print device info for BOTH encoder and decoder
+    # Debug: Print ALL buffers to find RoPE
     print(f"\n🔍 Debug Info:")
     print(f"  Target device: {device}")
     print(f"  Encoder embedding device: {next(encoder.parameters()).device}")
     print(f"  Decoder embedding device: {next(decoder.parameters()).device}")
     
-    # Check encoder RoPE buffers
-    print(f"\n  Encoder buffers:")
-    for name, buf in encoder.named_buffers():
-        if 'cos' in name or 'sin' in name:
-            print(f"    '{name}': {buf.device}")
+    # Check ALL encoder buffers
+    print(f"\n  ALL Encoder buffers (first 5):")
+    for i, (name, buf) in enumerate(encoder.named_buffers()):
+        print(f"    '{name}': {buf.device}")
+        if i >= 4:
+            break
     
-    # Check decoder RoPE buffers
-    print(f"\n  Decoder buffers:")
-    for name, buf in decoder.named_buffers():
-        if 'cos' in name or 'sin' in name:
-            print(f"    '{name}': {buf.device}")
+    # Check ALL decoder buffers
+    print(f"\n  ALL Decoder buffers (first 5):")
+    for i, (name, buf) in enumerate(decoder.named_buffers()):
+        print(f"    '{name}': {buf.device}")
+        if i >= 4:
+            break
     print()
     
     encoder.train()
