@@ -1244,18 +1244,20 @@ def main():
                     reduction='mean'
                 )
             
-            # Accumulate loss value (detach to prevent memory leak)
-            total_loss += loss.detach().item()
-            
-            # Backward pass on each example separately to save memory
-            (loss / batch_ctx.shape[0]).backward()
+            # Accumulate loss tensor (like train_msmarco)
+            total_loss += loss
             
             # Clear intermediate tensors
-            del encoder_k, encoder_v, logits, loss
+            del encoder_k, encoder_v, logits
         
-        # Average loss over batch (for logging)
+        # Average loss over batch (still a tensor, like train_msmarco)
         loss = total_loss / batch_ctx.shape[0]
         
+        # Backward pass
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        
+        # Gradient clipping
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 list(encoder.parameters()) + list(decoder.parameters()),
