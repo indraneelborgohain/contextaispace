@@ -404,33 +404,41 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
     
     print(f"\nLoading GPT-OSS weights from: {gptoss_weights_dir}")
     
-    # Find weights file
-    weights_file = None
+    # Find ALL weight files (GPT-OSS is sharded across multiple files)
+    weight_files = []
     for ext in ["*.safetensors", "*.bin", "*.pt", "*.pth"]:
-        weight_files = list(weights_path.glob(ext))
-        if weight_files:
-            weights_file = weight_files[0]
+        found_files = sorted(list(weights_path.glob(ext)))
+        if found_files:
+            weight_files = found_files
             break
     
-    if not weights_file:
+    if not weight_files:
         print(f"❌ No weight files found in {gptoss_weights_dir}")
         return 0
     
-    print(f"Loading from: {weights_file.name}")
+    print(f"Found {len(weight_files)} weight file(s)")
+    if len(weight_files) > 1:
+        print(f"  Loading sharded weights: {weight_files[0].name} ... {weight_files[-1].name}")
+    else:
+        print(f"  Loading from: {weight_files[0].name}")
     
-    # Load weights
+    # Load ALL weight files (handle sharded models)
+    gptoss_state = {}
     try:
-        if weights_file.suffix == ".safetensors":
-            try:
-                from safetensors.torch import load_file
-                gptoss_state = load_file(str(weights_file))
-            except ImportError:
-                print("⚠️  safetensors not installed. Install with: pip install safetensors")
-                return 0
-        else:
-            gptoss_state = torch.load(weights_file, map_location=device, weights_only=False)
+        for weight_file in weight_files:
+            if weight_file.suffix == ".safetensors":
+                try:
+                    from safetensors.torch import load_file
+                    shard_state = load_file(str(weight_file))
+                    gptoss_state.update(shard_state)
+                except ImportError:
+                    print("⚠️  safetensors not installed. Install with: pip install safetensors")
+                    return 0
+            else:
+                shard_state = torch.load(weight_file, map_location=device, weights_only=False)
+                gptoss_state.update(shard_state)
         
-        print(f"✓ Loaded GPT-OSS state dict ({len(gptoss_state)} parameters)")
+        print(f"✓ Loaded GPT-OSS state dict ({len(gptoss_state)} parameters from {len(weight_files)} files)")
     except Exception as e:
         print(f"❌ Failed to load weights: {e}")
         return 0
