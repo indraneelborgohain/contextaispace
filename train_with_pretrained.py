@@ -233,11 +233,14 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
         except Exception as e:
             print(f"  ⚠️  Skipped {enc_prefix}.mlp.fc2: {e}")
     
-    # Load the updated state
+    # Load the updated state by directly copying parameter data (preserves device)
     if loaded_count > 0:
-        encoder.load_state_dict(encoder_state, strict=False)
-        # Move entire encoder to device to sync all buffers (especially RoPE)
-        encoder.to(device)
+        for name, param in encoder.named_parameters():
+            if name in encoder_state:
+                param.data.copy_(encoder_state[name])
+        for name, buf in encoder.named_buffers():
+            if name in encoder_state:
+                buf.data.copy_(encoder_state[name])
         print(f"\n✓ Loaded {loaded_count} parameters from BERT")
     else:
         print(f"\n⚠️  No matching parameters found")
@@ -379,9 +382,13 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
     print(f"\n✓ Loaded {loaded_count} GPT-2 parameters into decoder")
     print("  Note: Custom layers (context_proj, cross_attn, MoE experts) remain randomly initialized")
     
-    # Load the modified state dict and move to device
-    decoder.load_state_dict(decoder_state, strict=False)
-    decoder.to(device)
+    # Load the modified state by directly copying parameter data (preserves device)
+    for name, param in decoder.named_parameters():
+        if name in decoder_state:
+            param.data.copy_(decoder_state[name])
+    for name, buf in decoder.named_buffers():
+        if name in decoder_state:
+            buf.data.copy_(decoder_state[name])
     return loaded_count
 
 
@@ -635,11 +642,14 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                 except Exception as e:
                     pass
     
-    # Load the updated state
+    # Load the updated state by directly copying parameter data (preserves device)
     if loaded_count > 0:
-        # Move entire decoder to device to sync all buffers
-        decoder.to(device)
-        decoder.load_state_dict(decoder_state)
+        for name, param in decoder.named_parameters():
+            if name in decoder_state:
+                param.data.copy_(decoder_state[name])
+        for name, buf in decoder.named_buffers():
+            if name in decoder_state:
+                buf.data.copy_(decoder_state[name])
         print(f"\n✓ Loaded {loaded_count} parameters from GPT-OSS")
         print(f"✓ Kept custom layers (context_proj, cross_attn, gate)")
     else:
