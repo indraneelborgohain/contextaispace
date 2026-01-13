@@ -1129,6 +1129,10 @@ def main():
     print(f"Max iterations: {args.max_iters}")
     print("="*60 + "\n")
     
+    # Ensure all components are on correct device (especially RoPE buffers)
+    encoder.to(device)
+    decoder.to(device)
+    
     encoder.train()
     decoder.train()
     
