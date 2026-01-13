@@ -1140,9 +1140,8 @@ def main():
     t0 = time.time()
     
     while iter_num < args.max_iters:
-        # Get batch (implement your data loading here)
-        # This is a placeholder - replace with your actual data loading
-        batch = get_training_batch(train_examples, args.batch_size, device)
+        # Get batch
+        batch_ctx, batch_qa = get_training_batch(train_examples, args.batch_size, args.max_context_len, args.max_qa_len, device)
         
         # Update learning rates with schedule
         encoder_lr = get_lr(iter_num, args.warmup_iters, args.max_iters, 
@@ -1159,11 +1158,25 @@ def main():
             optimizer.param_groups[2]['lr'] = custom_lr
         
         # Forward pass
-        # TODO: Implement your forward pass here
-        # This should encode context, decode with cross-attention, and compute loss
-        
-        # Placeholder loss computation
-        loss = torch.tensor(0.0, device=device)
+        with torch.autocast(device_type='cuda' if 'cuda' in str(device) else 'cpu', dtype=dtype_ctx, enabled=(args.dtype != 'float32')):
+            # Encode context
+            ctx_embeddings = encoder(batch_ctx)
+            
+            # Decode with cross-attention
+            # Input: batch_qa[:, :-1] (all but last token)
+            # Target: batch_qa[:, 1:] (all but first token)
+            input_ids = batch_qa[:, :-1]
+            targets = batch_qa[:, 1:]
+            
+            # Get logits from decoder
+            logits = decoder(input_ids, context_embeddings=ctx_embeddings)
+            
+            # Compute cross-entropy loss
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-1  # Ignore padding
+            )
         
         # Backward pass
         optimizer.zero_grad(set_to_none=True)
@@ -1234,12 +1247,51 @@ def main():
         writer.close()
 
 
-def get_training_batch(examples, batch_size, device):
+def get_training_batch(examples, batch_size, max_context_len, max_qa_len, device):
     """
-    Placeholder function - implement your actual batch creation here
+    Create a training batch from examples.
+    
+    Args:
+        examples: List of (context_tokens, qa_tokens) tuples
+        batch_size: Batch size
+        max_context_len: Max context length
+        max_qa_len: Max QA length
+        device: torch device
+    
+    Returns:
+        batch_ctx: [batch_size, max_context_len] context tokens
+        batch_qa: [batch_size, max_qa_len] QA tokens
     """
-    # TODO: Implement based on your data format
-    return {}
+    import random
+    
+    # Sample random examples
+    batch_examples = random.sample(examples, min(batch_size, len(examples)))
+    
+    # Pad to max lengths
+    batch_ctx = []
+    batch_qa = []
+    
+    for ctx_tokens, qa_tokens in batch_examples:
+        # Pad or truncate context
+        if len(ctx_tokens) < max_context_len:
+            ctx_tokens = ctx_tokens + [0] * (max_context_len - len(ctx_tokens))
+        else:
+            ctx_tokens = ctx_tokens[:max_context_len]
+        
+        # Pad or truncate QA
+        if len(qa_tokens) < max_qa_len:
+            qa_tokens = qa_tokens + [-1] * (max_qa_len - len(qa_tokens))  # Use -1 for padding (will be ignored)
+        else:
+            qa_tokens = qa_tokens[:max_qa_len]
+        
+        batch_ctx.append(ctx_tokens)
+        batch_qa.append(qa_tokens)
+    
+    # Convert to tensors
+    batch_ctx = torch.tensor(batch_ctx, dtype=torch.long, device=device)
+    batch_qa = torch.tensor(batch_qa, dtype=torch.long, device=device)
+    
+    return batch_ctx, batch_qa
 
 
 if __name__ == "__main__":
