@@ -389,7 +389,9 @@ def main():
     decoder = Transformer(decoder_config)
     decoder.to(device)
     decoder.load_state_dict(checkpoint['decoder'])
-    print(f"✓ Loaded dBERT weights for encoder
+    print(f"✓ Loaded decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+    
+    # Optionally load BERT weights for encoder
     if args.bert_model:
         print("\n" + "="*60)
         print("Hybrid Encoder Loading: BERT + Trained Model")
