@@ -119,79 +119,44 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
         # Load pretrained BERT model
         bert_model = AutoModel.from_pretrained(bert_model_name)
         bert_state = bert_model.state_dict()
-        print(f"✓ Downloaded BERT model")
+        print(f"✓ Downloaded BERT model ({len(bert_state)} parameters)")
+        
+        # Debug: show some BERT parameter names
+        print(f"Sample BERT parameters: {list(bert_state.keys())[:5]}")
     except Exception as e:
         print(f"❌ Failed to load BERT: {e}")
         return 0
     
     # Get encoder state
     encoder_state = encoder.state_dict()
-    
-    # Mapping between BERT and our encoder
-    # BERT uses: embeddings.word_embeddings, encoder.layer.N.attention, etc.
-    # We use: embedding, blocks.N.attn, etc.
+    print(f"Encoder has {len(encoder_state)} parameters")
+    print(f"Sample encoder parameters: {list(encoder_state.keys())[:5]}")
     
     loaded_count = 0
-    skipped_count = 0
     
-    for name, param in encoder_state.items():
-        # Skip custom compression and cross-attention layers
+    # Try direct parameter name matching (in case architectures align)
+    for name in encoder_state.keys():
+        # Skip custom layers
         if any(skip in name for skip in [
-            'cross_attn',
-            'final_cross_attn',
-            'lsi',
-            'compression',
-            '_compress'
+            'cross_attn', 'final_cross_attn', 'lsi', 
+            'start_token_embedding', 'chunk_context'
         ]):
-            skipped_count += 1
             continue
         
-        # Try to map our parameter names to BERT names
-        bert_name = None
-        
-        # Embedding layer
-        if name == 'embedding.weight':
-            bert_name = 'embeddings.word_embeddings.weight'
-        
-        # Encoder blocks: blocks.N.attn.qkv.weight -> encoder.layer.N.attention.self.query/key/value.weight
-        elif 'blocks.' in name:
-            parts = name.split('.')
-            layer_idx = parts[1]
-            
-            if 'attn.qkv.weight' in name:
-                # BERT splits QKV, we might need to concat them
-                # This is complex, skip for now and handle separately
-                pass
-            elif 'attn.out.weight' in name:
-                bert_name = f'encoder.layer.{layer_idx}.attention.output.dense.weight'
-            elif 'attn.norm' in name:
-                bert_name = f'encoder.layer.{layer_idx}.attention.output.LayerNorm.weight'
-            elif 'mlp' in name or 'ffn' in name:
-                # Map FFN layers
-                if 'mlp.0.weight' in name or 'experts.0.0.weight' in name:
-                    bert_name = f'encoder.layer.{layer_idx}.intermediate.dense.weight'
-                elif 'mlp.1.weight' in name or 'experts.0.1.weight' in name:
-                    bert_name = f'encoder.layer.{layer_idx}.output.dense.weight'
-        
-        # Norm layer
-        elif name == 'norm.weight':
-            bert_name = 'encoder.layer.11.output.LayerNorm.weight'  # Last layer norm
-        
-        # Try to load if we found a mapping
-        if bert_name and bert_name in bert_state:
-            bert_param = bert_state[bert_name]
-            if param.shape == bert_param.shape:
-                encoder_state[name] = bert_param.to(device)
-                loaded_count += 1
-            else:
-                # Shape mismatch, keep original
-                pass
+        # Try exact match
+        if name in bert_state and encoder_state[name].shape == bert_state[name].shape:
+            encoder_state[name] = bert_state[name].to(device)
+            loaded_count += 1
+            print(f"  Loaded: {name}")
     
     # Load the updated state
-    encoder.load_state_dict(encoder_state)
+    if loaded_count > 0:
+        encoder.load_state_dict(encoder_state)
+        print(f"\n✓ Loaded {loaded_count} parameters from BERT")
+    else:
+        print(f"\n⚠️  No matching parameters found between BERT and encoder")
+        print(f"   This is normal if architectures differ significantly")
     
-    print(f"✓ Loaded {loaded_count} parameters from BERT")
-    print(f"✓ Kept {skipped_count} custom parameters (SVD, cross-attn)")
     print(f"✓ Total encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M")
     
     return loaded_count
@@ -203,75 +168,76 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device):
     
     weights_path = Path(gptoss_weights_dir)
     if not weights_path.exists():
-        print(f"GPT-OSS weights not found at {gptoss_weights_dir}, skipping")
+        print(f"❌ GPT-OSS weights not found at {gptoss_weights_dir}")
         return 0
     
     print(f"\nLoading GPT-OSS weights from: {gptoss_weights_dir}")
     
     # Find weights file
     weights_file = None
-    for ext in ["*.safetensors", "*.bin", "*.pt"]:
+    for ext in ["*.safetensors", "*.bin", "*.pt", "*.pth"]:
         weight_files = list(weights_path.glob(ext))
         if weight_files:
             weights_file = weight_files[0]
             break
     
     if not weights_file:
-        print("No weight files found, skipping GPT-OSS loading")
+        print(f"❌ No weight files found in {gptoss_weights_dir}")
+        print(f"   Looking for: .safetensors, .bin, .pt, .pth")
+        print(f"   Found files: {list(weights_path.glob('*'))[:10]}")
         return 0
     
     print(f"Loading from: {weights_file.name}")
     
     # Load weights
-    if weights_file.suffix == ".safetensors":
-        try:
-            from safetensors.torch import load_file
-            gptoss_state = load_file(str(weights_file))
-        except ImportError:
-            print("safetensors not installed, skipping")
-            return 0
-    else:
-        gptoss_state = torch.load(weights_file, map_location=device, weights_only=False)
+    try:
+        if weights_file.suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+                gptoss_state = load_file(str(weights_file))
+            except ImportError:
+                print("⚠️  safetensors not installed. Install with: pip install safetensors")
+                return 0
+        else:
+            gptoss_state = torch.load(weights_file, map_location=device, weights_only=False)
+        
+        print(f"✓ Loaded GPT-OSS state dict ({len(gptoss_state)} parameters)")
+        print(f"Sample GPT-OSS parameters: {list(gptoss_state.keys())[:5]}")
+    except Exception as e:
+        print(f"❌ Failed to load weights: {e}")
+        return 0
     
     # Get decoder state
     decoder_state = decoder.state_dict()
+    print(f"Decoder has {len(decoder_state)} parameters")
+    print(f"Sample decoder parameters: {list(decoder_state.keys())[:5]}")
     
-    # Try to load compatible weights
     loaded_count = 0
-    skipped_count = 0
     
-    for name, param in decoder_state.items():
-        # Try exact match first
-        if name in gptoss_state:
-            gptoss_param = gptoss_state[name]
-            if param.shape == gptoss_param.shape:
-                decoder_state[name] = gptoss_param.to(device)
-                loaded_count += 1
-                continue
-        
-        # Try common mappings (GPT-OSS might use different names)
-        # embedding.weight -> embedding.weight
-        # block.0.attn.qkv.weight -> block.0.attn.qkv.weight
-        # etc.
-        
-        # Skip context-specific layers (will keep trained weights)
+    # Try direct matching first
+    for name in decoder_state.keys():
+        # Skip context-specific layers (keep trained weights)
         if any(skip in name for skip in [
-            'context_proj',
-            'cross_attn',
-            'context_state',
-            'start_token_embedding',
-            'lsi',
-            'encoder_projection'
+            'context_proj', 'cross_attn', 'context_state',
+            'start_token_embedding', 'lsi', 'encoder_projection'
         ]):
-            skipped_count += 1
             continue
+        
+        # Try exact match
+        if name in gptoss_state and decoder_state[name].shape == gptoss_state[name].shape:
+            decoder_state[name] = gptoss_state[name].to(device)
+            loaded_count += 1
+            print(f"  Loaded: {name}")
     
     # Load the updated state
-    decoder.load_state_dict(decoder_state)
+    if loaded_count > 0:
+        decoder.load_state_dict(decoder_state)
+        print(f"\n✓ Loaded {loaded_count} parameters from GPT-OSS")
+    else:
+        print(f"\n⚠️  No matching parameters found between GPT-OSS and decoder")
+        print(f"   This is normal if architectures differ significantly")
     
-    print(f"✓ Loaded {loaded_count} parameters from GPT-OSS")
-    print(f"✓ Kept {skipped_count} custom parameters from trained model")
-    print(f"✓ Total parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M")
+    print(f"✓ Total decoder parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M")
     
     return loaded_count
 
@@ -394,8 +360,8 @@ def main():
     decoder = Transformer(decoder_config)
     decoder.to(device)
     
-    # Only load decoder weights from checkpoint if NOT using GPT-OSS
-    if not args.gptoss_weights and 'decoder' in checkpoint:
+    # First, load checkpoint weights (includes custom layers)
+    if 'decoder' in checkpoint:
         decoder.load_state_dict(checkpoint['decoder'])
         print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
     else:
@@ -421,16 +387,14 @@ def main():
             print(f"\n⚠️  No BERT weights loaded, using only trained encoder")
         print("="*60 + "\n")
     
-    # Optionally load GPT-OSS weights for compatible decodern decoder.parameters())/1e6:.2f}M params)")
-    
-    # Optionally load GPT-OSS weights for compatible layers
+    # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
     if args.gptoss_weights:
         print("\n" + "="*60)
-        print("Hybrid Loading: GPT-OSS + Trained Model")
+        print("Hybrid Decoder Loading: GPT-OSS + Trained Model")
         print("="*60)
         print("Strategy:")
-        print("  - GPT-OSS weights: embedding, standard attention, MLP")
-        print("  - Trained weights: context projections, cross-attention")
+        print("  - GPT-OSS weights: embedding, standard attention, MLP (overwrite)")
+        print("  - Trained weights: context projections, cross-attention (keep)")
         print()
         
         loaded = load_gptoss_weights_partial(decoder, args.gptoss_weights, device)
