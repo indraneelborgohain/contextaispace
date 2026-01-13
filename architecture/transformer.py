@@ -306,7 +306,8 @@ class TransformerBlock(torch.nn.Module):
         
         # Optional cross-attention to encoder
         if config.use_encoder_decoder_cross_attention:
-            self.cross_attn = CrossAttentionLayer(config, device)
+            encoder_size = config.encoder_hidden_size if config.encoder_hidden_size else config.hidden_size
+            self.cross_attn = CrossAttentionLayer(config, encoder_hidden_size=encoder_size, device=device)
         else:
             self.cross_attn = None
 
@@ -338,12 +339,17 @@ class CrossAttentionLayer(torch.nn.Module):
     def __init__(
         self,
         config: ModelConfig,
+        encoder_hidden_size: int | None = None,
         device: torch.device | None = None,
     ):
         super().__init__()
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
+        
+        # If encoder has different hidden size, use that for K,V projections
+        if encoder_hidden_size is None:
+            encoder_hidden_size = config.hidden_size
         
         self.norm = RMSNorm(config.hidden_size, device=device)
         
@@ -355,15 +361,15 @@ class CrossAttentionLayer(torch.nn.Module):
             dtype=torch.bfloat16
         )
         
-        # K, V projections (from encoder)
+        # K, V projections (from encoder) - use encoder hidden size
         self.k_proj = torch.nn.Linear(
-            config.hidden_size,
+            encoder_hidden_size,
             config.head_dim * config.num_key_value_heads,
             device=device,
             dtype=torch.bfloat16
         )
         self.v_proj = torch.nn.Linear(
-            config.hidden_size,
+            encoder_hidden_size,
             config.head_dim * config.num_key_value_heads,
             device=device,
             dtype=torch.bfloat16

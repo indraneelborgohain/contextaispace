@@ -30,6 +30,7 @@ class ModelConfig:
     use_lsi_cross_attention: bool = True  # Enable LSI cross-attention
     use_context_embedding: bool = True  # Prepend context embedding to input sequence
     use_encoder_decoder_cross_attention: bool = False  # Enable encoder-decoder cross-attention
+    encoder_hidden_size: int | None = None  # Hidden size of encoder (if different from decoder)
     
     @property
     def context_dim(self) -> int:

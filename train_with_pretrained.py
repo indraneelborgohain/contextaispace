@@ -825,7 +825,8 @@ def main():
             decoder_config = ModelConfig(
                 vocab_size=vocab_size, hidden_size=2880, num_hidden_layers=num_layers,
                 num_experts=32, num_attention_heads=64, num_key_value_heads=64,  # Full MHA, not GQA!
-                use_encoder_decoder_cross_attention=True
+                use_encoder_decoder_cross_attention=True,
+                encoder_hidden_size=1024  # Encoder uses 1024 (bert-large), decoder uses 2880
             )
         else:  # large
             # Matches GPT-2 large (1280 hidden, 36 layers)
