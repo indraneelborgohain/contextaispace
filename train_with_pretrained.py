@@ -625,4 +625,3 @@ def get_training_batch(examples, batch_size, device):
 
 if __name__ == "__main__":
     main()
-Fine-Tuning Encoder-Decoder with New Learning Rate
