@@ -1001,32 +1001,83 @@ def main():
         for i, ex in enumerate(dataset['train']):
             if i >= 10000:  # Limit for faster testing
                 break
-            if ex.get('passages') and ex.get('query'):
-                context = " ".join([p['passage_text'] for p in ex['passages'][:3]])
-                question = ex['query']
-                answer = ex.get('answers', [''])[0] if ex.get('answers') else ""
-                
-                # Tokenize
-                ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
-                qa_text = f"{question} {answer}"
-                qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
-                
-                train_examples.append((ctx_tokens, qa_tokens))
+            
+            try:
+                # MS MARCO structure: passages is a dict with 'passage_text' as a list
+                if 'passages' in ex and 'query' in ex:
+                    passages = ex['passages']
+                    if isinstance(passages, dict) and 'passage_text' in passages:
+                        # passages is a dict with lists as values
+                        passage_texts = passages['passage_text'][:3] if isinstance(passages['passage_text'], list) else [passages['passage_text']]
+                    elif isinstance(passages, list):
+                        # passages is a list of dicts
+                        passage_texts = [p.get('passage_text', '') for p in passages[:3]]
+                    else:
+                        continue
+                    
+                    context = " ".join(passage_texts)
+                    question = ex['query']
+                    
+                    # Get answer
+                    if 'answers' in ex and ex['answers']:
+                        if isinstance(ex['answers'], list):
+                            answer = ex['answers'][0] if ex['answers'] else ""
+                        elif isinstance(ex['answers'], dict):
+                            answer = ex['answers'].get('text', [''])[0] if 'text' in ex['answers'] else ""
+                        else:
+                            answer = str(ex['answers'])
+                    else:
+                        answer = ""
+                    
+                    # Tokenize
+                    ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
+                    qa_text = f"{question} {answer}"
+                    qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+                    
+                    train_examples.append((ctx_tokens, qa_tokens))
+            except Exception as e:
+                # Skip problematic examples
+                if i < 10:  # Only print first few errors
+                    print(f"  Warning: Skipping example {i}: {e}")
+                continue
         
         print("Formatting validation examples...")
         for i, ex in enumerate(dataset['validation']):
             if i >= 1000:  # Smaller validation set
                 break
-            if ex.get('passages') and ex.get('query'):
-                context = " ".join([p['passage_text'] for p in ex['passages'][:3]])
-                question = ex['query']
-                answer = ex.get('answers', [''])[0] if ex.get('answers') else ""
-                
-                ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
-                qa_text = f"{question} {answer}"
-                qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
-                
-                val_examples.append((ctx_tokens, qa_tokens))
+            
+            try:
+                if 'passages' in ex and 'query' in ex:
+                    passages = ex['passages']
+                    if isinstance(passages, dict) and 'passage_text' in passages:
+                        passage_texts = passages['passage_text'][:3] if isinstance(passages['passage_text'], list) else [passages['passage_text']]
+                    elif isinstance(passages, list):
+                        passage_texts = [p.get('passage_text', '') for p in passages[:3]]
+                    else:
+                        continue
+                    
+                    context = " ".join(passage_texts)
+                    question = ex['query']
+                    
+                    if 'answers' in ex and ex['answers']:
+                        if isinstance(ex['answers'], list):
+                            answer = ex['answers'][0] if ex['answers'] else ""
+                        elif isinstance(ex['answers'], dict):
+                            answer = ex['answers'].get('text', [''])[0] if 'text' in ex['answers'] else ""
+                        else:
+                            answer = str(ex['answers'])
+                    else:
+                        answer = ""
+                    
+                    ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
+                    qa_text = f"{question} {answer}"
+                    qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+                    
+                    val_examples.append((ctx_tokens, qa_tokens))
+            except Exception as e:
+                if i < 10:
+                    print(f"  Warning: Skipping validation example {i}: {e}")
+                continue
     else:
         # Simple SQuAD loader
         print("Loading SQuAD dataset...")
