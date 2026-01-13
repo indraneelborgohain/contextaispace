@@ -936,12 +936,12 @@ def main():
             print(f"  GPT-OSS provides base transformer knowledge")
             print(f"  Your trained model provides custom functionality")
             if args.max_decoder_layers and args.max_decoder_layers < 24:
-        
-        # Ensure decoder is on correct device after loading weights
-        decoder.to(device)
                 print(f"  📊 Loaded only first {args.max_decoder_layers} layers (saves GPU memory)")
         else:
             print(f"\n⚠️  No GPT-OSS weights loaded, using only trained model")
+        
+        # Ensure decoder is on correct device after loading weights
+        decoder.to(device)
         print("="*60 + "\n")
     
     # Setup optimizer with different learning rates
