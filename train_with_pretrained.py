@@ -357,7 +357,7 @@ def main():
     print(f"Loading models from: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
-    # Load encoder
+    # Load encoder config
     from architecture.encoder import BidirectionalEncoder, EncoderConfig
     if 'encoder_config' in checkpoint:
         encoder_config = checkpoint['encoder_config']
@@ -371,8 +371,13 @@ def main():
     
     encoder = BidirectionalEncoder(encoder_config)
     encoder.to(device)
-    encoder.load_state_dict(checkpoint['encoder'])
-    print(f"✓ Loaded encoder ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
+    
+    # Only load encoder weights from checkpoint if NOT using BERT
+    if not args.bert_model and 'encoder' in checkpoint:
+        encoder.load_state_dict(checkpoint['encoder'])
+        print(f"✓ Loaded encoder from checkpoint ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
+    else:
+        print(f"✓ Initialized encoder ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
     
     # Load decoder
     if 'decoder_config' in checkpoint:
@@ -388,8 +393,13 @@ def main():
     
     decoder = Transformer(decoder_config)
     decoder.to(device)
-    decoder.load_state_dict(checkpoint['decoder'])
-    print(f"✓ Loaded decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+    
+    # Only load decoder weights from checkpoint if NOT using GPT-OSS
+    if not args.gptoss_weights and 'decoder' in checkpoint:
+        decoder.load_state_dict(checkpoint['decoder'])
+        print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+    else:
+        print(f"✓ Initialized decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
     
     # Optionally load BERT weights for encoder
     if args.bert_model:
