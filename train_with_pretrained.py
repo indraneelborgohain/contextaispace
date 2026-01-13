@@ -134,16 +134,30 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
     encoder_state = encoder.state_dict()
     loaded_count = 0
     
+    print(f"Encoder expects {len([k for k in encoder_state.keys() if 'blocks' in k])} block parameters")
+    print(f"BERT has {len([k for k in bert_state.keys() if 'encoder.layer' in k])} layer parameters")
+    
     # 1. Load embedding
     if 'embeddings.word_embeddings.weight' in bert_state:
-        if encoder_state['embedding.weight'].shape == bert_state['embeddings.word_embeddings.weight'].shape:
-            encoder_state['embedding.weight'] = bert_state['embeddings.word_embeddings.weight'].to(device)
+        bert_emb = bert_state['embeddings.word_embeddings.weight']
+        enc_emb = encoder_state['embedding.weight']
+        print(f"  BERT embedding: {bert_emb.shape}, Encoder embedding: {enc_emb.shape}")
+        
+        if enc_emb.shape == bert_emb.shape:
+            encoder_state['embedding.weight'] = bert_emb.to(device)
             loaded_count += 1
             print(f"  ✓ Loaded embedding.weight")
+        else:
+            print(f"  ✗ Embedding shape mismatch")
     
     # 2. Load each encoder block
-    num_layers = encoder.config.num_hidden_layers
-    for layer_idx in range(num_layers):
+    num_bert_layers = sum(1 for k in bert_state.keys() if k.startswith('encoder.layer.') and '.attention.self.query.weight' in k)
+    num_enc_layers = encoder.config.num_hidden_layers
+    layers_to_load = min(num_bert_layers, num_enc_layers)
+    
+    print(f"  Loading {layers_to_load} layers (BERT has {num_bert_layers}, encoder has {num_enc_layers})")
+    
+    for layer_idx in range(layers_to_load):
         bert_prefix = f'encoder.layer.{layer_idx}'
         enc_prefix = f'blocks.{layer_idx}'
         
@@ -216,7 +230,7 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
     
     # Load the updated state
     if loaded_count > 0:
-        encoder.load_state_dict(encoder_state)
+        encoder.load_state_dict(encoder_state, strict=False)
         print(f"\n✓ Loaded {loaded_count} parameters from BERT")
     else:
         print(f"\n⚠️  No matching parameters found")
@@ -459,15 +473,20 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
     
     for layer_idx in range(num_layers):
         dec_prefix = f'block.{layer_idx}'
+        layer_loaded = False
         
         # Try different GPT naming conventions
         for gpt_layer_prefix in [
             f'{gpt_prefix}h.{layer_idx}',
             f'{gpt_prefix}blocks.{layer_idx}',
             f'{gpt_prefix}layers.{layer_idx}',
+            f'layers.{layer_idx}',  # GPT-OSS actual format
             f'block.{layer_idx}',
         ]:
-            # Try to load attention QKV
+            if layer_loaded:
+                break
+                
+            # Option 1: Try fused QKV (GPT-2 style)
             for qkv_key in [f'{gpt_layer_prefix}.attn.c_attn.weight', 
                            f'{gpt_layer_prefix}.attn.qkv.weight',
                            f'{gpt_layer_prefix}.attention.qkv.weight']:
@@ -485,13 +504,53 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                                 loaded_count += 1
                             
                             print(f"  ✓ Loaded {dec_prefix}.attn.qkv from {qkv_key}")
+                            layer_loaded = True
                             break
                     except Exception as e:
+                        continue
+            
+            # Option 2: Try separate Q, K, V (GPT-OSS style)
+            if not layer_loaded:
+                q_key = f'{gpt_layer_prefix}.attn.q.weight'
+                k_key = f'{gpt_layer_prefix}.attn.k.weight'
+                v_key = f'{gpt_layer_prefix}.attn.v.weight'
+                
+                if q_key in gptoss_state and k_key in gptoss_state and v_key in gptoss_state:
+                    try:
+                        q_weight = gptoss_state[q_key]
+                        k_weight = gptoss_state[k_key]
+                        v_weight = gptoss_state[v_key]
+                        
+                        # Concatenate Q, K, V
+                        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                        
+                        if decoder_state[f'{dec_prefix}.attn.qkv.weight'].shape == qkv_weight.shape:
+                            decoder_state[f'{dec_prefix}.attn.qkv.weight'] = qkv_weight.to(device)
+                            loaded_count += 1
+                            
+                            # Try to load biases if they exist
+                            q_bias_key = f'{gpt_layer_prefix}.attn.q.bias'
+                            k_bias_key = f'{gpt_layer_prefix}.attn.k.bias'
+                            v_bias_key = f'{gpt_layer_prefix}.attn.v.bias'
+                            
+                            if q_bias_key in gptoss_state and k_bias_key in gptoss_state and v_bias_key in gptoss_state:
+                                q_bias = gptoss_state[q_bias_key]
+                                k_bias = gptoss_state[k_bias_key]
+                                v_bias = gptoss_state[v_bias_key]
+                                qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+                                decoder_state[f'{dec_prefix}.attn.qkv.bias'] = qkv_bias.to(device)
+                                loaded_count += 1
+                            
+                            print(f"  ✓ Loaded {dec_prefix}.attn.qkv from separate Q,K,V")
+                            layer_loaded = True
+                    except Exception as e:
+                        print(f"  ⚠️  Failed to concat Q,K,V for layer {layer_idx}: {e}")
                         continue
             
             # Try to load attention output
             for out_key in [f'{gpt_layer_prefix}.attn.c_proj.weight',
                            f'{gpt_layer_prefix}.attn.out.weight',
+                           f'{gpt_layer_prefix}.attn.o.weight',  # GPT-OSS actual format
                            f'{gpt_layer_prefix}.attention.out.weight']:
                 if out_key in gptoss_state:
                     try:
@@ -511,51 +570,51 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                     except Exception as e:
                         continue
             
-            # Try to load MLP experts (if GPT-OSS also uses MoE)
-            # Skip gate and context_proj - those are custom
-            num_experts = decoder.config.num_experts
-            for expert_idx in range(num_experts):
-                # Try fc1 (first layer of expert)
-                for fc1_key in [f'{gpt_layer_prefix}.mlp.experts.{expert_idx}.0.weight',
-                               f'{gpt_layer_prefix}.mlp.experts.{expert_idx}.fc1.weight']:
-                    if fc1_key in gptoss_state:
-                        try:
-                            fc1_weight = gptoss_state[fc1_key]
-                            fc1_bias_key = fc1_key.replace('.weight', '.bias')
-                            
-                            if decoder_state[f'{dec_prefix}.mlp.experts.{expert_idx}.0.weight'].shape == fc1_weight.shape:
-                                decoder_state[f'{dec_prefix}.mlp.experts.{expert_idx}.0.weight'] = fc1_weight.to(device)
-                                loaded_count += 1
-                                
-                                if fc1_bias_key in gptoss_state:
-                                    decoder_state[f'{dec_prefix}.mlp.experts.{expert_idx}.0.bias'] = gptoss_state[fc1_bias_key].to(device)
-                                    loaded_count += 1
-                                
-                                print(f"  ✓ Loaded {dec_prefix}.mlp.experts.{expert_idx}.0")
-                                break
-                        except Exception:
-                            continue
-                
-                # Try fc2 (second layer of expert)
-                for fc2_key in [f'{gpt_layer_prefix}.mlp.experts.{expert_idx}.1.weight',
-                               f'{gpt_layer_prefix}.mlp.experts.{expert_idx}.fc2.weight']:
-                    if fc2_key in gptoss_state:
-                        try:
-                            fc2_weight = gptoss_state[fc2_key]
-                            fc2_bias_key = fc2_key.replace('.weight', '.bias')
-                            
-                            if decoder_state[f'{dec_prefix}.mlp.experts.{expert_idx}.1.weight'].shape == fc2_weight.shape:
-                                decoder_state[f'{dec_prefix}.mlp.experts.{expert_idx}.1.weight'] = fc2_weight.to(device)
-                                loaded_count += 1
-                                
-                                if fc2_bias_key in gptoss_state:
-                                    decoder_state[f'{dec_prefix}.mlp.experts.{expert_idx}.1.bias'] = gptoss_state[fc2_bias_key].to(device)
-                                    loaded_count += 1
-                                
-                                print(f"  ✓ Loaded {dec_prefix}.mlp.experts.{expert_idx}.1")
-                                break
-                        except Exception:
-                            continue
+            # Try to load MoE/MLP weights
+            # GPT-OSS uses: layers.N.moe.W_in, layers.N.moe.W_out (single MoE, not per-expert)
+            # Try loading GPT-OSS MoE format first
+            moe_w_in_key = f'{gpt_layer_prefix}.moe.W_in'
+            moe_w_out_key = f'{gpt_layer_prefix}.moe.W_out'
+            
+            if moe_w_in_key in gptoss_state and moe_w_out_key in gptoss_state:
+                # GPT-OSS has MoE structure - we need to distribute to our experts
+                # For now, skip this as architectures don't match
+                print(f"  ⚠️  Layer {layer_idx}: GPT-OSS uses different MoE structure, skipping MLP")
+                continue
+            
+            # Try standard MLP (for non-MoE models)
+            mlp_fc1_key = f'{gpt_layer_prefix}.mlp.fc1.weight'
+            mlp_fc2_key = f'{gpt_layer_prefix}.mlp.fc2.weight'
+            
+            if mlp_fc1_key in gptoss_state:
+                # Standard MLP - load into first expert
+                try:
+                    fc1_weight = gptoss_state[mlp_fc1_key]
+                    fc1_bias = gptoss_state.get(f'{gpt_layer_prefix}.mlp.fc1.bias')
+                    
+                    if decoder_state[f'{dec_prefix}.mlp.experts.0.0.weight'].shape == fc1_weight.shape:
+                        decoder_state[f'{dec_prefix}.mlp.experts.0.0.weight'] = fc1_weight.to(device)
+                        loaded_count += 1
+                        if fc1_bias is not None:
+                            decoder_state[f'{dec_prefix}.mlp.experts.0.0.bias'] = fc1_bias.to(device)
+                            loaded_count += 1
+                        print(f"  ✓ Loaded {dec_prefix}.mlp.experts.0.0 (fc1)")
+                except Exception as e:
+                    pass
+                    
+                try:
+                    fc2_weight = gptoss_state[mlp_fc2_key]
+                    fc2_bias = gptoss_state.get(f'{gpt_layer_prefix}.mlp.fc2.bias')
+                    
+                    if decoder_state[f'{dec_prefix}.mlp.experts.0.1.weight'].shape == fc2_weight.shape:
+                        decoder_state[f'{dec_prefix}.mlp.experts.0.1.weight'] = fc2_weight.to(device)
+                        loaded_count += 1
+                        if fc2_bias is not None:
+                            decoder_state[f'{dec_prefix}.mlp.experts.0.1.bias'] = fc2_bias.to(device)
+                            loaded_count += 1
+                        print(f"  ✓ Loaded {dec_prefix}.mlp.experts.0.1 (fc2)")
+                except Exception as e:
+                    pass
     
     # Load the updated state
     if loaded_count > 0:
