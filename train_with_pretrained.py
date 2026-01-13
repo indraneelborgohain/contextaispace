@@ -120,42 +120,100 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
         bert_model = AutoModel.from_pretrained(bert_model_name)
         bert_state = bert_model.state_dict()
         print(f"✓ Downloaded BERT model ({len(bert_state)} parameters)")
-        
-        # Debug: show some BERT parameter names
-        print(f"Sample BERT parameters: {list(bert_state.keys())[:5]}")
     except Exception as e:
         print(f"❌ Failed to load BERT: {e}")
         return 0
     
     # Get encoder state
     encoder_state = encoder.state_dict()
-    print(f"Encoder has {len(encoder_state)} parameters")
-    print(f"Sample encoder parameters: {list(encoder_state.keys())[:5]}")
-    
     loaded_count = 0
     
-    # Try direct parameter name matching (in case architectures align)
-    for name in encoder_state.keys():
-        # Skip custom layers
-        if any(skip in name for skip in [
-            'cross_attn', 'final_cross_attn', 'lsi', 
-            'start_token_embedding', 'chunk_context'
-        ]):
+    # 1. Load embedding
+    if 'embeddings.word_embeddings.weight' in bert_state:
+        if encoder_state['embedding.weight'].shape == bert_state['embeddings.word_embeddings.weight'].shape:
+            encoder_state['embedding.weight'] = bert_state['embeddings.word_embeddings.weight'].to(device)
+            loaded_count += 1
+            print(f"  ✓ Loaded embedding.weight")
+    
+    # 2. Load each encoder block
+    num_layers = encoder.config.num_hidden_layers
+    for layer_idx in range(num_layers):
+        bert_prefix = f'encoder.layer.{layer_idx}'
+        enc_prefix = f'blocks.{layer_idx}'
+        
+        # Check if this layer exists in BERT
+        if f'{bert_prefix}.attention.self.query.weight' not in bert_state:
             continue
         
-        # Try exact match
-        if name in bert_state and encoder_state[name].shape == bert_state[name].shape:
-            encoder_state[name] = bert_state[name].to(device)
-            loaded_count += 1
-            print(f"  Loaded: {name}")
+        # Load attention QKV (BERT has separate Q,K,V, we need to concat them)
+        try:
+            q_weight = bert_state[f'{bert_prefix}.attention.self.query.weight']
+            k_weight = bert_state[f'{bert_prefix}.attention.self.key.weight']
+            v_weight = bert_state[f'{bert_prefix}.attention.self.value.weight']
+            
+            q_bias = bert_state[f'{bert_prefix}.attention.self.query.bias']
+            k_bias = bert_state[f'{bert_prefix}.attention.self.key.bias']
+            v_bias = bert_state[f'{bert_prefix}.attention.self.value.bias']
+            
+            # Concatenate Q, K, V
+            qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+            qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+            
+            if encoder_state[f'{enc_prefix}.attn.qkv.weight'].shape == qkv_weight.shape:
+                encoder_state[f'{enc_prefix}.attn.qkv.weight'] = qkv_weight.to(device)
+                encoder_state[f'{enc_prefix}.attn.qkv.bias'] = qkv_bias.to(device)
+                loaded_count += 2
+                print(f"  ✓ Loaded {enc_prefix}.attn.qkv")
+        except Exception as e:
+            print(f"  ⚠️  Skipped {enc_prefix}.attn.qkv: {e}")
+        
+        # Load attention output
+        try:
+            if f'{bert_prefix}.attention.output.dense.weight' in bert_state:
+                out_weight = bert_state[f'{bert_prefix}.attention.output.dense.weight']
+                out_bias = bert_state[f'{bert_prefix}.attention.output.dense.bias']
+                
+                if encoder_state[f'{enc_prefix}.attn.out.weight'].shape == out_weight.shape:
+                    encoder_state[f'{enc_prefix}.attn.out.weight'] = out_weight.to(device)
+                    encoder_state[f'{enc_prefix}.attn.out.bias'] = out_bias.to(device)
+                    loaded_count += 2
+                    print(f"  ✓ Loaded {enc_prefix}.attn.out")
+        except Exception as e:
+            print(f"  ⚠️  Skipped {enc_prefix}.attn.out: {e}")
+        
+        # Load FFN (MLP)
+        try:
+            if f'{bert_prefix}.intermediate.dense.weight' in bert_state:
+                fc1_weight = bert_state[f'{bert_prefix}.intermediate.dense.weight']
+                fc1_bias = bert_state[f'{bert_prefix}.intermediate.dense.bias']
+                
+                if encoder_state[f'{enc_prefix}.mlp.fc1.weight'].shape == fc1_weight.shape:
+                    encoder_state[f'{enc_prefix}.mlp.fc1.weight'] = fc1_weight.to(device)
+                    encoder_state[f'{enc_prefix}.mlp.fc1.bias'] = fc1_bias.to(device)
+                    loaded_count += 2
+                    print(f"  ✓ Loaded {enc_prefix}.mlp.fc1")
+        except Exception as e:
+            print(f"  ⚠️  Skipped {enc_prefix}.mlp.fc1: {e}")
+        
+        try:
+            if f'{bert_prefix}.output.dense.weight' in bert_state:
+                fc2_weight = bert_state[f'{bert_prefix}.output.dense.weight']
+                fc2_bias = bert_state[f'{bert_prefix}.output.dense.bias']
+                
+                if encoder_state[f'{enc_prefix}.mlp.fc2.weight'].shape == fc2_weight.shape:
+                    encoder_state[f'{enc_prefix}.mlp.fc2.weight'] = fc2_weight.to(device)
+                    encoder_state[f'{enc_prefix}.mlp.fc2.bias'] = fc2_bias.to(device)
+                    loaded_count += 2
+                    print(f"  ✓ Loaded {enc_prefix}.mlp.fc2")
+        except Exception as e:
+            print(f"  ⚠️  Skipped {enc_prefix}.mlp.fc2: {e}")
     
     # Load the updated state
     if loaded_count > 0:
         encoder.load_state_dict(encoder_state)
         print(f"\n✓ Loaded {loaded_count} parameters from BERT")
     else:
-        print(f"\n⚠️  No matching parameters found between BERT and encoder")
-        print(f"   This is normal if architectures differ significantly")
+        print(f"\n⚠️  No matching parameters found")
     
     print(f"✓ Total encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M")
     
