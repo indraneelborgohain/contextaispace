@@ -1157,26 +1157,36 @@ def main():
                               args.cross_attn_lr, args.cross_attn_lr * args.min_lr_ratio)
             optimizer.param_groups[2]['lr'] = custom_lr
         
-        # Forward pass
-        with torch.autocast(device_type='cuda' if 'cuda' in str(device) else 'cpu', dtype=dtype_ctx, enabled=(args.dtype != 'float32')):
-            # Encode context
-            ctx_embeddings = encoder(batch_ctx)
+        # Forward pass - process each example in batch separately (like other train scripts)
+        total_loss = 0.0
+        for i in range(batch_ctx.shape[0]):
+            ctx_tokens = batch_ctx[i]
+            qa_tokens = batch_qa[i]
             
-            # Decode with cross-attention
-            # Input: batch_qa[:, :-1] (all but last token)
-            # Target: batch_qa[:, 1:] (all but first token)
-            input_ids = batch_qa[:, :-1]
-            targets = batch_qa[:, 1:]
+            # Remove padding
+            ctx_tokens = ctx_tokens[ctx_tokens != 0]
+            qa_mask = qa_tokens != -1
+            qa_tokens = qa_tokens[qa_mask]
             
-            # Get logits from decoder
-            logits = decoder(input_ids, context_embeddings=ctx_embeddings)
+            with torch.autocast(device_type='cuda' if 'cuda' in str(device) else 'cpu', dtype=dtype_ctx, enabled=(args.dtype != 'float32')):
+                # Encode context and get K,V for cross-attention
+                encoder_k, encoder_v = encoder(ctx_tokens, return_encoder_kv=True)
+                
+                # Decode with cross-attention
+                decoder.reset_context()
+                logits = decoder(qa_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
+                
+                # Compute cross-entropy loss (shift by 1 for autoregressive)
+                loss = F.cross_entropy(
+                    logits[:-1].view(-1, logits.size(-1)),
+                    qa_tokens[1:].view(-1),
+                    reduction='mean'
+                )
             
-            # Compute cross-entropy loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1),
-                ignore_index=-1  # Ignore padding
-            )
+            total_loss += loss
+        
+        # Average loss over batch
+        loss = total_loss / batch_ctx.shape[0]
         
         # Backward pass
         optimizer.zero_grad(set_to_none=True)
