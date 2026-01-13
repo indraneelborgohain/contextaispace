@@ -42,7 +42,7 @@ def get_args():
                     help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
     ap.add_argument("--decoder_checkpoint", type=str, default=None,
                     help="Optional: Path to checkpoint with just decoder weights (.pt file)")
-    ap.add_argument("--gptoss_weights", type=str, default=None,
+    ap.add_argument("--gptoss_weights", type=str, default="architecture/open-gpt-oss/weights",
                     help="Optional: Directory with GPT-OSS weights (will load compatible decoder layers)")
     ap.add_argument("--gpt2_model", type=str, default=None,
                     help="Optional: GPT-2 model name (e.g., 'gpt2', 'gpt2-medium', 'gpt2-large') for decoder")
