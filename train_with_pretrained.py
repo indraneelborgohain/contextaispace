@@ -92,6 +92,10 @@ def get_args():
     # Dataset
     ap.add_argument("--dataset", type=str, default="msmarco",
                     choices=["msmarco", "squad"])
+    ap.add_argument("--sep_token", type=str, default="<SEP>")
+    ap.add_argument("--a_token", type=str, default="<A>")
+    ap.add_argument("--sep_token", type=str, default="<SEP>")
+    ap.add_argument("--a_token", type=str, default="<A>")
     
     # TensorBoard
     ap.add_argument("--use_tensorboard", action="store_true", default=False)
@@ -938,11 +942,36 @@ def main():
                         answer = ""
                     
                     # Tokenize
-                    ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
-                    qa_text = f"{question} {answer}"
-                    qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+                    context_tokens = tokenizer.encode(context)
+                    question_tokens = tokenizer.encode(question)
+                    answer_tokens = tokenizer.encode(answer)
                     
-                    train_examples.append((ctx_tokens, qa_tokens))
+                    c_marker = tokenizer.encode("<C>")
+                    sep_marker = tokenizer.encode(args.sep_token)
+                    a_marker = tokenizer.encode(args.a_token)
+                    
+                    # Build encoder input: <C> Context <SEP> Question
+                    max_context_space = args.max_context_len - len(question_tokens) - len(sep_marker) - len(c_marker)
+                    if max_context_space < 50:
+                        continue
+                    
+                    if len(context_tokens) > max_context_space:
+                        context_tokens = context_tokens[:max_context_space]
+                    
+                    ctx_tokens = c_marker + context_tokens + sep_marker + question_tokens
+                    
+                    # Build decoder input: Question <A> Answer
+                    max_answer_space = args.max_qa_len - len(question_tokens) - len(a_marker)
+                    if max_answer_space < 10:
+                        continue
+                    
+                    if len(answer_tokens) > max_answer_space:
+                        answer_tokens = answer_tokens[:max_answer_space]
+                    
+                    qa_tokens = question_tokens + a_marker + answer_tokens
+                    a_position = len(question_tokens)  # <A> is right after question
+                    
+                    train_examples.append((ctx_tokens, qa_tokens, a_position))
             except Exception as e:
                 # Skip problematic examples
                 if i < 10:  # Only print first few errors
@@ -977,11 +1006,37 @@ def main():
                     else:
                         answer = ""
                     
-                    ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
-                    qa_text = f"{question} {answer}"
-                    qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+                    # Tokenize
+                    context_tokens = tokenizer.encode(context)
+                    question_tokens = tokenizer.encode(question)
+                    answer_tokens = tokenizer.encode(answer)
                     
-                    val_examples.append((ctx_tokens, qa_tokens))
+                    c_marker = tokenizer.encode("<C>")
+                    sep_marker = tokenizer.encode(args.sep_token)
+                    a_marker = tokenizer.encode(args.a_token)
+                    
+                    # Build encoder input: <C> Context <SEP> Question
+                    max_context_space = args.max_context_len - len(question_tokens) - len(sep_marker) - len(c_marker)
+                    if max_context_space < 50:
+                        continue
+                    
+                    if len(context_tokens) > max_context_space:
+                        context_tokens = context_tokens[:max_context_space]
+                    
+                    ctx_tokens = c_marker + context_tokens + sep_marker + question_tokens
+                    
+                    # Build decoder input: Question <A> Answer
+                    max_answer_space = args.max_qa_len - len(question_tokens) - len(a_marker)
+                    if max_answer_space < 10:
+                        continue
+                    
+                    if len(answer_tokens) > max_answer_space:
+                        answer_tokens = answer_tokens[:max_answer_space]
+                    
+                    qa_tokens = question_tokens + a_marker + answer_tokens
+                    a_position = len(question_tokens)  # <A> is right after question
+                    
+                    val_examples.append((ctx_tokens, qa_tokens, a_position))
             except Exception as e:
                 if i < 10:
                     print(f"  Warning: Skipping validation example {i}: {e}")
@@ -1004,11 +1059,37 @@ def main():
             question = ex['question']
             answer = ex['answers']['text'][0] if ex['answers']['text'] else ""
             
-            ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
-            qa_text = f"{question} {answer}"
-            qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+            # Tokenize
+            context_tokens = tokenizer.encode(context)
+            question_tokens = tokenizer.encode(question)
+            answer_tokens = tokenizer.encode(answer)
             
-            train_examples.append((ctx_tokens, qa_tokens))
+            c_marker = tokenizer.encode("<C>")
+            sep_marker = tokenizer.encode(args.sep_token)
+            a_marker = tokenizer.encode(args.a_token)
+            
+            # Build encoder input: <C> Context <SEP> Question
+            max_context_space = args.max_context_len - len(question_tokens) - len(sep_marker) - len(c_marker)
+            if max_context_space < 50:
+                continue
+            
+            if len(context_tokens) > max_context_space:
+                context_tokens = context_tokens[:max_context_space]
+            
+            ctx_tokens = c_marker + context_tokens + sep_marker + question_tokens
+            
+            # Build decoder input: Question <A> Answer
+            max_answer_space = args.max_qa_len - len(question_tokens) - len(a_marker)
+            if max_answer_space < 10:
+                continue
+            
+            if len(answer_tokens) > max_answer_space:
+                answer_tokens = answer_tokens[:max_answer_space]
+            
+            qa_tokens = question_tokens + a_marker + answer_tokens
+            a_position = len(question_tokens)  # <A> is right after question
+            
+            train_examples.append((ctx_tokens, qa_tokens, a_position))
         
         print("Formatting validation examples...")
         for i, ex in enumerate(dataset['validation']):
@@ -1018,11 +1099,37 @@ def main():
             question = ex['question']
             answer = ex['answers']['text'][0] if ex['answers']['text'] else ""
             
-            ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
-            qa_text = f"{question} {answer}"
-            qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+            # Tokenize
+            context_tokens = tokenizer.encode(context)
+            question_tokens = tokenizer.encode(question)
+            answer_tokens = tokenizer.encode(answer)
             
-            val_examples.append((ctx_tokens, qa_tokens))
+            c_marker = tokenizer.encode("<C>")
+            sep_marker = tokenizer.encode(args.sep_token)
+            a_marker = tokenizer.encode(args.a_token)
+            
+            # Build encoder input: <C> Context <SEP> Question
+            max_context_space = args.max_context_len - len(question_tokens) - len(sep_marker) - len(c_marker)
+            if max_context_space < 50:
+                continue
+            
+            if len(context_tokens) > max_context_space:
+                context_tokens = context_tokens[:max_context_space]
+            
+            ctx_tokens = c_marker + context_tokens + sep_marker + question_tokens
+            
+            # Build decoder input: Question <A> Answer
+            max_answer_space = args.max_qa_len - len(question_tokens) - len(a_marker)
+            if max_answer_space < 10:
+                continue
+            
+            if len(answer_tokens) > max_answer_space:
+                answer_tokens = answer_tokens[:max_answer_space]
+            
+            qa_tokens = question_tokens + a_marker + answer_tokens
+            a_position = len(question_tokens)  # <A> is right after question
+            
+            val_examples.append((ctx_tokens, qa_tokens, a_position))
     
     print(f"Training examples: {len(train_examples)}")
     print(f"Validation examples: {len(val_examples)}")
@@ -1053,7 +1160,7 @@ def main():
     
     while iter_num < args.max_iters:
         # Get batch
-        batch_ctx, batch_qa = get_training_batch(train_examples, args.batch_size, args.max_context_len, args.max_qa_len, device)
+        batch_ctx, batch_qa, a_position_batch = get_training_batch(train_examples, args.batch_size, args.max_context_len, args.max_qa_len, device)
         
         # Update learning rates with schedule
         encoder_lr = get_lr(iter_num, args.warmup_iters, args.max_iters, 
@@ -1077,6 +1184,7 @@ def main():
         for i in range(batch_ctx.shape[0]):
             ctx_tokens = batch_ctx[i]
             qa_tokens = batch_qa[i]
+            a_position = a_position_batch[i]
             
             # Remove padding
             ctx_tokens = ctx_tokens[ctx_tokens != 0]
@@ -1095,12 +1203,25 @@ def main():
                 decoder.reset_context()
                 logits = decoder(qa_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
                 
-                # Compute cross-entropy loss (shift by 1 for autoregressive)
-                loss = F.cross_entropy(
+                # Loss masking: only compute loss on answer tokens (after <A>)
+                seq_len = len(logits) - 1
+                loss_mask = torch.zeros(seq_len, device=device, dtype=torch.float)
+                # Safeguard: if a_position is invalid, compute loss on all tokens
+                if a_position is not None and 0 <= a_position < seq_len:
+                    loss_mask[a_position:] = 1.0  # Only compute loss from <A> position onwards
+                else:
+                    loss_mask[:] = 1.0  # Fallback: loss on all tokens
+                
+                # Compute cross entropy per token
+                ce_loss = F.cross_entropy(
                     logits[:-1].view(-1, logits.size(-1)),
                     qa_tokens[1:].view(-1),
-                    reduction='mean'
+                    reduction='none'
                 )
+                
+                # Apply mask and compute mean over answer tokens only
+                masked_loss = ce_loss * loss_mask
+                loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)
             
             # Accumulate loss tensor (like train_msmarco)
             total_loss += loss
@@ -1190,7 +1311,7 @@ def get_training_batch(examples, batch_size, max_context_len, max_qa_len, device
     Create a training batch from examples.
     
     Args:
-        examples: List of (context_tokens, qa_tokens) tuples
+        examples: List of (context_tokens, qa_tokens, a_position) tuples
         batch_size: Batch size
         max_context_len: Max context length
         max_qa_len: Max QA length
@@ -1199,6 +1320,7 @@ def get_training_batch(examples, batch_size, max_context_len, max_qa_len, device
     Returns:
         batch_ctx: [batch_size, max_context_len] context tokens
         batch_qa: [batch_size, max_qa_len] QA tokens
+        a_position_batch: List of <A> marker positions for loss masking
     """
     import random
     
@@ -1208,8 +1330,9 @@ def get_training_batch(examples, batch_size, max_context_len, max_qa_len, device
     # Pad to max lengths
     batch_ctx = []
     batch_qa = []
+    a_position_batch = []
     
-    for ctx_tokens, qa_tokens in batch_examples:
+    for ctx_tokens, qa_tokens, a_position in batch_examples:
         # Pad or truncate context
         if len(ctx_tokens) < max_context_len:
             ctx_tokens = ctx_tokens + [0] * (max_context_len - len(ctx_tokens))
@@ -1224,12 +1347,13 @@ def get_training_batch(examples, batch_size, max_context_len, max_qa_len, device
         
         batch_ctx.append(ctx_tokens)
         batch_qa.append(qa_tokens)
+        a_position_batch.append(a_position)
     
     # Convert to tensors
     batch_ctx = torch.tensor(batch_ctx, dtype=torch.long, device=device)
     batch_qa = torch.tensor(batch_qa, dtype=torch.long, device=device)
     
-    return batch_ctx, batch_qa
+    return batch_ctx, batch_qa, a_position_batch
 
 
 if __name__ == "__main__":
