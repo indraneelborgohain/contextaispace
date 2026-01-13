@@ -179,11 +179,16 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
             qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
             qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
             
+            expected_shape = encoder_state[f'{enc_prefix}.attn.qkv.weight'].shape
+            print(f"    Layer {layer_idx} QKV: BERT={qkv_weight.shape}, Expected={expected_shape}")
+            
             if encoder_state[f'{enc_prefix}.attn.qkv.weight'].shape == qkv_weight.shape:
                 encoder_state[f'{enc_prefix}.attn.qkv.weight'] = qkv_weight.to(device)
                 encoder_state[f'{enc_prefix}.attn.qkv.bias'] = qkv_bias.to(device)
                 loaded_count += 2
                 print(f"  ✓ Loaded {enc_prefix}.attn.qkv")
+            else:
+                print(f"  ✗ Shape mismatch for {enc_prefix}.attn.qkv")
         except Exception as e:
             print(f"  ⚠️  Skipped {enc_prefix}.attn.qkv: {e}")
         
@@ -521,6 +526,9 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                         k_weight = gptoss_state[k_key]
                         v_weight = gptoss_state[v_key]
                         
+                        expected_qkv = decoder_state[f'{dec_prefix}.attn.qkv.weight']
+                        print(f"    Layer {layer_idx}: Q={q_weight.shape}, K={k_weight.shape}, V={v_weight.shape}, Expected={expected_qkv.shape}")
+                        
                         # Concatenate Q, K, V
                         qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
                         
@@ -723,14 +731,19 @@ def main():
     else:
         # Default config based on model_size
         if args.model_size == "toy":
-            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=256, num_hidden_layers=4)
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=256, num_hidden_layers=4,
+                                          num_attention_heads=8, num_key_value_heads=8)
         elif args.model_size == "small":
-            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8)
+            # Matches bert-base (768 hidden, 12 heads)
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=768, num_hidden_layers=8,
+                                          num_attention_heads=12, num_key_value_heads=12)
         elif args.model_size == "medium":
             # Use 1024 (bert-large compatible) - cross-attention handles dimension mismatch with decoder
-            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12)
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1024, num_hidden_layers=12,
+                                          num_attention_heads=16, num_key_value_heads=16)
         else:  # large
-            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=16)
+            encoder_config = EncoderConfig(vocab_size=vocab_size, hidden_size=1280, num_hidden_layers=16,
+                                          num_attention_heads=20, num_key_value_heads=20)
         print(f"✓ Created {args.model_size} encoder config")
     
     encoder = BidirectionalEncoder(encoder_config)
