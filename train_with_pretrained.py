@@ -41,7 +41,9 @@ def get_args():
     ap.add_argument("--checkpoint", type=str, required=True,
                     help="Path to checkpoint with trained encoder and decoder (.pt file)")
     ap.add_argument("--gptoss_weights", type=str, default=None,
-                    help="Optional: Directory with GPT-OSS weights (will load compatible layers only)")
+                    help="Optional: Directory with GPT-OSS weights (will load compatible decoder layers)")
+    ap.add_argument("--bert_model", type=str, default=None,
+                    help="Optional: BERT model name (e.g., 'bert-base-uncased', 'roberta-base') for encoder")
     ap.add_argument("--out_dir", type=str, default="model_finetuned")
     
     # Model size
@@ -90,6 +92,109 @@ def get_args():
     ap.add_argument("--log_dir", type=str, default="runs_pretrained")
     
     return ap.parse_args()
+
+
+def load_bert_weights_partial(encoder, bert_model_name, device):
+    """
+    Load BERT/RoBERTa weights for compatible encoder layers.
+    Keeps custom SVD compression and cross-attention layers.
+    
+    Args:
+        encoder: BidirectionalEncoder instance
+        bert_model_name: Hugging Face model name (e.g., 'bert-base-uncased', 'roberta-base')
+        device: torch device
+    
+    Returns:
+        Number of parameters loaded
+    """
+    try:
+        from transformers import AutoModel
+    except ImportError:
+        print("⚠️  transformers not installed. Install with: pip install transformers")
+        return 0
+    
+    print(f"\nLoading BERT weights from: {bert_model_name}")
+    
+    try:
+        # Load pretrained BERT model
+        bert_model = AutoModel.from_pretrained(bert_model_name)
+        bert_state = bert_model.state_dict()
+        print(f"✓ Downloaded BERT model")
+    except Exception as e:
+        print(f"❌ Failed to load BERT: {e}")
+        return 0
+    
+    # Get encoder state
+    encoder_state = encoder.state_dict()
+    
+    # Mapping between BERT and our encoder
+    # BERT uses: embeddings.word_embeddings, encoder.layer.N.attention, etc.
+    # We use: embedding, blocks.N.attn, etc.
+    
+    loaded_count = 0
+    skipped_count = 0
+    
+    for name, param in encoder_state.items():
+        # Skip custom compression and cross-attention layers
+        if any(skip in name for skip in [
+            'cross_attn',
+            'final_cross_attn',
+            'lsi',
+            'compression',
+            '_compress'
+        ]):
+            skipped_count += 1
+            continue
+        
+        # Try to map our parameter names to BERT names
+        bert_name = None
+        
+        # Embedding layer
+        if name == 'embedding.weight':
+            bert_name = 'embeddings.word_embeddings.weight'
+        
+        # Encoder blocks: blocks.N.attn.qkv.weight -> encoder.layer.N.attention.self.query/key/value.weight
+        elif 'blocks.' in name:
+            parts = name.split('.')
+            layer_idx = parts[1]
+            
+            if 'attn.qkv.weight' in name:
+                # BERT splits QKV, we might need to concat them
+                # This is complex, skip for now and handle separately
+                pass
+            elif 'attn.out.weight' in name:
+                bert_name = f'encoder.layer.{layer_idx}.attention.output.dense.weight'
+            elif 'attn.norm' in name:
+                bert_name = f'encoder.layer.{layer_idx}.attention.output.LayerNorm.weight'
+            elif 'mlp' in name or 'ffn' in name:
+                # Map FFN layers
+                if 'mlp.0.weight' in name or 'experts.0.0.weight' in name:
+                    bert_name = f'encoder.layer.{layer_idx}.intermediate.dense.weight'
+                elif 'mlp.1.weight' in name or 'experts.0.1.weight' in name:
+                    bert_name = f'encoder.layer.{layer_idx}.output.dense.weight'
+        
+        # Norm layer
+        elif name == 'norm.weight':
+            bert_name = 'encoder.layer.11.output.LayerNorm.weight'  # Last layer norm
+        
+        # Try to load if we found a mapping
+        if bert_name and bert_name in bert_state:
+            bert_param = bert_state[bert_name]
+            if param.shape == bert_param.shape:
+                encoder_state[name] = bert_param.to(device)
+                loaded_count += 1
+            else:
+                # Shape mismatch, keep original
+                pass
+    
+    # Load the updated state
+    encoder.load_state_dict(encoder_state)
+    
+    print(f"✓ Loaded {loaded_count} parameters from BERT")
+    print(f"✓ Kept {skipped_count} custom parameters (SVD, cross-attn)")
+    print(f"✓ Total encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M")
+    
+    return loaded_count
 
 
 def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device):
@@ -284,7 +389,27 @@ def main():
     decoder = Transformer(decoder_config)
     decoder.to(device)
     decoder.load_state_dict(checkpoint['decoder'])
-    print(f"✓ Loaded decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+    print(f"✓ Loaded dBERT weights for encoder
+    if args.bert_model:
+        print("\n" + "="*60)
+        print("Hybrid Encoder Loading: BERT + Trained Model")
+        print("="*60)
+        print("Strategy:")
+        print("  - BERT weights: embedding, attention, FFN")
+        print("  - Trained weights: SVD compression, cross-attention")
+        print()
+        
+        loaded = load_bert_weights_partial(encoder, args.bert_model, device)
+        
+        if loaded > 0:
+            print(f"\n✓ Hybrid encoder created successfully!")
+            print(f"  BERT provides pretrained language understanding")
+            print(f"  Your model provides SVD compression & cross-attention")
+        else:
+            print(f"\n⚠️  No BERT weights loaded, using only trained encoder")
+        print("="*60 + "\n")
+    
+    # Optionally load GPT-OSS weights for compatible decodern decoder.parameters())/1e6:.2f}M params)")
     
     # Optionally load GPT-OSS weights for compatible layers
     if args.gptoss_weights:

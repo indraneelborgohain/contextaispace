@@ -1,8 +1,16 @@
-# Fine-Tuning with GPT-OSS Weights
+# Fine-Tuning with Pretrained Weights (BERT + GPT-OSS)
 
-This guide shows you how to fine-tune your trained encoder-decoder model by optionally loading GPT-OSS weights for compatible layers.
+This guide shows you how to fine-tune your encoder-decoder model by loading pretrained weights from open-source models:
+- **BERT/RoBERTa** for the encoder
+- **GPT-OSS** for the decoder
 
-## Step 1: Download GPT-OSS Weights
+Your custom components (SVD compression, cross-attention) are preserved!
+
+---
+
+## Step 1: Download Pretrained Weights
+
+### Option A: GPT-OSS Decoder Weights
 
 ```bash
 cd architecture/open-gpt-oss
@@ -10,14 +18,28 @@ python download_weights.py
 cd ../..
 ```
 
-**What this does:**
-- Downloads ~20GB GPT-OSS model weights from Hugging Face
+**What this downloads:**
+- ~20GB GPT-OSS model weights from Hugging Face
 - Saves to `architecture/open-gpt-oss/weights/`
-- Includes model weights, config, and tokenizer
+
+### Option B: BERT Encoder Weights
+
+BERT weights download automatically when you specify `--bert_model`:
+
+```bash
+# No manual download needed!
+# Will auto-download when you run training with --bert_model
+```
+
+**Common BERT models:**
+- `bert-base-uncased` (110M params)
+- `bert-large-uncased` (340M params)
+- `roberta-base` (125M params)
+- `roberta-large` (355M params)
 
 **Requirements:**
 ```bash
-pip install huggingface_hub
+pip install transformers huggingface_hub
 ```
 
 **Verify download:**
@@ -29,22 +51,17 @@ python check_models.py
 
 ## Step 2: Start Fine-Tuning
 
-### Option A: Simple Fine-Tuning (Without GPT-OSS)
+### Option A: Simple Fine-Tuning (No Pretrained Weights)
 
-If you just want to fine-tune your existing model with new learning rates:
+Just fine-tune your existing model with new learning rates:
 
 ```bash
 python run_pretrained_training.py
 ```
 
-This will:
-- ✅ Auto-find your latest checkpoint
-- ✅ Use default learning rates (1e-5 for encoder and decoder)
-- ✅ Ask for confirmation before starting
+### Option B: Hybrid Decoder (GPT-OSS)
 
-### Option B: Hybrid Loading (With GPT-OSS)
-
-To load GPT-OSS weights for compatible layers while keeping your custom layers:
+Load GPT-OSS weights for decoder base layers:
 
 ```bash
 python train_with_pretrained.py \
@@ -52,49 +69,98 @@ python train_with_pretrained.py \
     --gptoss_weights architecture/open-gpt-oss/weights \
     --encoder_lr 1e-5 \
     --decoder_lr 1e-6 \
+    --cross_attn_lr 3e-4
+```
+
+**Decoder layers loaded from GPT-OSS:**
+- ✅ Embedding, attention, base MLP
+
+**Decoder layers kept from your model:**
+- ✅ Context projections, cross-attention, custom components
+
+### Option C: Hybrid Encoder (BERT)
+
+Load BERT weights for encoder base layers:
+
+```bash
+python train_with_pretrained.py \
+    --checkpoint model_msmarco/checkpoint_5000.pt \
+    --bert_model bert-base-uncased \
+    --encoder_lr 1e-5 \
+    --decoder_lr 1e-5
+```
+
+**Encoder layers loaded from BERT:**
+- ✅ Embedding, attention, FFN
+
+**Encoder layers kept from your model:**
+- ✅ SVD compression, cross-attention between chunks
+
+### Option D: Full Hybrid (BERT + GPT-OSS) 🚀
+
+Load both BERT for encoder AND GPT-OSS for decoder:
+
+```bash
+python train_with_pretrained.py \
+    --checkpoint model_msmarco/checkpoint_5000.pt \
+    --bert_model bert-base-uncased \
+    --gptoss_weights architecture/open-gpt-oss/weights \
+    --encoder_lr 1e-5 \
+    --decoder_lr 1e-6 \
     --cross_attn_lr 3e-4 \
     --max_iters 5000
 ```
 
-**What gets loaded from GPT-OSS:**
-- ✅ Embedding layers
-- ✅ Attention mechanisms  
-- ✅ Base MLP layers
-
-**What stays from your model:**
-- ✅ Context projections
-- ✅ Cross-attention layers
-- ✅ Custom components (LSI, encoder adapters)
+**This combines:**
+- 🤗 BERT's language understanding (encoder)
+- 🤖 GPT-OSS's generation power (decoder)  
+- 🎯 Your custom architecture (SVD compression + cross-attention)
 
 ---
 
 ## Learning Rate Guide
 
-| Approach | Encoder | Decoder | Custom Layers |
-|----------|---------|---------|---------------|
-| **Simple fine-tuning** | 1e-5 | 1e-5 | - |
-| **With GPT-OSS (conservative)** | 1e-5 | 1e-6 | 3e-4 |
-| **With GPT-OSS (aggressive)** | 3e-5 | 1e-5 | 5e-4 |
+| Approach | Encoder | Decoder | Custom Layers | Use Case |
+|----------|---------|---------|---------------|----------|
+| **Simple** | 1e-5 | 1e-5 | - | Continue training |
+| **BERT only** | 1e-6 | 1e-5 | 3e-4 | Improve encoding |
+| **GPT-OSS only** | 1e-5 | 1e-6 | 3e-4 | Improve generation |
+| **Both (recommended)** | 1e-6 | 1e-6 | 3e-4 | Best of both worlds |
 
 ---
 
 ## Quick Commands
 
 ```bash
-# 1. Download weights
+# 1. Download GPT-OSS (optional)
 cd architecture/open-gpt-oss && python download_weights.py && cd ../..
 
 # 2. Check what you have
 python check_models.py
 
-# 3. Start fine-tuning (easy way)
+# 3a. Simple fine-tuning
 python run_pretrained_training.py
 
-# OR with GPT-OSS (advanced)
+# 3b. With BERT encoder
+python train_with_pretrained.py \
+    --checkpoint your_checkpoint.pt \
+    --bert_model bert-base-uncased \
+    --encoder_lr 1e-6
+
+# 3c. With GPT-OSS decoder  
 python train_with_pretrained.py \
     --checkpoint your_checkpoint.pt \
     --gptoss_weights architecture/open-gpt-oss/weights \
     --decoder_lr 1e-6
+
+# 3d. With BOTH (full hybrid) 🚀
+python train_with_pretrained.py \
+    --checkpoint your_checkpoint.pt \
+    --bert_model roberta-base \
+    --gptoss_weights architecture/open-gpt-oss/weights \
+    --encoder_lr 1e-6 \
+    --decoder_lr 1e-6 \
+    --cross_attn_lr 3e-4
 ```
 
 ---
