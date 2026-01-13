@@ -987,17 +987,83 @@ def main():
     # Load dataset
     print(f"\nLoading {args.dataset} dataset...")
     if args.dataset == "msmarco":
-        # Load MS MARCO
-        from dataloader.data_loader import load_msmarco_data
-        train_examples, val_examples = load_msmarco_data(
-            tokenizer, args.max_context_len, args.max_qa_len
-        )
+        # Simple MS MARCO loader
+        print("Loading MS MARCO dataset...")
+        from datasets import load_dataset
+        
+        dataset = load_dataset("ms_marco", "v2.1")
+        
+        # Simple formatting - just use query and passages
+        train_examples = []
+        val_examples = []
+        
+        print("Formatting training examples...")
+        for i, ex in enumerate(dataset['train']):
+            if i >= 10000:  # Limit for faster testing
+                break
+            if ex.get('passages') and ex.get('query'):
+                context = " ".join([p['passage_text'] for p in ex['passages'][:3]])
+                question = ex['query']
+                answer = ex.get('answers', [''])[0] if ex.get('answers') else ""
+                
+                # Tokenize
+                ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
+                qa_text = f"{question} {answer}"
+                qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+                
+                train_examples.append((ctx_tokens, qa_tokens))
+        
+        print("Formatting validation examples...")
+        for i, ex in enumerate(dataset['validation']):
+            if i >= 1000:  # Smaller validation set
+                break
+            if ex.get('passages') and ex.get('query'):
+                context = " ".join([p['passage_text'] for p in ex['passages'][:3]])
+                question = ex['query']
+                answer = ex.get('answers', [''])[0] if ex.get('answers') else ""
+                
+                ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
+                qa_text = f"{question} {answer}"
+                qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+                
+                val_examples.append((ctx_tokens, qa_tokens))
     else:
-        # Load SQuAD
-        from dataloader.data_loader import load_squad_data
-        train_examples, val_examples = load_squad_data(
-            tokenizer, args.max_context_len, args.max_qa_len
-        )
+        # Simple SQuAD loader
+        print("Loading SQuAD dataset...")
+        from datasets import load_dataset
+        
+        dataset = load_dataset("squad")
+        
+        train_examples = []
+        val_examples = []
+        
+        print("Formatting training examples...")
+        for i, ex in enumerate(dataset['train']):
+            if i >= 10000:  # Limit for faster testing
+                break
+            context = ex['context']
+            question = ex['question']
+            answer = ex['answers']['text'][0] if ex['answers']['text'] else ""
+            
+            ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
+            qa_text = f"{question} {answer}"
+            qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+            
+            train_examples.append((ctx_tokens, qa_tokens))
+        
+        print("Formatting validation examples...")
+        for i, ex in enumerate(dataset['validation']):
+            if i >= 1000:
+                break
+            context = ex['context']
+            question = ex['question']
+            answer = ex['answers']['text'][0] if ex['answers']['text'] else ""
+            
+            ctx_tokens = tokenizer.encode(context)[:args.max_context_len]
+            qa_text = f"{question} {answer}"
+            qa_tokens = tokenizer.encode(qa_text)[:args.max_qa_len]
+            
+            val_examples.append((ctx_tokens, qa_tokens))
     
     print(f"Training examples: {len(train_examples)}")
     print(f"Validation examples: {len(val_examples)}")
