@@ -917,8 +917,8 @@ def main():
         print("="*60 + "\n")
     
     # Optionally load GPT-2 weights for decoder (preferred for single GPU)
-    # TEMPORARILY DISABLED FOR DEBUGGING
-    ifn" + "="*60)
+    if args.gpt2_model:
+        print("\n" + "="*60)
         print("Hybrid Decoder Loading: GPT-2 + Trained Model")
         print("="*60)
         print("Strategy:")
@@ -940,8 +940,8 @@ def main():
         print("="*60 + "\n")
     
     # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
-    # TEMPORARILY DISABLED FOR DEBUGGING
-    elif + "="*60)
+    if args.gptoss_weights:
+        print("\n" + "="*60)
         print("Hybrid Decoder Loading: GPT-OSS + Trained Model")
         print("="*60)
         print("Strategy:")
