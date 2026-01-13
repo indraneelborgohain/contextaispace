@@ -794,10 +794,11 @@ def main():
             )
         elif args.model_size == "medium":
             # Matches GPT-OSS (2880 hidden, 24 layers, but only first 12 loaded by default)
+            # Use 64 KV heads (full MHA) to match GPT-OSS - no GQA
             num_layers = args.max_decoder_layers if args.max_decoder_layers else 24
             decoder_config = ModelConfig(
                 vocab_size=vocab_size, hidden_size=2880, num_hidden_layers=num_layers,
-                num_experts=32, num_attention_heads=64, num_key_value_heads=8,
+                num_experts=32, num_attention_heads=64, num_key_value_heads=64,  # Full MHA, not GQA!
                 use_encoder_decoder_cross_attention=True
             )
         else:  # large
