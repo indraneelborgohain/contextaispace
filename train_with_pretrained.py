@@ -345,11 +345,23 @@ def main():
     else:
         print(f"✓ Initialized encoder ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
     
-    # Load decoder
+    # Load decoder config from checkpoint
     if 'decoder_config' in checkpoint:
         decoder_config = checkpoint['decoder_config']
+        print(f"Loaded decoder config from checkpoint")
+        print(f"  Config type: {type(decoder_config)}")
+        
+        # If config is a dict, convert to ModelConfig
+        if isinstance(decoder_config, dict):
+            decoder_config = ModelConfig(**decoder_config)
+            print(f"  Converted dict to ModelConfig")
+    elif 'config' in checkpoint:
+        # Try alternate key
+        decoder_config = checkpoint['config']
+        if isinstance(decoder_config, dict):
+            decoder_config = ModelConfig(**decoder_config)
     else:
-        # Default config if not found
+        print("⚠️  No decoder config found in checkpoint, using default")
         decoder_config = ModelConfig(
             vocab_size=vocab_size,
             hidden_size=encoder_config.hidden_size,
@@ -357,20 +369,33 @@ def main():
             use_encoder_decoder_cross_attention=True,
         )
     
+    # Print config details
+    print(f"  Decoder config: {decoder_config.num_hidden_layers} layers, "
+          f"{decoder_config.num_experts} experts, "
+          f"{decoder_config.num_attention_heads} heads")
+    
     decoder = Transformer(decoder_config)
     decoder.to(device)
     
     # First, load checkpoint weights (includes custom layers)
     if 'decoder' in checkpoint:
-        decoder.load_state_dict(checkpoint['decoder'])
-        print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+        try:
+            decoder.load_state_dict(checkpoint['decoder'], strict=True)
+            print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+        except RuntimeError as e:
+            print(f"❌ Error loading decoder weights:")
+            print(f"   {str(e)[:200]}...")
+            print(f"\n⚠️  This usually means the checkpoint config doesn't match")
+            print(f"   Try checking what's in the checkpoint with:")
+            print(f"   python -c \"import torch; ckpt=torch.load('{args.checkpoint}', weights_only=False); print(ckpt.keys())\"")
+            raise
     else:
         print(f"✓ Initialized decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
     
     # Optionally load BERT weights for encoder
     if args.bert_model:
         print("\n" + "="*60)
-        print("Hybrid Encoder Loading: BERT + Trained Model")
+        print("Hybrid Encoder Loa ding: BERT + Trained Model")
         print("="*60)
         print("Strategy:")
         print("  - BERT weights: embedding, attention, FFN")
