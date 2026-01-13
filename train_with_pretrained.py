@@ -60,7 +60,7 @@ def get_args():
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--max_context_len", type=int, default=512)
     ap.add_argument("--max_qa_len", type=int, default=128)
-    ap.add_argument("--max_iters", type=int, default=1000)
+    ap.add_argument("--max_iters", type=int, default=150000)
     ap.add_argument("--log_interval", type=int, default=10)
     ap.add_argument("--eval_interval", type=int, default=200)
     ap.add_argument("--eval_iters", type=int, default=20)
@@ -146,16 +146,11 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
         if enc_emb.shape == bert_emb.shape:
             encoder_state['embedding.weight'] = bert_emb.to(device)
             loaded_count += 1
-            print(f"  ✓ Loaded embedding.weight")
-        else:
-            print(f"  ✗ Embedding shape mismatch")
     
     # 2. Load each encoder block
     num_bert_layers = sum(1 for k in bert_state.keys() if k.startswith('encoder.layer.') and '.attention.self.query.weight' in k)
     num_enc_layers = encoder.config.num_hidden_layers
     layers_to_load = min(num_bert_layers, num_enc_layers)
-    
-    print(f"  Loading {layers_to_load} layers (BERT has {num_bert_layers}, encoder has {num_enc_layers})")
     
     for layer_idx in range(layers_to_load):
         bert_prefix = f'encoder.layer.{layer_idx}'
@@ -179,18 +174,12 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
             qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
             qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
             
-            expected_shape = encoder_state[f'{enc_prefix}.attn.qkv.weight'].shape
-            print(f"    Layer {layer_idx} QKV: BERT={qkv_weight.shape}, Expected={expected_shape}")
-            
             if encoder_state[f'{enc_prefix}.attn.qkv.weight'].shape == qkv_weight.shape:
                 encoder_state[f'{enc_prefix}.attn.qkv.weight'] = qkv_weight.to(device)
                 encoder_state[f'{enc_prefix}.attn.qkv.bias'] = qkv_bias.to(device)
                 loaded_count += 2
-                print(f"  ✓ Loaded {enc_prefix}.attn.qkv")
-            else:
-                print(f"  ✗ Shape mismatch for {enc_prefix}.attn.qkv")
         except Exception as e:
-            print(f"  ⚠️  Skipped {enc_prefix}.attn.qkv: {e}")
+            pass
         
         # Load attention output
         try:
@@ -202,9 +191,8 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
                     encoder_state[f'{enc_prefix}.attn.out.weight'] = out_weight.to(device)
                     encoder_state[f'{enc_prefix}.attn.out.bias'] = out_bias.to(device)
                     loaded_count += 2
-                    print(f"  ✓ Loaded {enc_prefix}.attn.out")
         except Exception as e:
-            print(f"  ⚠️  Skipped {enc_prefix}.attn.out: {e}")
+            pass
         
         # Load FFN (MLP)
         try:
@@ -216,9 +204,8 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
                     encoder_state[f'{enc_prefix}.mlp.fc1.weight'] = fc1_weight.to(device)
                     encoder_state[f'{enc_prefix}.mlp.fc1.bias'] = fc1_bias.to(device)
                     loaded_count += 2
-                    print(f"  ✓ Loaded {enc_prefix}.mlp.fc1")
         except Exception as e:
-            print(f"  ⚠️  Skipped {enc_prefix}.mlp.fc1: {e}")
+            pass
         
         try:
             if f'{bert_prefix}.output.dense.weight' in bert_state:
@@ -229,9 +216,8 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
                     encoder_state[f'{enc_prefix}.mlp.fc2.weight'] = fc2_weight.to(device)
                     encoder_state[f'{enc_prefix}.mlp.fc2.bias'] = fc2_bias.to(device)
                     loaded_count += 2
-                    print(f"  ✓ Loaded {enc_prefix}.mlp.fc2")
         except Exception as e:
-            print(f"  ⚠️  Skipped {enc_prefix}.mlp.fc2: {e}")
+            pass
     
     # Load the updated state by directly copying parameter data (preserves device)
     if loaded_count > 0:
@@ -241,11 +227,7 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
         for name, buf in encoder.named_buffers():
             if name in encoder_state:
                 buf.data.copy_(encoder_state[name])
-        print(f"\n✓ Loaded {loaded_count} parameters from BERT")
-    else:
-        print(f"\n⚠️  No matching parameters found")
-    
-    print(f"✓ Total encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M")
+        print("Encoder loaded")
     
     return loaded_count
 
@@ -275,15 +257,11 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
     try:
         gpt2_model = GPT2LMHeadModel.from_pretrained(gpt2_model_name)
         gpt2_state = gpt2_model.state_dict()
-        print(f"✓ Loaded GPT-2 state dict ({len(gpt2_state)} parameters)")
     except Exception as e:
-        print(f"❌ Failed to load GPT-2 model: {e}")
         return 0
     
     decoder_state = decoder.state_dict()
     loaded_count = 0
-    
-    print("\nMapping GPT-2 parameters to decoder:")
     
     # Load embedding
     if "transformer.wte.weight" in gpt2_state and "embedding.weight" in decoder_state:
@@ -295,9 +273,6 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
         if gpt2_emb.size(1) == dec_emb.size(1):
             decoder_state["embedding.weight"][:min_vocab] = gpt2_emb[:min_vocab].clone()
             loaded_count += 1
-            print(f"  ✓ embedding.weight [{min_vocab}/{dec_emb.size(0)} tokens, {dec_emb.size(1)} dim]")
-        else:
-            print(f"  ✗ embedding dimension mismatch: GPT-2={gpt2_emb.size(1)}, decoder={dec_emb.size(1)}")
     
     # Determine number of layers to load
     num_gpt2_layers = sum(1 for k in gpt2_state.keys() if k.startswith("transformer.h.") and ".ln_1.weight" in k)
@@ -305,8 +280,6 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
     layers_to_load = min(num_gpt2_layers, num_decoder_layers)
     if max_layers:
         layers_to_load = min(layers_to_load, max_layers)
-    
-    print(f"  Loading {layers_to_load} layers (GPT-2 has {num_gpt2_layers}, decoder has {num_decoder_layers})")
     
     for layer_idx in range(layers_to_load):
         layer_loaded = 0
@@ -366,10 +339,6 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
                     layer_loaded += 1
         
         loaded_count += layer_loaded
-        if layer_idx < 3 or layer_idx >= layers_to_load - 1:
-            print(f"  ✓ Layer {layer_idx}: {layer_loaded} params")
-        elif layer_idx == 3:
-            print(f"    ... (loading layers {layer_idx} to {layers_to_load-1})")
     
     # Load final layer norm if present
     if "transformer.ln_f.weight" in gpt2_state and "ln_f.weight" in decoder_state:
@@ -377,10 +346,6 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
             decoder_state["ln_f.weight"] = gpt2_state["transformer.ln_f.weight"].clone()
             decoder_state["ln_f.bias"] = gpt2_state["transformer.ln_f.bias"].clone()
             loaded_count += 2
-            print(f"  ✓ ln_f (final layer norm)")
-    
-    print(f"\n✓ Loaded {loaded_count} GPT-2 parameters into decoder")
-    print("  Note: Custom layers (context_proj, cross_attn, MoE experts) remain randomly initialized")
     
     # Load the modified state by directly copying parameter data (preserves device)
     for name, param in decoder.named_parameters():
@@ -447,10 +412,7 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
             else:
                 shard_state = torch.load(weight_file, map_location=device, weights_only=False)
                 gptoss_state.update(shard_state)
-        
-        print(f"✓ Loaded GPT-OSS state dict ({len(gptoss_state)} parameters from {len(weight_files)} files)")
     except Exception as e:
-        print(f"❌ Failed to load weights: {e}")
         return 0
     
     # Get decoder state
@@ -459,7 +421,6 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
     
     # Try to figure out GPT-OSS parameter naming by looking at keys
     sample_keys = list(gptoss_state.keys())[:10]
-    print(f"Sample GPT-OSS parameters: {sample_keys}")
     
     # Common GPT naming patterns:
     # - transformer.wte.weight (embedding)
@@ -485,14 +446,12 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
             if decoder_state['embedding.weight'].shape == gptoss_state[emb_key].shape:
                 decoder_state['embedding.weight'] = gptoss_state[emb_key].to(device)
                 loaded_count += 1
-                print(f"  ✓ Loaded embedding from {emb_key}")
                 break
     
     # 2. Load each decoder block
     num_layers = decoder.config.num_hidden_layers
     if max_layers:
         num_layers = min(num_layers, max_layers)
-        print(f"\n📊 Loading only first {num_layers} layers from GPT-OSS (memory optimization)")
     
     for layer_idx in range(num_layers):
         dec_prefix = f'block.{layer_idx}'
@@ -526,7 +485,6 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                                 decoder_state[f'{dec_prefix}.attn.qkv.bias'] = gptoss_state[qkv_bias_key].to(device)
                                 loaded_count += 1
                             
-                            print(f"  ✓ Loaded {dec_prefix}.attn.qkv from {qkv_key}")
                             layer_loaded = True
                             break
                     except Exception as e:
@@ -545,7 +503,6 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                         v_weight = gptoss_state[v_key]
                         
                         expected_qkv = decoder_state[f'{dec_prefix}.attn.qkv.weight']
-                        print(f"    Layer {layer_idx}: Q={q_weight.shape}, K={k_weight.shape}, V={v_weight.shape}, Expected={expected_qkv.shape}")
                         
                         # Concatenate Q, K, V
                         qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
@@ -567,10 +524,8 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                                 decoder_state[f'{dec_prefix}.attn.qkv.bias'] = qkv_bias.to(device)
                                 loaded_count += 1
                             
-                            print(f"  ✓ Loaded {dec_prefix}.attn.qkv from separate Q,K,V")
                             layer_loaded = True
                     except Exception as e:
-                        print(f"  ⚠️  Failed to concat Q,K,V for layer {layer_idx}: {e}")
                         continue
             
             # Try to load attention output
@@ -591,7 +546,6 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                                 decoder_state[f'{dec_prefix}.attn.out.bias'] = gptoss_state[out_bias_key].to(device)
                                 loaded_count += 1
                             
-                            print(f"  ✓ Loaded {dec_prefix}.attn.out from {out_key}")
                             break
                     except Exception as e:
                         continue
@@ -605,7 +559,6 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
             if moe_w_in_key in gptoss_state and moe_w_out_key in gptoss_state:
                 # GPT-OSS has MoE structure - we need to distribute to our experts
                 # For now, skip this as architectures don't match
-                print(f"  ⚠️  Layer {layer_idx}: GPT-OSS uses different MoE structure, skipping MLP")
                 continue
             
             # Try standard MLP (for non-MoE models)
@@ -624,7 +577,6 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                         if fc1_bias is not None:
                             decoder_state[f'{dec_prefix}.mlp.experts.0.0.bias'] = fc1_bias.to(device)
                             loaded_count += 1
-                        print(f"  ✓ Loaded {dec_prefix}.mlp.experts.0.0 (fc1)")
                 except Exception as e:
                     pass
                     
@@ -638,7 +590,6 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
                         if fc2_bias is not None:
                             decoder_state[f'{dec_prefix}.mlp.experts.0.1.bias'] = fc2_bias.to(device)
                             loaded_count += 1
-                        print(f"  ✓ Loaded {dec_prefix}.mlp.experts.0.1 (fc2)")
                 except Exception as e:
                     pass
     
@@ -650,13 +601,7 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
         for name, buf in decoder.named_buffers():
             if name in decoder_state:
                 buf.data.copy_(decoder_state[name])
-        print(f"\n✓ Loaded {loaded_count} parameters from GPT-OSS")
-        print(f"✓ Kept custom layers (context_proj, cross_attn, gate)")
-    else:
-        print(f"\n⚠️  No matching parameters found between GPT-OSS and decoder")
-        print(f"   GPT-OSS may have different architecture or naming")
-    
-    print(f"✓ Total decoder parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M")
+        print("Decoder loaded")
     
     return loaded_count
 
