@@ -40,6 +40,8 @@ def get_args():
     # Model paths
     ap.add_argument("--checkpoint", type=str, default=None,
                     help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from latest checkpoint in out_dir")
     ap.add_argument("--decoder_checkpoint", type=str, default=None,
                     help="Optional: Path to checkpoint with just decoder weights (.pt file)")
     ap.add_argument("--gptoss_weights", type=str, default="architecture/open-gpt-oss/weights",
@@ -685,9 +687,20 @@ def main():
     print(f"Output directory: {args.out_dir}")
     print("="*60 + "\n")
     
-    # Load checkpoint if provided
+    # Load checkpoint if provided or resume from latest
     checkpoint = None
-    if args.checkpoint:
+    if args.resume:
+        # Find latest checkpoint in out_dir
+        import glob
+        checkpoints = glob.glob(os.path.join(args.out_dir, "checkpoint_*.pt"))
+        if checkpoints:
+            # Sort by iteration number
+            latest = max(checkpoints, key=lambda x: int(x.split('_')[-1].replace('.pt', '')))
+            print(f"Resuming from: {latest}")
+            checkpoint = torch.load(latest, map_location=device, weights_only=False)
+        else:
+            print(f"No checkpoints found in {args.out_dir}, starting fresh")
+    elif args.checkpoint:
         print(f"Loading models from: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
@@ -887,6 +900,11 @@ def main():
             {'params': decoder_base_params + decoder_custom_params, 'lr': args.decoder_lr, 'name': 'decoder'},
         ], betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
         use_three_tier = False
+    
+    # Restore optimizer state from checkpoint
+    if checkpoint and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        print(f"✓ Restored optimizer state")
     
     # TensorBoard
     writer = None
@@ -1149,10 +1167,14 @@ def main():
     encoder.train()
     decoder.train()
     
-    iter_num = 0
+    # Restore training state from checkpoint
+    iter_num = checkpoint.get('iter', 0) if checkpoint else 0
+    best_val_loss = checkpoint.get('best_val_loss', float('inf')) if checkpoint else float('inf')
+    if iter_num > 0:
+        print(f"✓ Resuming from iteration {iter_num}")
+    
     running_loss = 0.0
     log_count = 0
-    best_val_loss = float('inf')
     
     t0 = time.time()
     
@@ -1276,6 +1298,84 @@ def main():
             log_count = 0
             t0 = time.time()
         
+        # Validation
+        if (iter_num + 1) % args.eval_interval == 0:
+            encoder.eval()
+            decoder.eval()
+            
+            val_loss = 0.0
+            val_count = 0
+            
+            with torch.no_grad():
+                for _ in range(min(args.eval_iters, len(val_examples))):
+                    batch_ctx, batch_qa, a_position_batch = get_training_batch(
+                        val_examples, args.batch_size, args.max_context_len, args.max_qa_len, device
+                    )
+                    
+                    batch_loss = 0.0
+                    for i in range(batch_ctx.shape[0]):
+                        ctx_tokens = batch_ctx[i]
+                        qa_tokens = batch_qa[i]
+                        a_position = a_position_batch[i]
+                        
+                        # Remove padding
+                        ctx_tokens = ctx_tokens[ctx_tokens != 0]
+                        qa_mask = qa_tokens != -1
+                        qa_tokens = qa_tokens[qa_mask]
+                        
+                        ctx_tokens = ctx_tokens.to(device)
+                        qa_tokens = qa_tokens.to(device)
+                        
+                        with torch.autocast(device_type='cuda' if 'cuda' in str(device) else 'cpu', dtype=dtype_ctx, enabled=(args.dtype != 'float32')):
+                            encoder_k, encoder_v = encoder(ctx_tokens, return_encoder_kv=True)
+                            decoder.reset_context()
+                            logits = decoder(qa_tokens, encoder_k=encoder_k, encoder_v=encoder_v)
+                            
+                            # Loss masking
+                            seq_len = len(logits) - 1
+                            loss_mask = torch.zeros(seq_len, device=device, dtype=torch.float)
+                            if a_position is not None and 0 <= a_position < seq_len:
+                                loss_mask[a_position:] = 1.0
+                            else:
+                                loss_mask[:] = 1.0
+                            
+                            ce_loss = F.cross_entropy(
+                                logits[:-1].view(-1, logits.size(-1)),
+                                qa_tokens[1:].view(-1),
+                                reduction='none'
+                            )
+                            masked_loss = ce_loss * loss_mask
+                            loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)
+                        
+                        batch_loss += loss.item()
+                    
+                    val_loss += batch_loss / batch_ctx.shape[0]
+                    val_count += 1
+            
+            val_loss = val_loss / val_count if val_count > 0 else float('inf')
+            print(f"iter {iter_num + 1:5d} | val_loss {val_loss:.4f}")
+            
+            if writer:
+                writer.add_scalar('Loss/val', val_loss, iter_num + 1)
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_path = os.path.join(args.out_dir, "best_model.pt")
+                torch.save({
+                    'encoder': encoder.state_dict(),
+                    'decoder': decoder.state_dict(),
+                    'encoder_config': encoder_config,
+                    'decoder_config': decoder_config,
+                    'iter': iter_num + 1,
+                    'val_loss': val_loss,
+                    'best_val_loss': best_val_loss,
+                }, best_path)
+                print(f"Saved best model (val_loss={val_loss:.4f})")
+            
+            encoder.train()
+            decoder.train()
+        
         # Save checkpoint
         if (iter_num + 1) % args.save_every == 0:
             checkpoint_path = os.path.join(args.out_dir, f"checkpoint_{iter_num + 1}.pt")
@@ -1283,8 +1383,10 @@ def main():
                 'encoder': encoder.state_dict(),
                 'decoder': decoder.state_dict(),
                 'encoder_config': encoder_config,
+                'decoder_config': decoder_config,
                 'optimizer': optimizer.state_dict(),
                 'iter': iter_num + 1,
+                'best_val_loss': best_val_loss,
                 'args': vars(args),
             }, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
