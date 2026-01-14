@@ -42,6 +42,8 @@ def get_args():
                     help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
     ap.add_argument("--resume", action="store_true",
                     help="Resume from latest checkpoint in out_dir")
+    ap.add_argument("--no_resume_optimizer", action="store_true",
+                    help="Don't load optimizer state from checkpoint (saves GPU memory, resets momentum)")
     ap.add_argument("--decoder_checkpoint", type=str, default=None,
                     help="Optional: Path to checkpoint with just decoder weights (.pt file)")
     ap.add_argument("--gptoss_weights", type=str, default="architecture/open-gpt-oss/weights",
@@ -60,7 +62,10 @@ def get_args():
     
     # Training hyperparameters
     ap.add_argument("--batch_size", type=int, default=1)
-    ap.add_argument("--max_context_len", type=int, default=512)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=4,
+                    help="Number of steps to accumulate gradients (effective batch = batch_size * grad_accum)")
+    ap.add_argument("--max_context_len", type=int, default=256,
+                    help="Max context length (reduced from 512 to save memory)")
     ap.add_argument("--max_qa_len", type=int, default=128)
     ap.add_argument("--max_iters", type=int, default=150000)
     ap.add_argument("--log_interval", type=int, default=10)
@@ -90,6 +95,8 @@ def get_args():
     ap.add_argument("--device", type=str, default="cuda:0")
     ap.add_argument("--dtype", type=str, 
                     choices=["float32", "bfloat16", "float16"], default="bfloat16")
+    ap.add_argument("--compile", action="store_true", default=False,
+                    help="Use torch.compile for faster training (requires PyTorch 2.0+)")
     
     # Dataset
     ap.add_argument("--dataset", type=str, default="msmarco",
@@ -852,6 +859,11 @@ def main():
     if not decoder_loaded:
         print(f"✓ Initialized decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
     
+    # Clear GPU cache after loading large models
+    if 'cuda' in str(device):
+        torch.cuda.empty_cache()
+        print(f"🧹 Cleared GPU cache after model loading")
+    
     # Optionally load BERT weights for encoder
     if args.bert_model:
         load_bert_weights_partial(encoder, args.bert_model, device)
@@ -866,6 +878,10 @@ def main():
     if args.gptoss_weights:
         load_gptoss_weights_partial(decoder, args.gptoss_weights, device, max_layers=args.max_decoder_layers)
         decoder = decoder.to(device)
+    
+    # Clear GPU cache after all model loading
+    if 'cuda' in str(device):
+        torch.cuda.empty_cache()
     
     # Setup optimizer with different learning rates
     encoder_params = list(encoder.parameters())
@@ -901,10 +917,19 @@ def main():
         ], betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
         use_three_tier = False
     
-    # Restore optimizer state from checkpoint
-    if checkpoint and 'optimizer' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        print(f"✓ Restored optimizer state")
+    # Restore optimizer state from checkpoint (unless disabled to save memory)
+    if checkpoint and 'optimizer' in checkpoint and not args.no_resume_optimizer:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print(f"✓ Restored optimizer state (momentum/variance)")
+        except Exception as e:
+            print(f"⚠️  Failed to load optimizer state: {e}")
+            print(f"   Continuing with fresh optimizer (momentum reset)")
+    elif checkpoint and args.no_resume_optimizer:
+        print(f"⚠️  Skipping optimizer state (--no_resume_optimizer flag set)")
+        print(f"   This saves GPU memory but resets Adam momentum/variance")
+    elif checkpoint:
+        print(f"⚠️  No optimizer state in checkpoint")
     
     # TensorBoard
     writer = None
@@ -1158,6 +1183,9 @@ def main():
     print("\n" + "="*60)
     print("Starting training...")
     print(f"Max iterations: {args.max_iters}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print("="*60 + "\n")
     
     # Ensure all components are on correct device (especially RoPE buffers)
@@ -1175,6 +1203,7 @@ def main():
     
     running_loss = 0.0
     log_count = 0
+    accum_step = 0  # Track gradient accumulation steps
     
     t0 = time.time()
     
@@ -1182,22 +1211,20 @@ def main():
         # Get batch
         batch_ctx, batch_qa, a_position_batch = get_training_batch(train_examples, args.batch_size, args.max_context_len, args.max_qa_len, device)
         
-        # Update learning rates with schedule
-        encoder_lr = get_lr(iter_num, args.warmup_iters, args.max_iters, 
-                           args.encoder_lr, args.encoder_lr * args.min_lr_ratio)
-        decoder_lr = get_lr(iter_num, args.warmup_iters, args.max_iters,
-                           args.decoder_lr, args.decoder_lr * args.min_lr_ratio)
-        
-        optimizer.param_groups[0]['lr'] = encoder_lr
-        optimizer.param_groups[1]['lr'] = decoder_lr
-        
-        if use_three_tier:
-            custom_lr = get_lr(iter_num, args.warmup_iters, args.max_iters,
-                              args.cross_attn_lr, args.cross_attn_lr * args.min_lr_ratio)
-            optimizer.param_groups[2]['lr'] = custom_lr
-        
-        # Zero gradients before accumulation
-        optimizer.zero_grad(set_to_none=True)
+        # Update learning rates with schedule (only on actual optimizer steps)
+        if accum_step == 0:
+            encoder_lr = get_lr(iter_num, args.warmup_iters, args.max_iters, 
+                               args.encoder_lr, args.encoder_lr * args.min_lr_ratio)
+            decoder_lr = get_lr(iter_num, args.warmup_iters, args.max_iters,
+                               args.decoder_lr, args.decoder_lr * args.min_lr_ratio)
+            
+            optimizer.param_groups[0]['lr'] = encoder_lr
+            optimizer.param_groups[1]['lr'] = decoder_lr
+            
+            if use_three_tier:
+                custom_lr = get_lr(iter_num, args.warmup_iters, args.max_iters,
+                                  args.cross_attn_lr, args.cross_attn_lr * args.min_lr_ratio)
+                optimizer.param_groups[2]['lr'] = custom_lr
         
         # Forward pass - process each example in batch separately (like other train scripts)
         total_loss = 0.0
@@ -1243,27 +1270,45 @@ def main():
                 masked_loss = ce_loss * loss_mask
                 loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)
             
+            # Scale loss by gradient accumulation steps
+            loss = loss / args.gradient_accumulation_steps
+            
             # Accumulate loss tensor (like train_msmarco)
             total_loss += loss
             
-            # Clear intermediate tensors
-            del encoder_k, encoder_v, logits
+            # Clear intermediate tensors to save memory
+            del encoder_k, encoder_v, logits, loss_mask, ce_loss, masked_loss
         
         # Average loss over batch (still a tensor, like train_msmarco)
         loss = total_loss / batch_ctx.shape[0]
         
         # Backward pass
-        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         
-        # Gradient clipping
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(decoder.parameters()),
-                args.grad_clip
-            )
+        # Increment accumulation step
+        accum_step += 1
         
-        optimizer.step()
+        # Only update weights every gradient_accumulation_steps
+        if accum_step >= args.gradient_accumulation_steps:
+            # Gradient clipping
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(encoder.parameters()) + list(decoder.parameters()),
+                    args.grad_clip
+                )
+            
+            # Optimizer step
+            optimizer.step()
+            
+            # Zero gradients after optimizer step
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Reset accumulation counter
+            accum_step = 0
+            
+            # Clear cache after optimizer step
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
         
         # Clear GPU cache periodically
         if (iter_num + 1) % 10 == 0:
