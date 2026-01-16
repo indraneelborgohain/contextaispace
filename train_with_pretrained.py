@@ -1468,22 +1468,40 @@ def main():
         
         # Save checkpoint (if enabled)
         if args.save_every > 0 and (iter_num + 1) % args.save_every == 0:
-            checkpoint_path = os.path.join(args.out_dir, f"checkpoint_{iter_num + 1}.pt")
-            torch.save({
-                'encoder': encoder.state_dict(),
-                'decoder': decoder.state_dict(),
-                'encoder_config': encoder_config,
-                'decoder_config': decoder_config,
-                'optimizer': optimizer.state_dict(),
-                'iter': iter_num + 1,
-                'best_val_loss': best_val_loss,
-                'args': vars(args),
-            }, checkpoint_path)
+            # Decide whether to save full checkpoint or model-only
+            is_full_checkpoint = (iter_num + 1) % args.save_full_every == 0
             
-            checkpoint_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
-            print(f"💾 Saved checkpoint to {checkpoint_path} ({checkpoint_size_mb:.1f} MB)")
+            if is_full_checkpoint:
+                checkpoint_path = os.path.join(args.out_dir, f"checkpoint_full_{iter_num + 1}.pt")
+                torch.save({
+                    'encoder': encoder.state_dict(),
+                    'decoder': decoder.state_dict(),
+                    'encoder_config': encoder_config,
+                    'decoder_config': decoder_config,
+                    'optimizer': optimizer.state_dict(),
+                    'iter': iter_num + 1,
+                    'best_val_loss': best_val_loss,
+                    'args': vars(args),
+                }, checkpoint_path)
+                
+                checkpoint_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+                print(f"💾 Saved FULL checkpoint to {checkpoint_path} ({checkpoint_size_mb:.1f} MB)")
+            else:
+                checkpoint_path = os.path.join(args.out_dir, f"checkpoint_{iter_num + 1}.pt")
+                torch.save({
+                    'encoder': encoder.state_dict(),
+                    'decoder': decoder.state_dict(),
+                    'encoder_config': encoder_config,
+                    'decoder_config': decoder_config,
+                    'iter': iter_num + 1,
+                    'best_val_loss': best_val_loss,
+                    'args': vars(args),
+                }, checkpoint_path)
+                
+                checkpoint_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+                print(f"💾 Saved model checkpoint to {checkpoint_path} ({checkpoint_size_mb:.1f} MB)")
             
-            # Cleanup old checkpoints to save disk space
+            # Cleanup old checkpoints to save disk space (only non-full checkpoints)
             if args.keep_last_n_checkpoints > 0:
                 cleanup_old_checkpoints(args.out_dir, args.keep_last_n_checkpoints)
         
