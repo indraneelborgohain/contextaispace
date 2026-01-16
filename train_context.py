@@ -379,8 +379,32 @@ def main():
     elif args.load_model:
         print("Starting with fresh optimizer state")
     
+    # Validate data loader before training
+    print("\nValidating data loader...")
+    try:
+        test_batch = next(iter(train_loader))
+        print(f"✓ Data loader working - batch shape: {test_batch[0].shape}")
+        del test_batch
+    except Exception as e:
+        print(f"❌ Data loader validation failed: {e}")
+        raise
+    
+    # Test model forward pass
+    print("Testing model forward pass...")
+    try:
+        model.reset_context()
+        test_input = torch.randint(0, vocab_size, (10,), device=device)
+        with torch.no_grad():
+            test_output = model(test_input, update_context=False)
+        print(f"✓ Model forward pass working - output shape: {test_output.shape}")
+        del test_input, test_output
+        clear_gpu_memory()
+    except Exception as e:
+        print(f"❌ Model forward pass failed: {e}")
+        raise
+    
     # Training loop
-    print("Starting training...")
+    print("\nStarting training...")
     print(f"Max iterations: {args.max_iters}")
     print(f"Log interval: {args.log_interval}")
     print(f"Eval interval: {args.eval_interval}")
@@ -394,16 +418,17 @@ def main():
     
     t0 = time.time()
     
-    while iter_num < args.max_iters:
-        # Get batch
-        try:
-            inputs, targets, doc_starts, lengths = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            inputs, targets, doc_starts, lengths = next(train_iter)
-        
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+    try:
+        while iter_num < args.max_iters:
+            # Get batch
+            try:
+                inputs, targets, doc_starts, lengths = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                inputs, targets, doc_starts, lengths = next(train_iter)
+            
+            inputs = inputs.to(device)
+            targets = targets.to(device)
         
         # Update learning rate
         lr = get_lr(iter_num, args.warmup_iters, args.max_iters, args.lr, args.min_lr)
@@ -415,57 +440,63 @@ def main():
         total_loss = 0.0
         valid_samples = 0
         
-        for j in range(inputs.shape[0]):
-            # Reset context if this is a new document
-            if doc_starts[j]:
-                model.reset_context()
-            
-            seq_input = inputs[j]
-            seq_target = targets[j]
-            seq_len = lengths[j].item()
-            
-            # Use actual tokens (model handles long sequences via chunking)
-            # Only slice if there's padding, otherwise use full sequence
-            if seq_len < seq_input.shape[0]:
-                seq_input = seq_input[:seq_len]
-                seq_target = seq_target[:seq_len]
-            
-            with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
-                logits = model(seq_input, update_context=True)  # Update context during training
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    seq_target.view(-1),
-                    ignore_index=-100
-                )
-            
-            total_loss += loss
-            valid_samples += 1
-            
-            # Clear intermediate tensors
-            del logits, seq_input, seq_target
-        
-        # Average loss over batch
-        if valid_samples > 0:
-            loss = total_loss / valid_samples
-        else:
+            try:
+                for j in range(inputs.shape[0]):
+                    # Reset context if this is a new document
+                    if doc_starts[j]:
+                        model.reset_context()
+                    
+                    seq_input = inputs[j]
+                    seq_target = targets[j]
+                    seq_len = lengths[j].item()
+                    
+                    # Use actual tokens (model handles long sequences via chunking)
+                    # Only slice if there's padding, otherwise use full sequence
+                    if seq_len < seq_input.shape[0]:
+                        seq_input = seq_input[:seq_len]
+                        seq_target = seq_target[:seq_len]
+                    
+                    with torch.amp.autocast(device_type=device.type, dtype=dtype_ctx):
+                        logits = model(seq_input, update_context=True)  # Update context during training
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            seq_target.view(-1),
+                            ignore_index=-100
+                        )
+                    
+                    total_loss += loss
+                    valid_samples += 1
+                    
+                    # Clear intermediate tensors
+                    del logits, seq_input, seq_target
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n⚠️  CUDA OOM at iteration {iter_num}. Clearing cache and skipping batch...")
+                    clear_gpu_memory()
+                    if 'inputs' in locals():
+                        del inputs, targets
+                    continue
+                else:
+                    raise
             continue  # Skip this batch if no valid samples
         
         # Backward pass
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        
-        # Gradient clipping
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        
-        optimizer.step()
-        
-        # Clear GPU cache periodically to prevent fragmentation
-        if (iter_num + 1) % 100 == 0:
-            clear_gpu_memory()
-        
-        # Logging (get loss value before deleting)
-        loss_val = loss.item()
+            try:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                
+                # Gradient clipping
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                
+                optimizer.step()
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n⚠️  CUDA OOM during backward pass at iteration {iter_num}. Clearing cache...")
+                    clear_gpu_memory()
+                    continue
+                else:
+                    raise
         running_loss += loss_val
         log_loss_count += 1
         
@@ -545,8 +576,28 @@ def main():
         
         iter_num += 1
     
-    # Save final model
-    final_path = os.path.join(args.out_dir, "final_model.pt")
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Training interrupted by user (Ctrl+C)")
+        print(f"Last completed iteration: {iter_num}")
+    except Exception as e:
+        print(f"\n\n❌ Training failed with error at iteration {iter_num}:")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        # Save emergency checkpoint on any exit
+        try:
+            emergency_path = os.path.join(args.out_dir, "emergency_checkpoint.pt")
+            torch.save({
+                'model': model.state_dict(),
+                'iter': iter_num,
+                'config': config.__dict__,
+            }, emergency_path)
+            print(f"\n💾 Saved emergency checkpoint to {emergency_path}")
+        except Exception as e:
+            print(f"⚠️  Could not save emergency checkpoint: {e}")
     torch.save({
         'model': model.state_dict(),
         'config': config.__dict__,
