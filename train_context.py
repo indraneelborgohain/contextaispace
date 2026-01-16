@@ -40,6 +40,8 @@ def get_args():
     ap.add_argument("--eval_iters", type=int, default=5)
     # save + sample
     ap.add_argument("--save_every", type=int, default=500)
+    ap.add_argument("--save_full_every", type=int, default=2000, help="Save full checkpoint (with optimizer) every N iters")
+    ap.add_argument("--keep_last_n_checkpoints", type=int, default=3, help="Keep only last N checkpoints (0 = keep all)")
     ap.add_argument("--sample_every", type=int, default=250)
     ap.add_argument("--sample_tokens", type=int, default=100)
     ap.add_argument("--top_k", type=int, default=200)
@@ -57,8 +59,9 @@ def get_args():
     ap.add_argument("--device", type=str, default="cuda:0", help="Device to use (cuda:0, cpu, etc.)")
     ap.add_argument("--dtype", type=str, choices=["float32", "bfloat16", "float16"], default="bfloat16")
     # checkpoint
-    ap.add_argument("--resume", action="store_true", default=False)
+    ap.add_argument("--resume", action="store_true", default=False, help="Resume training with optimizer state")
     ap.add_argument("--checkpoint_path", type=str, default=None, help="Path to checkpoint to resume from")
+    ap.add_argument("--load_model", type=str, default=None, help="Load model weights only (24GB checkpoint) and start training with fresh optimizer")
     # tensorboard
     ap.add_argument("--use_tensorboard", action="store_true", default=False, help="Enable TensorBoard logging")
     ap.add_argument("--log_dir", type=str, default="runs_context", help="TensorBoard log directory")
@@ -330,8 +333,18 @@ def main():
     
     # Load checkpoint if resuming (this overrides the pretrained weights)
     start_iter = 0
-    if args.resume and args.checkpoint_path and os.path.exists(args.checkpoint_path):
-        print(f"Loading checkpoint from {args.checkpoint_path}")
+    checkpoint = None
+    
+    # Option 1: Load model weights only (fresh optimizer)
+    if args.load_model and os.path.exists(args.load_model):
+        print(f"Loading model weights from {args.load_model}")
+        checkpoint = torch.load(args.load_model, map_location=device)
+        model.load_state_dict(checkpoint['model'])
+        start_iter = checkpoint.get('iter', 0)
+        print(f"Loaded model from iteration {start_iter} (optimizer will be initialized fresh)")
+    # Option 2: Resume full training (model + optimizer)
+    elif args.resume and args.checkpoint_path and os.path.exists(args.checkpoint_path):
+        print(f"Loading full checkpoint from {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model'])
         start_iter = checkpoint.get('iter', 0)
@@ -359,10 +372,12 @@ def main():
         weight_decay=args.weight_decay
     )
     
-    if args.resume and args.checkpoint_path and os.path.exists(args.checkpoint_path):
-        if 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("Loaded optimizer state")
+    # Load optimizer state only when resuming (not when just loading model)
+    if args.resume and checkpoint and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        print("Loaded optimizer state (resuming training)")
+    elif args.load_model:
+        print("Starting with fresh optimizer state")
     
     # Training loop
     print("Starting training...")
@@ -495,15 +510,38 @@ def main():
         
         # Save checkpoint
         if (iter_num + 1) % args.save_every == 0:
-            checkpoint_path = os.path.join(args.out_dir, f"checkpoint_{iter_num + 1}.pt")
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'iter': iter_num + 1,
-                'config': config.__dict__,
-            }
-            torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+            # Decide whether to save full checkpoint or model-only
+            is_full_checkpoint = (iter_num + 1) % args.save_full_every == 0
+            
+            if is_full_checkpoint:
+                checkpoint_path = os.path.join(args.out_dir, f"checkpoint_full_{iter_num + 1}.pt")
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'iter': iter_num + 1,
+                    'config': config.__dict__,
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"Saved FULL checkpoint to {checkpoint_path} ({os.path.getsize(checkpoint_path) / 1e9:.2f} GB)")
+            else:
+                checkpoint_path = os.path.join(args.out_dir, f"checkpoint_{iter_num + 1}.pt")
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'iter': iter_num + 1,
+                    'config': config.__dict__,
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"Saved model checkpoint to {checkpoint_path} ({os.path.getsize(checkpoint_path) / 1e9:.2f} GB)")
+            
+            # Clean up old checkpoints if requested
+            if args.keep_last_n_checkpoints > 0:
+                import glob
+                # Get all non-full checkpoints
+                checkpoints = sorted(glob.glob(os.path.join(args.out_dir, "checkpoint_[0-9]*.pt")))
+                if len(checkpoints) > args.keep_last_n_checkpoints:
+                    for old_ckpt in checkpoints[:-args.keep_last_n_checkpoints]:
+                        os.remove(old_ckpt)
+                        print(f"Removed old checkpoint: {old_ckpt}")
         
         iter_num += 1
     
