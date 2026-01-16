@@ -71,7 +71,10 @@ def get_args():
     ap.add_argument("--log_interval", type=int, default=10)
     ap.add_argument("--eval_interval", type=int, default=200)
     ap.add_argument("--eval_iters", type=int, default=20)
-    ap.add_argument("--save_every", type=int, default=500)
+    ap.add_argument("--save_every", type=int, default=500,
+                    help="Save checkpoint every N iterations (0 = disable intermediate checkpoints)")
+    ap.add_argument("--keep_last_n_checkpoints", type=int, default=2,
+                    help="Keep only the last N checkpoints (older ones auto-deleted to save space)")
     
     # Learning rates
     ap.add_argument("--encoder_lr", type=float, default=1e-5,
@@ -703,12 +706,15 @@ def main():
         if checkpoints:
             # Sort by iteration number
             latest = max(checkpoints, key=lambda x: int(x.split('_')[-1].replace('.pt', '')))
-            print(f"Resuming from: {latest}")
+            checkpoint_size_mb = os.path.getsize(latest) / (1024 * 1024)
+            print(f"\n\u267b\ufe0f  Resuming from: {latest} ({checkpoint_size_mb:.1f} MB)")
             checkpoint = torch.load(latest, map_location=device, weights_only=False)
+            print(f"   \u2192 Will skip loading pretrained weights (using checkpoint instead)")
         else:
             print(f"No checkpoints found in {args.out_dir}, starting fresh")
     elif args.checkpoint:
-        print(f"Loading models from: {args.checkpoint}")
+        checkpoint_size_mb = os.path.getsize(args.checkpoint) / (1024 * 1024)
+        print(f"\nLoading models from: {args.checkpoint} ({checkpoint_size_mb:.1f} MB)")
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
     # Load encoder config
@@ -864,20 +870,29 @@ def main():
         torch.cuda.empty_cache()
         print(f"🧹 Cleared GPU cache after model loading")
     
-    # Optionally load BERT weights for encoder
-    if args.bert_model:
+    # Optionally load BERT weights for encoder (skip if resuming - checkpoint already has weights)
+    if args.bert_model and not (checkpoint and 'encoder' in checkpoint):
+        print(f"Loading BERT weights from {args.bert_model}...")
         load_bert_weights_partial(encoder, args.bert_model, device)
         encoder = encoder.to(device)
+    elif args.bert_model and checkpoint:
+        print(f"⚠️  Skipping BERT weight loading (using checkpoint weights instead)")
     
-    # Optionally load GPT-2 weights for decoder (preferred for single GPU)
-    if args.gpt2_model:
+    # Optionally load GPT-2 weights for decoder (skip if resuming - checkpoint already has weights)
+    if args.gpt2_model and not (checkpoint and 'decoder' in checkpoint):
+        print(f"Loading GPT-2 weights from {args.gpt2_model}...")
         load_gpt2_weights_partial(decoder, args.gpt2_model, device, max_layers=args.max_decoder_layers)
         decoder = decoder.to(device)
+    elif args.gpt2_model and checkpoint:
+        print(f"⚠️  Skipping GPT-2 weight loading (using checkpoint weights instead)")
     
-    # Optionally load GPT-OSS weights for compatible layers (overwrites base layers)
-    if args.gptoss_weights:
+    # Optionally load GPT-OSS weights for compatible layers (skip if resuming - checkpoint already has weights)
+    if args.gptoss_weights and not (checkpoint and 'decoder' in checkpoint):
+        print(f"Loading GPT-OSS weights from {args.gptoss_weights}...")
         load_gptoss_weights_partial(decoder, args.gptoss_weights, device, max_layers=args.max_decoder_layers)
         decoder = decoder.to(device)
+    elif args.gptoss_weights and checkpoint:
+        print(f"⚠️  Skipping GPT-OSS weight loading (using checkpoint weights instead)")
     
     # Clear GPU cache after all model loading
     if 'cuda' in str(device):
@@ -1186,6 +1201,17 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
     print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    
+    # Show checkpoint saving strategy
+    if args.save_every == 0:
+        print(f"💾 Checkpoint saving: DISABLED (only best_model.pt and final_model.pt will be saved)")
+    else:
+        print(f"💾 Checkpoint saving: Every {args.save_every} iterations")
+        if args.keep_last_n_checkpoints > 0:
+            print(f"   Keeping only last {args.keep_last_n_checkpoints} checkpoints (auto-cleanup to save disk)")
+        else:
+            print(f"   ⚠️  All checkpoints will be kept (may use lots of disk space!)")
+    
     print("="*60 + "\n")
     
     # Ensure all components are on correct device (especially RoPE buffers)
@@ -1273,7 +1299,7 @@ def main():
             # Scale loss by gradient accumulation steps
             loss = loss / args.gradient_accumulation_steps
             
-            # Accumulate loss tensor (like train_msmarco)
+            # Accumulate loss tensor (keep gradients for backward pass)
             total_loss += loss
             
             # Clear intermediate tensors to save memory
@@ -1314,9 +1340,13 @@ def main():
         if (iter_num + 1) % 10 == 0:
             torch.cuda.empty_cache()
         
-        # Logging
-        running_loss += loss.item()
+        # Logging (get loss value before deleting)
+        loss_val = loss.item()
+        running_loss += loss_val
         log_count += 1
+        
+        # Clean up batch tensors
+        del batch_ctx, batch_qa, batch_a_pos, total_loss, loss
         
         if (iter_num + 1) % args.log_interval == 0:
             avg_loss = running_loss / log_count
@@ -1421,8 +1451,8 @@ def main():
             encoder.train()
             decoder.train()
         
-        # Save checkpoint
-        if (iter_num + 1) % args.save_every == 0:
+        # Save checkpoint (if enabled)
+        if args.save_every > 0 and (iter_num + 1) % args.save_every == 0:
             checkpoint_path = os.path.join(args.out_dir, f"checkpoint_{iter_num + 1}.pt")
             torch.save({
                 'encoder': encoder.state_dict(),
@@ -1434,7 +1464,13 @@ def main():
                 'best_val_loss': best_val_loss,
                 'args': vars(args),
             }, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+            
+            checkpoint_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+            print(f"💾 Saved checkpoint to {checkpoint_path} ({checkpoint_size_mb:.1f} MB)")
+            
+            # Cleanup old checkpoints to save disk space
+            if args.keep_last_n_checkpoints > 0:
+                cleanup_old_checkpoints(args.out_dir, args.keep_last_n_checkpoints)
         
         iter_num += 1
     
@@ -1449,6 +1485,41 @@ def main():
     
     if writer:
         writer.close()
+
+
+def cleanup_old_checkpoints(out_dir, keep_last_n=2):
+    """
+    Delete old checkpoints, keeping only the last N to save disk space.
+    Always preserves best_model.pt and final_model.pt.
+    
+    Args:
+        out_dir: Output directory containing checkpoints
+        keep_last_n: Number of recent checkpoints to keep
+    """
+    import glob
+    
+    # Find all checkpoint files (not best_model.pt or final_model.pt)
+    checkpoints = glob.glob(os.path.join(out_dir, "checkpoint_*.pt"))
+    
+    if len(checkpoints) <= keep_last_n:
+        return  # Nothing to delete
+    
+    # Sort by iteration number (extract from filename)
+    checkpoints_sorted = sorted(
+        checkpoints,
+        key=lambda x: int(x.split('_')[-1].replace('.pt', ''))
+    )
+    
+    # Delete old checkpoints (keep last N)
+    to_delete = checkpoints_sorted[:-keep_last_n]
+    
+    for ckpt_path in to_delete:
+        try:
+            file_size_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
+            os.remove(ckpt_path)
+            print(f"🗑️  Deleted old checkpoint: {os.path.basename(ckpt_path)} ({file_size_mb:.1f} MB freed)")
+        except Exception as e:
+            print(f"⚠️  Failed to delete {ckpt_path}: {e}")
 
 
 def get_training_batch(examples, batch_size, max_context_len, max_qa_len, device):

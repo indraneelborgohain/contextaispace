@@ -425,6 +425,9 @@ def main():
             
             total_loss += loss
             valid_samples += 1
+            
+            # Clear intermediate tensors
+            del logits, seq_input, seq_target
         
         # Average loss over batch
         if valid_samples > 0:
@@ -442,9 +445,17 @@ def main():
         
         optimizer.step()
         
-        # Logging
-        running_loss += loss.item()
+        # Clear GPU cache periodically to prevent fragmentation
+        if (iter_num + 1) % 100 == 0:
+            clear_gpu_memory()
+        
+        # Logging (get loss value before deleting)
+        loss_val = loss.item()
+        running_loss += loss_val
         log_loss_count += 1
+        
+        # Delete tensors to free memory
+        del inputs, targets, total_loss, loss
         
         if (iter_num + 1) % args.log_interval == 0:
             avg_loss = running_loss / log_loss_count
@@ -462,11 +473,14 @@ def main():
         
         # Evaluation
         if (iter_num + 1) % args.eval_interval == 0:
+            model.reset_context()  # Reset context before evaluation
             val_loss = evaluate(model, val_loader, args.eval_iters, device, dtype_ctx)
             print(f"iter {iter_num + 1:5d} | val_loss {val_loss:.4f}")
             
             if writer:
                 writer.add_scalar('Loss/val', val_loss, iter_num + 1)
+            
+            clear_gpu_memory()  # Clear cache after evaluation
         
         # Sample generation
         if (iter_num + 1) % args.sample_every == 0:
