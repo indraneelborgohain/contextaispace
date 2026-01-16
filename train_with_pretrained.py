@@ -1346,7 +1346,7 @@ def main():
         log_count += 1
         
         # Clean up batch tensors
-        del batch_ctx, batch_qa, batch_a_pos, total_loss, loss
+        del batch_ctx, batch_qa, a_position_batch, total_loss, loss
         
         if (iter_num + 1) % args.log_interval == 0:
             avg_loss = running_loss / log_count
