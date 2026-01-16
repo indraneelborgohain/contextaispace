@@ -42,6 +42,8 @@ def get_args():
                     help="Optional: Path to checkpoint with trained encoder and decoder (.pt file)")
     ap.add_argument("--resume", action="store_true",
                     help="Resume from latest checkpoint in out_dir")
+    ap.add_argument("--load_model", type=str, default=None,
+                    help="Load model weights only (24GB checkpoint) and start training with fresh optimizer")
     ap.add_argument("--no_resume_optimizer", action="store_true",
                     help="Don't load optimizer state from checkpoint (saves GPU memory, resets momentum)")
     ap.add_argument("--decoder_checkpoint", type=str, default=None,
@@ -73,6 +75,8 @@ def get_args():
     ap.add_argument("--eval_iters", type=int, default=20)
     ap.add_argument("--save_every", type=int, default=500,
                     help="Save checkpoint every N iterations (0 = disable intermediate checkpoints)")
+    ap.add_argument("--save_full_every", type=int, default=2000,
+                    help="Save full checkpoint (with optimizer) every N iters")
     ap.add_argument("--keep_last_n_checkpoints", type=int, default=2,
                     help="Keep only the last N checkpoints (older ones auto-deleted to save space)")
     
@@ -699,7 +703,16 @@ def main():
     
     # Load checkpoint if provided or resume from latest
     checkpoint = None
-    if args.resume:
+    load_optimizer = True  # Track whether to load optimizer state
+    
+    if args.load_model and os.path.exists(args.load_model):
+        # Load model weights only (fresh optimizer)
+        checkpoint_size_mb = os.path.getsize(args.load_model) / (1024 * 1024)
+        print(f"\n📦 Loading model weights from: {args.load_model} ({checkpoint_size_mb:.1f} MB)")
+        checkpoint = torch.load(args.load_model, map_location=device, weights_only=False)
+        load_optimizer = False
+        print(f"   → Will initialize fresh optimizer (continuing from iteration {checkpoint.get('iter', 0)})")
+    elif args.resume:
         # Find latest checkpoint in out_dir
         import glob
         checkpoints = glob.glob(os.path.join(args.out_dir, "checkpoint_*.pt"))
@@ -707,15 +720,17 @@ def main():
             # Sort by iteration number
             latest = max(checkpoints, key=lambda x: int(x.split('_')[-1].replace('.pt', '')))
             checkpoint_size_mb = os.path.getsize(latest) / (1024 * 1024)
-            print(f"\n\u267b\ufe0f  Resuming from: {latest} ({checkpoint_size_mb:.1f} MB)")
+            print(f"\n♻️  Resuming from: {latest} ({checkpoint_size_mb:.1f} MB)")
             checkpoint = torch.load(latest, map_location=device, weights_only=False)
-            print(f"   \u2192 Will skip loading pretrained weights (using checkpoint instead)")
+            load_optimizer = not args.no_resume_optimizer
+            print(f"   → Will skip loading pretrained weights (using checkpoint instead)")
         else:
             print(f"No checkpoints found in {args.out_dir}, starting fresh")
     elif args.checkpoint:
         checkpoint_size_mb = os.path.getsize(args.checkpoint) / (1024 * 1024)
         print(f"\nLoading models from: {args.checkpoint} ({checkpoint_size_mb:.1f} MB)")
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        load_optimizer = not args.no_resume_optimizer
     
     # Load encoder config
     from architecture.encoder import BidirectionalEncoder, EncoderConfig
@@ -933,15 +948,15 @@ def main():
         use_three_tier = False
     
     # Restore optimizer state from checkpoint (unless disabled to save memory)
-    if checkpoint and 'optimizer' in checkpoint and not args.no_resume_optimizer:
+    if checkpoint and 'optimizer' in checkpoint and load_optimizer:
         try:
             optimizer.load_state_dict(checkpoint['optimizer'])
             print(f"✓ Restored optimizer state (momentum/variance)")
         except Exception as e:
             print(f"⚠️  Failed to load optimizer state: {e}")
             print(f"   Continuing with fresh optimizer (momentum reset)")
-    elif checkpoint and args.no_resume_optimizer:
-        print(f"⚠️  Skipping optimizer state (--no_resume_optimizer flag set)")
+    elif checkpoint and not load_optimizer:
+        print(f"⚠️  Skipping optimizer state (--load_model or --no_resume_optimizer flag set)")
         print(f"   This saves GPU memory but resets Adam momentum/variance")
     elif checkpoint:
         print(f"⚠️  No optimizer state in checkpoint")
