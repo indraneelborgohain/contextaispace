@@ -791,7 +791,18 @@ def main():
     
     # Only load encoder weights from checkpoint if NOT using BERT
     if checkpoint and not args.bert_model and 'encoder' in checkpoint:
-        encoder.load_state_dict(checkpoint['encoder'])
+        print(f"Loading encoder weights (memory-efficient streaming from CPU to GPU)...")
+        encoder_state = checkpoint['encoder']
+        
+        # Stream parameters one at a time from CPU to GPU (avoids duplication)
+        for name, param in encoder.named_parameters():
+            if name in encoder_state:
+                param.data.copy_(encoder_state[name].to(device))
+        
+        for name, buffer in encoder.named_buffers():
+            if name in encoder_state:
+                buffer.data.copy_(encoder_state[name].to(device))
+        
         print(f"✓ Loaded encoder from checkpoint ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
         # Delete encoder state from checkpoint to free memory
         del checkpoint['encoder']
@@ -890,7 +901,17 @@ def main():
             decoder_state = decoder_ckpt
         
         try:
-            decoder.load_state_dict(decoder_state, strict=False)
+            print(f"Loading decoder weights (memory-efficient streaming from CPU to GPU)...")
+            
+            # Stream parameters one at a time from CPU to GPU
+            for name, param in decoder.named_parameters():
+                if name in decoder_state:
+                    param.data.copy_(decoder_state[name].to(device))
+            
+            for name, buffer in decoder.named_buffers():
+                if name in decoder_state:
+                    buffer.data.copy_(decoder_state[name].to(device))
+            
             print(f"✓ Loaded decoder from {args.decoder_checkpoint} ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
             del decoder_state, decoder_ckpt  # Free memory
             if 'cuda' in str(device):
@@ -904,7 +925,18 @@ def main():
     elif checkpoint and 'decoder' in checkpoint:
         # Load from full checkpoint
         try:
-            decoder.load_state_dict(checkpoint['decoder'], strict=True)
+            print(f"Loading decoder weights (memory-efficient streaming from CPU to GPU)...")
+            decoder_state = checkpoint['decoder']
+            
+            # Stream parameters one at a time from CPU to GPU (avoids duplication)
+            for name, param in decoder.named_parameters():
+                if name in decoder_state:
+                    param.data.copy_(decoder_state[name].to(device))
+            
+            for name, buffer in decoder.named_buffers():
+                if name in decoder_state:
+                    buffer.data.copy_(decoder_state[name].to(device))
+            
             print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
             # Delete decoder state from checkpoint to free memory
             del checkpoint['decoder']
