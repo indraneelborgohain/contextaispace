@@ -719,6 +719,8 @@ def main():
     # Load checkpoint if provided or resume from latest
     checkpoint = None
     load_optimizer = True  # Track whether to load optimizer state
+    checkpoint_iter = 0  # Extract iteration number early
+    checkpoint_best_val_loss = float('inf')  # Extract best val loss early
     
     if args.load_model and os.path.exists(args.load_model):
         # Load model weights only (fresh optimizer)
@@ -728,7 +730,9 @@ def main():
         print(f"   → Loading to CPU first to save GPU memory...")
         checkpoint = torch.load(args.load_model, map_location='cpu', weights_only=False)
         load_optimizer = False
-        print(f"   → Will initialize fresh optimizer (continuing from iteration {checkpoint.get('iter', 0)})")
+        checkpoint_iter = checkpoint.get('iter', 0)
+        checkpoint_best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        print(f"   → Will initialize fresh optimizer (continuing from iteration {checkpoint_iter})")
     elif args.resume:
         # Find latest checkpoint in out_dir
         import glob
@@ -742,6 +746,8 @@ def main():
             print(f"   → Loading to CPU first to save GPU memory...")
             checkpoint = torch.load(latest, map_location='cpu', weights_only=False)
             load_optimizer = not args.no_resume_optimizer
+            checkpoint_iter = checkpoint.get('iter', 0)
+            checkpoint_best_val_loss = checkpoint.get('best_val_loss', float('inf'))
             print(f"   → Will skip loading pretrained weights (using checkpoint instead)")
         else:
             print(f"No checkpoints found in {args.out_dir}, starting fresh")
@@ -752,6 +758,8 @@ def main():
         print(f"   → Loading to CPU first to save GPU memory...")
         checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         load_optimizer = not args.no_resume_optimizer
+        checkpoint_iter = checkpoint.get('iter', 0)
+        checkpoint_best_val_loss = checkpoint.get('best_val_loss', float('inf'))
     
     # Load encoder config
     from architecture.encoder import BidirectionalEncoder, EncoderConfig
@@ -783,13 +791,12 @@ def main():
     
     # Only load encoder weights from checkpoint if NOT using BERT
     if checkpoint and not args.bert_model and 'encoder' in checkpoint:
-        # Load state dict and move to device (checkpoint is on CPU)
-        encoder_state = checkpoint['encoder']
-        # Move state dict tensors to device
-        encoder_state = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in encoder_state.items()}
-        encoder.load_state_dict(encoder_state)
+        encoder.load_state_dict(checkpoint['encoder'])
         print(f"✓ Loaded encoder from checkpoint ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
-        del encoder_state  # Free memory
+        # Delete encoder state from checkpoint to free memory
+        del checkpoint['encoder']
+        if 'cuda' in str(device):
+            torch.cuda.empty_cache()
     else:
         print(f"✓ Initialized encoder ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
     
@@ -883,11 +890,11 @@ def main():
             decoder_state = decoder_ckpt
         
         try:
-            # Move state dict to device
-            decoder_state = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in decoder_state.items()}
             decoder.load_state_dict(decoder_state, strict=False)
             print(f"✓ Loaded decoder from {args.decoder_checkpoint} ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
             del decoder_state, decoder_ckpt  # Free memory
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
             decoder_loaded = True
         except RuntimeError as e:
             print(f"❌ Error loading decoder from {args.decoder_checkpoint}: {str(e)[:200]}")
@@ -897,12 +904,12 @@ def main():
     elif checkpoint and 'decoder' in checkpoint:
         # Load from full checkpoint
         try:
-            # Move decoder state dict to device (checkpoint is on CPU)
-            decoder_state = checkpoint['decoder']
-            decoder_state = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in decoder_state.items()}
-            decoder.load_state_dict(decoder_state, strict=True)
+            decoder.load_state_dict(checkpoint['decoder'], strict=True)
             print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
-            del decoder_state  # Free memory
+            # Delete decoder state from checkpoint to free memory
+            del checkpoint['decoder']
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
             decoder_loaded = True
         except RuntimeError as e:
             print(f"❌ Error loading decoder weights:")
@@ -917,12 +924,14 @@ def main():
     
     # Delete checkpoint from memory (we've extracted what we need)
     if checkpoint is not None:
-        # Keep only config data if needed, delete state dicts
+        # Delete large state dicts if still present
         if 'encoder' in checkpoint:
             del checkpoint['encoder']
         if 'decoder' in checkpoint:
             del checkpoint['decoder']
-        if 'optimizer' in checkpoint and not load_optimizer:
+        # CRITICAL: Always delete optimizer state when using --load_model to save GPU memory
+        if 'optimizer' in checkpoint:
+            print(f"Deleting optimizer state from checkpoint (saves ~{sum(p.numel() for p in encoder.parameters()) * 2 * 4 / (1024**3):.1f}GB GPU memory)")
             del checkpoint['optimizer']
     
     # Clear GPU cache after loading large models
@@ -1012,32 +1021,29 @@ def main():
     # Restore optimizer state from checkpoint (unless disabled to save memory)
     if checkpoint and 'optimizer' in checkpoint and load_optimizer:
         try:
-            # Move optimizer state to device
-            optimizer_state = checkpoint['optimizer']
-            # Move tensors in optimizer state to GPU
-            for state in optimizer_state.get('state', {}).values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(device)
-            optimizer.load_state_dict(optimizer_state)
+            optimizer.load_state_dict(checkpoint['optimizer'])
             print(f"✓ Restored optimizer state (momentum/variance)")
-            del optimizer_state  # Free memory
         except Exception as e:
             print(f"⚠️  Failed to load optimizer state: {e}")
             print(f"   Continuing with fresh optimizer (momentum reset)")
-    elif checkpoint and not load_optimizer:
-        print(f"⚠️  Skipping optimizer state (--load_model or --no_resume_optimizer flag set)")
-        print(f"   This saves GPU memory but resets Adam momentum/variance")
-    elif checkpoint:
+    elif not load_optimizer:
+        print(f"✓ Starting with fresh optimizer (--load_model mode saves GPU memory)")
+        print(f"   No optimizer state loaded - Adam will start with zero momentum/variance")
+    elif checkpoint and 'optimizer' not in checkpoint:
         print(f"⚠️  No optimizer state in checkpoint")
     
-    # Delete remaining checkpoint data from memory
+    # CRITICAL: Delete checkpoint completely from memory NOW
     if checkpoint is not None:
+        # Delete all keys to free memory
+        checkpoint.clear()
         del checkpoint
         checkpoint = None
+        # Force garbage collection
+        import gc
+        gc.collect()
         if 'cuda' in str(device):
             torch.cuda.empty_cache()
-            print(f"🧹 Deleted checkpoint from memory and cleared cache")
+            print(f"🧹 Deleted checkpoint from memory, freed all references, cleared cache")
     
     # TensorBoard
     writer = None
@@ -1324,8 +1330,8 @@ def main():
         print(f"   Reserved: {reserved:.2f} GB")
     
     # Restore training state from checkpoint
-    iter_num = checkpoint.get('iter', 0) if checkpoint else 0
-    best_val_loss = checkpoint.get('best_val_loss', float('inf')) if checkpoint else float('inf')
+    iter_num = checkpoint_iter
+    best_val_loss = checkpoint_best_val_loss
     if iter_num > 0:
         print(f"✓ Resuming from iteration {iter_num}")
     
