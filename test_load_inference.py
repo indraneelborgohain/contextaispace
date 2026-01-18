@@ -81,18 +81,34 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda:0', dtype=torch.bfl
     print("Creating encoder...")
     encoder = BidirectionalEncoder(encoder_config, device='cpu')
     if 'encoder' in checkpoint:
-        encoder.load_state_dict(checkpoint['encoder'])
+        encoder.load_state_dict(checkpoint['encoder'], strict=False)
         del checkpoint['encoder']
+    # Ensure all parameters and buffers are on target device
     encoder = encoder.to(device=device, dtype=dtype)
+    # Double-check all components are on correct device
+    for name, param in encoder.named_parameters():
+        if param.device != device:
+            param.data = param.data.to(device)
+    for name, buffer in encoder.named_buffers():
+        if buffer.device != device:
+            buffer.data = buffer.data.to(device)
     print(f"✓ Encoder loaded: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params")
     
     # Create decoder
     print("Creating decoder...")
     decoder = Transformer(decoder_config, device='cpu')
     if 'decoder' in checkpoint:
-        decoder.load_state_dict(checkpoint['decoder'])
+        decoder.load_state_dict(checkpoint['decoder'], strict=False)
         del checkpoint['decoder']
+    # Ensure all parameters and buffers are on target device
     decoder = decoder.to(device=device, dtype=dtype)
+    # Double-check all components are on correct device
+    for name, param in decoder.named_parameters():
+        if param.device != device:
+            param.data = param.data.to(device)
+    for name, buffer in decoder.named_buffers():
+        if buffer.device != device:
+            buffer.data = buffer.data.to(device)
     print(f"✓ Decoder loaded: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params\n")
     
     # Cleanup
