@@ -119,9 +119,49 @@ def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
+def load_saved_model(model_dir, device):
+    """Load encoder and decoder from saved checkpoint."""
+    print(f"\n{'='*60}")
+    print("LOADING SAVED MODEL")
+    print(f"{'='*60}")
+    print(f"Model directory: {model_dir}")
+    
+    encoder_path = os.path.join(model_dir, "encoder.pt")
+    decoder_path = os.path.join(model_dir, "decoder.pt")
+    
+    if not os.path.exists(encoder_path) or not os.path.exists(decoder_path):
+        print(f"⚠️  Model files not found in {model_dir}")
+        return None, None
+    
+    try:
+        # Load encoder
+        print(f"Loading encoder from {encoder_path}...")
+        encoder_checkpoint = torch.load(encoder_path, map_location=device)
+        encoder_config = encoder_checkpoint['config']
+        encoder = BidirectionalEncoder(encoder_config, device=device)
+        encoder.load_state_dict(encoder_checkpoint['model_state_dict'])
+        print(f"✓ Encoder loaded ({sum(p.numel() for p in encoder.parameters())/1e6:.1f}M params)")
+        
+        # Load decoder
+        print(f"Loading decoder from {decoder_path}...")
+        decoder_checkpoint = torch.load(decoder_path, map_location=device)
+        decoder_config = decoder_checkpoint['config']
+        decoder = Transformer(decoder_config, device=device)
+        decoder.load_state_dict(decoder_checkpoint['model_state_dict'])
+        print(f"✓ Decoder loaded ({sum(p.numel() for p in decoder.parameters())/1e6:.1f}M params)")
+        
+        print(f"{'='*60}\n")
+        return encoder, decoder
+        
+    except Exception as e:
+        print(f"⚠️  Error loading model: {e}")
+        return None, None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Clean training script")
     parser.add_argument("--out_dir", type=str, default="model_clean", help="Output directory")
+    parser.add_argument("--model_dir", type=str, default=None, help="Directory with saved model to resume from")
     args = parser.parse_args()
     
     # ========================================
@@ -167,69 +207,89 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.n_vocab
     
-    # ========================================
-    # STEP 1: Create encoder config from BERT
-    # ========================================
-    print("="*60)
-    print("STEP 1: Creating encoder config from BERT")
-    print("="*60)
-    print(f"BERT model: {bert_model_name}")
+    # Check if loading from saved model
+    if args.model_dir and os.path.exists(args.model_dir):
+        encoder, decoder = load_saved_model(args.model_dir, device)
+        if encoder is not None and decoder is not None:
+            # Successfully loaded - skip BERT and GPT-OSS loading
+            encoder_config = encoder.config
+            decoder_config = decoder.config
+            print("✓ Skipping BERT and GPT-OSS loading (using saved model)\n")
+        else:
+            # Failed to load - proceed with normal initialization
+            encoder = None
+            decoder = None
+    else:
+        encoder = None
+        decoder = None
     
-    encoder_config = create_encoder_config_from_bert(bert_model_name)
+    # Only create new models if we didn't load from checkpoint
+    if encoder is None or decoder is None:
+        # ========================================
+        # STEP 1: Create encoder config from BERT
+        # ========================================
+        print("="*60)
+        print("STEP 1: Creating encoder config from BERT")
+        print("="*60)
+        print(f"BERT model: {bert_model_name}")
+        
+        encoder_config = create_encoder_config_from_bert(bert_model_name)
     
-    # Override vocab size to match our tokenizer
-    encoder_config.vocab_size = vocab_size
-    
-    print(f"\n✓ Encoder config created:")
-    print(f"  Vocab size: {encoder_config.vocab_size}")
-    print(f"  Hidden size: {encoder_config.hidden_size}")
-    print(f"  Layers: {encoder_config.num_hidden_layers}")
-    print(f"  Attention heads: {encoder_config.num_attention_heads}")
-    print(f"  Intermediate size: {encoder_config.intermediate_size}")
-    print(f"  Max position: {encoder_config.max_position_embeddings}\n")
-    
-    # ========================================
-    # STEP 2: Load BERT weights into encoder
-    # ========================================
-    print("="*60)
-    print("STEP 2: Loading BERT weights into encoder")
-    print("="*60)
-    
-    encoder = load_bert_encoder(encoder_config, bert_model_name, device)
-    
-    if encoder is None:
-        print("⚠️  Failed to load BERT weights")
-        print("Creating encoder with random weights...")
-        encoder = BidirectionalEncoder(encoder_config, device=device)
-    
-    print(f"\n✓ Encoder ready")
-    print(f"Encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.1f}M\n")
-    
-    # ========================================
-    # STEP 3: Create decoder from GPT-OSS
-    # ========================================
-    # Using SMALLER decoder config for GPU memory constraints
-    # Original GPT-OSS: 2880 hidden, 12 layers, 64 heads, 32 experts
-    # Smaller config: 768 hidden, 6 layers, 12 heads, 8 experts
-    decoder_config = ModelConfig(
-        vocab_size=vocab_size,
-        hidden_size=768,          # Reduced from 2880
-        num_hidden_layers=6,      # Reduced from 12
-        num_experts=8,            # Reduced from 32
-        num_attention_heads=12,   # Reduced from 64
-        num_key_value_heads=12,   # Reduced from 64
-        use_encoder_decoder_cross_attention=True,
-        encoder_hidden_size=encoder_config.hidden_size
-    )
-    
-    print(f"Decoder config:")
-    print(f"  Vocab size: {decoder_config.vocab_size}")
-    print(f"  Hidden size: {decoder_config.hidden_size}")
-    print(f"  Layers: {decoder_config.num_hidden_layers}")
-    print(f"  Cross-attention: {decoder_config.use_encoder_decoder_cross_attention}")
-    print(f"  Encoder hidden size: {decoder_config.encoder_hidden_size}")
-    
-    decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
+        # Override vocab size to match our tokenizer
+        encoder_config.vocab_size = vocab_size
+        
+        print(f"\n✓ Encoder config created:")
+        print(f"  Vocab size: {encoder_config.vocab_size}")
+        print(f"  Hidden size: {encoder_config.hidden_size}")
+        print(f"  Layers: {encoder_config.num_hidden_layers}")
+        print(f"  Attention heads: {encoder_config.num_attention_heads}")
+        print(f"  Intermediate size: {encoder_config.intermediate_size}")
+        print(f"  Max position: {encoder_config.max_position_embeddings}\n")
+        
+        # ========================================
+        # STEP 2: Load BERT weights into encoder
+        # ========================================
+        print("="*60)
+        print("STEP 2: Loading BERT weights into encoder")
+        print("="*60)
+        
+        encoder = load_bert_encoder(encoder_config, bert_model_name, device)
+        
+        if encoder is None:
+            print("⚠️  Failed to load BERT weights")
+            print("Creating encoder with random weights...")
+            encoder = BidirectionalEncoder(encoder_config, device=device)
+        
+        print(f"\n✓ Encoder ready")
+        print(f"Encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.1f}M\n")
+        
+        # ========================================
+        # STEP 3: Create decoder from GPT-OSS
+        # ========================================
+        # Using SMALLER decoder config for GPU memory constraints
+        # Original GPT-OSS: 2880 hidden, 12 layers, 64 heads, 32 experts
+        # Smaller config: 768 hidden, 6 layers, 12 heads, 8 experts
+        decoder_config = ModelConfig(
+            vocab_size=vocab_size,
+            hidden_size=768,          # Reduced from 2880
+            num_hidden_layers=6,      # Reduced from 12
+            num_experts=8,            # Reduced from 32
+            num_attention_heads=12,   # Reduced from 64
+            num_key_value_heads=12,   # Reduced from 64
+            use_encoder_decoder_cross_attention=True,
+            encoder_hidden_size=encoder_config.hidden_size,
+            use_context_embedding=True,  # Enable context state tracking
+            sliding_window=512           # Set sliding window size
+        )
+        
+        print(f"Decoder config:")
+        print(f"  Vocab size: {decoder_config.vocab_size}")
+        print(f"  Hidden size: {decoder_config.hidden_size}")
+        print(f"  Layers: {decoder_config.num_hidden_layers}")
+        print(f"  Cross-attention: {decoder_config.use_encoder_decoder_cross_attention}")
+        print(f"  Encoder hidden size: {decoder_config.encoder_hidden_size}")
+        
+        decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
     
     # ========================================
     # Training setup
@@ -340,6 +400,9 @@ def main():
         # Gradient accumulation
         total_loss = 0.0
         for micro_step in range(gradient_accumulation_steps):
+            # CRITICAL: Reset context before each example to prevent bleeding
+            decoder.reset_context()
+            
             # Get batch
             example = train_examples[train_idx % len(train_examples)]
             train_idx += 1
@@ -380,7 +443,8 @@ def main():
                 logits = decoder(
                     decoder_input,
                     encoder_k=encoder_k,
-                    encoder_v=encoder_v
+                    encoder_v=encoder_v,
+                    update_context=True  # Allow context updates during training
                 )
                 
                 # Loss
@@ -402,7 +466,9 @@ def main():
         
         # Logging
         if it % log_interval == 0:
-            print(f"Iter {it:5d} | Loss: {total_loss:.4f} | LR: {enc_lr:.2e}/{dec_lr:.2e}/{cross_lr:.2e}")
+            # Add context state diagnostic
+            context_norm = decoder.context_state.norm().item() if hasattr(decoder, 'context_state') else 0.0
+            print(f"Iter {it:5d} | Loss: {total_loss:.4f} | LR: {enc_lr:.2e}/{dec_lr:.2e}/{cross_lr:.2e} | Ctx: {context_norm:.4f}")
         
         # Validation
         if it > 0 and it % eval_interval == 0:
@@ -414,6 +480,9 @@ def main():
             
             with torch.no_grad():
                 for val_idx in range(num_val):
+                    # CRITICAL: Reset context for each validation example
+                    decoder.reset_context()
+                    
                     example = val_examples[val_idx]
                     
                     context = example['context'][:max_context_len*4]
@@ -465,21 +534,48 @@ def main():
             
             with torch.no_grad():
                 with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                    # Encode
                     encoder_k, encoder_v = encoder(encoder_input, return_encoder_kv=True, sep_token_id=sep_token_id)
                     
-                    # Generate
+                    # CRITICAL: Reset decoder context before generation
+                    decoder.reset_context()
+                    
+                    # Generate token by token
                     generated = []
                     a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-                    current_token = torch.tensor([a_token_id], dtype=torch.long, device=device)
-                    
                     end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                    for _ in range(64):
-                        logits = decoder(current_token, encoder_k=encoder_k, encoder_v=encoder_v)
-                        next_token = torch.argmax(logits[-1], dim=-1).item()
+                    
+                    current_token = a_token_id
+                    max_gen_len = 64
+                    temperature = 0.8
+                    
+                    for step in range(max_gen_len):
+                        # CRITICAL: Pass single token, let decoder handle context internally
+                        token_input = torch.tensor([current_token], dtype=torch.long, device=device)
+                        
+                        logits = decoder(
+                            token_input,
+                            encoder_k=encoder_k,
+                            encoder_v=encoder_v,
+                            update_context=True  # Update context after each token
+                        )
+                        
+                        # Get next token with temperature sampling
+                        next_logits = logits[-1] / temperature
+                        probs = F.softmax(next_logits, dim=-1)
+                        
+                        # Sample instead of argmax for better diversity
+                        next_token = torch.multinomial(probs, num_samples=1).item()
+                        
+                        # Debug first few tokens
+                        if step < 5:
+                            print(f"  Gen step {step}: token={next_token}, prob={probs[next_token]:.4f}")
+                        
                         if next_token == end_token_id:
                             break
+                        
                         generated.append(next_token)
-                        current_token = torch.cat([current_token, torch.tensor([next_token], dtype=torch.long, device=device)])
+                        current_token = next_token
             
             generated_text = tokenizer.decode(generated)
             print(f"Generated: {generated_text}")
@@ -488,16 +584,22 @@ def main():
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                checkpoint = {
-                    'encoder': encoder.state_dict(),
-                    'decoder': decoder.state_dict(),
-                    'encoder_config': encoder_config,
-                    'decoder_config': decoder_config,
-                    'optimizer': optimizer.state_dict(),
+                
+                # Save encoder and decoder separately
+                encoder_checkpoint = {
+                    'model_state_dict': encoder.state_dict(),
+                    'config': encoder_config,
                     'iter': it,
                     'val_loss': val_loss
                 }
-                torch.save(checkpoint, os.path.join(args.out_dir, 'best_model.pt'))
+                decoder_checkpoint = {
+                    'model_state_dict': decoder.state_dict(),
+                    'config': decoder_config,
+                    'iter': it,
+                    'val_loss': val_loss
+                }
+                torch.save(encoder_checkpoint, os.path.join(args.out_dir, 'encoder.pt'))
+                torch.save(decoder_checkpoint, os.path.join(args.out_dir, 'decoder.pt'))
                 print(f"✓ Saved best model (val_loss: {val_loss:.4f})\n")
             
             encoder.train()
@@ -505,15 +607,22 @@ def main():
         
         # Save checkpoint
         if it > 0 and it % save_every == 0:
-            checkpoint = {
-                'encoder': encoder.state_dict(),
-                'decoder': decoder.state_dict(),
-                'encoder_config': encoder_config,
-                'decoder_config': decoder_config,
-                'optimizer': optimizer.state_dict(),
+            checkpoint_dir = os.path.join(args.out_dir, f'checkpoint_{it:06d}')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
+            # Save encoder and decoder separately
+            encoder_checkpoint = {
+                'model_state_dict': encoder.state_dict(),
+                'config': encoder_config,
                 'iter': it
             }
-            torch.save(checkpoint, os.path.join(args.out_dir, f'checkpoint_{it:06d}.pt'))
+            decoder_checkpoint = {
+                'model_state_dict': decoder.state_dict(),
+                'config': decoder_config,
+                'iter': it
+            }
+            torch.save(encoder_checkpoint, os.path.join(checkpoint_dir, 'encoder.pt'))
+            torch.save(decoder_checkpoint, os.path.join(checkpoint_dir, 'decoder.pt'))
             print(f"✓ Saved checkpoint at iter {it}\n")
         
         # Clear cache periodically
