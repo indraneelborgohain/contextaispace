@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 """
-Simple script to test loading model checkpoint and doing inference.
-This helps diagnose GPU memory issues.
+Simple script to load checkpoint and test inference on MS MARCO.
 """
 import argparse
 import torch
 from datasets import load_dataset
-
-try:
-    from accelerate import load_checkpoint_in_model, init_empty_weights
-    ACCELERATE_AVAILABLE = True
-except ImportError:
-    print("⚠️  accelerate not installed. Install with: pip install accelerate")
-    ACCELERATE_AVAILABLE = False
 
 from architecture.config import ModelConfig
 from architecture.encoder import BidirectionalEncoder, EncoderConfig
@@ -20,59 +12,27 @@ from architecture.transformer import Transformer
 from architecture.tokenizer import get_tokenizer
 
 
-def print_gpu_memory(label):
-    """Print current GPU memory usage"""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated(0) / (1024**3)
-        reserved = torch.cuda.memory_reserved(0) / (1024**3)
-        print(f"[{label}] GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-
-
-def load_checkpoint_metadata_only(checkpoint_path):
-    """Load only the config metadata without loading full state dicts"""
-    # Use mmap if available (PyTorch 2.0+)
-    try:
-        checkpoint = torch.load(
-            checkpoint_path, 
-            map_location='cpu', 
-            weights_only=False,
-            mmap=True  # Memory-mapped loading
-        )
-    except TypeError:
-        # Fallback for older PyTorch versions
-        checkpoint = torch.load(
-            checkpoint_path, 
-            map_location='cpu', 
-            weights_only=False
-        )
-    return checkpoint
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file")
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--use-bfloat16", action="store_true", help="Use bfloat16 precision")
-    args = parser.parse_args()
+def load_model_from_checkpoint(checkpoint_path, device='cuda:0', dtype=torch.bfloat16):
+    """
+    Load encoder-decoder model from checkpoint.
     
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if args.use_bfloat16 else torch.float32
-    print(f"Using device: {device}, dtype: {dtype}\n")
+    Args:
+        checkpoint_path: Path to .pt checkpoint file
+        device: Device to load to ('cuda:0', 'cpu', etc.)
+        dtype: Data type (torch.bfloat16, torch.float32, etc.)
     
-    # Get tokenizer
-    tokenizer = get_tokenizer()
+    Returns:
+        encoder, decoder, tokenizer
+    """
+    print(f"Loading checkpoint from: {checkpoint_path}")
+    print(f"Target device: {device}, dtype: {dtype}\n")
     
-    # STEP 1: Load checkpoint metadata only (configs)
-    print("=" * 60)
-    print("STEP 1: Loading checkpoint metadata")
-    print("=" * 60)
-    print_gpu_memory("Before loading checkpoint")
-    
-    # Load checkpoint with memory mapping
-    checkpoint = load_checkpoint_metadata_only(args.checkpoint)
+    # Load checkpoint to CPU first
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     print(f"✓ Checkpoint loaded")
-    print(f"  Keys in checkpoint: {list(checkpoint.keys())}")
+    print(f"  Keys: {list(checkpoint.keys())}\n")
     
+    # Get configs
     encoder_config = checkpoint.get('encoder_config')
     if isinstance(encoder_config, dict):
         encoder_config = EncoderConfig(**encoder_config)
@@ -81,161 +41,58 @@ def main():
     if isinstance(decoder_config, dict):
         decoder_config = ModelConfig(**decoder_config)
     
-    print(f"Encoder config: {encoder_config.hidden_size}d, {encoder_config.num_hidden_layers} layers")
-    print(f"Decoder config: {decoder_config.hidden_size}d, {decoder_config.num_hidden_layers} layers")
+    print(f"Encoder: {encoder_config.hidden_size}d, {encoder_config.num_hidden_layers} layers")
+    print(f"Decoder: {decoder_config.hidden_size}d, {decoder_config.num_hidden_layers} layers\n")
     
-    # STEP 2: Create models and load weights efficiently
-    print("\n" + "=" * 60)
-    print("STEP 2: Creating and loading models")
-    print("=" * 60)
-    print_gpu_memory("Before creating models")
+    # Create encoder
+    print("Creating encoder...")
+    encoder = BidirectionalEncoder(encoder_config, device='cpu')
+    if 'encoder' in checkpoint:
+        encoder.load_state_dict(checkpoint['encoder'])
+        del checkpoint['encoder']
+    encoder = encoder.to(device=device, dtype=dtype)
+    print(f"✓ Encoder loaded: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params")
     
-    if ACCELERATE_AVAILABLE:
-        print("🚀 Using Accelerate for memory-efficient loading\n")
-        
-        # NOTE: Accelerate's load_checkpoint_in_model expects a file path, not state dict
-        # So we'll use init_empty_weights + manual loading for better memory efficiency
-        
-        # Create encoder with empty weights (no memory allocated)
-        print("Creating encoder with empty weights...")
-        with init_empty_weights():
-            encoder = BidirectionalEncoder(encoder_config, device='meta')
-        print(f"  Encoder params: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M (meta device)")
-        
-        # Load encoder weights directly to target device/dtype
-        if 'encoder' in checkpoint:
-            print("Loading encoder weights to GPU...")
-            # Load state dict directly with target device/dtype
-            encoder_state = checkpoint['encoder']
-            
-            # Move model to device first (creates actual tensors)
-            encoder = encoder.to_empty(device=device)
-            
-            # Load weights piece by piece to target device/dtype
-            for name, param in encoder.named_parameters():
-                if name in encoder_state:
-                    param.data.copy_(encoder_state[name].to(device=device, dtype=dtype))
-            
-            for name, buffer in encoder.named_buffers():
-                if name in encoder_state:
-                    buffer.data.copy_(encoder_state[name].to(device=device, dtype=dtype))
-            
-            print(f"✓ Encoder loaded to {device} with {dtype}")
-            print_gpu_memory("After loading encoder")
-            
-            # Free encoder weights from CPU memory
-            del checkpoint['encoder']
-            del encoder_state
-            torch.cuda.empty_cache() 
-        
-        # Create decoder with empty weights
-        print("\nCreating decoder with empty weights...")
-        with init_empty_weights():
-            decoder = Transformer(decoder_config, device='meta')
-        print(f"  Decoder params: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M (meta device)")
-        
-        # Load decoder weights directly to target device/dtype
-        if 'decoder' in checkpoint:
-            print("Loading decoder weights to GPU...")
-            decoder_state = checkpoint['decoder']
-            
-            # Move model to device first
-            decoder = decoder.to_empty(device=device)
-            
-            # Load weights piece by piece to target device/dtype
-            for name, param in decoder.named_parameters():
-                if name in decoder_state:
-                    param.data.copy_(decoder_state[name].to(device=device, dtype=dtype))
-            
-            for name, buffer in decoder.named_buffers():
-                if name in decoder_state:
-                    buffer.data.copy_(decoder_state[name].to(device=device, dtype=dtype))
-            
-            print(f"✓ Decoder loaded to {device} with {dtype}")
-            print_gpu_memory("After loading decoder")
-            
-            # Free decoder weights from CPU memory
-            del checkpoint['decoder']
-            del decoder_state
-            torch.cuda.empty_cache()
-            
-    else:
-        print("📦 Using standard PyTorch loading\n")
-        
-        # Load encoder directly to target device
-        print("Creating and loading encoder...")
-        encoder = BidirectionalEncoder(encoder_config, device='cpu')
-        
-        if 'encoder' in checkpoint:
-            encoder.load_state_dict(checkpoint['encoder'], strict=True)
-            del checkpoint['encoder']
-            
-        encoder = encoder.to(device=device, dtype=dtype)
-        print(f"✓ Encoder: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params")
-        print_gpu_memory("After loading encoder")
-        
-        torch.cuda.empty_cache()
-        
-        # Load decoder directly to target device
-        print("\nCreating and loading decoder...")
-        decoder = Transformer(decoder_config, device='cpu')
-        
-        if 'decoder' in checkpoint:
-            decoder.load_state_dict(checkpoint['decoder'], strict=True)
-            del checkpoint['decoder']
-            
-        decoder = decoder.to(device=device, dtype=dtype)
-        print(f"✓ Decoder: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params")
-        print_gpu_memory("After loading decoder")
-        
-        torch.cuda.empty_cache()
+    # Create decoder
+    print("Creating decoder...")
+    decoder = Transformer(decoder_config, device='cpu')
+    if 'decoder' in checkpoint:
+        decoder.load_state_dict(checkpoint['decoder'])
+        del checkpoint['decoder']
+    decoder = decoder.to(device=device, dtype=dtype)
+    print(f"✓ Decoder loaded: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params\n")
     
-    # STEP 3: Clean up checkpoint
-    print("\n" + "=" * 60)
-    print("STEP 3: Cleaning up checkpoint")
-    print("=" * 60)
-    
+    # Cleanup
     checkpoint.clear()
     del checkpoint
-    import gc
-    gc.collect()
     torch.cuda.empty_cache()
     
-    print("✓ Checkpoint deleted from memory")
-    print_gpu_memory("After cleanup")
-    
-    # STEP 4: Test inference
-    print("\n" + "=" * 60)
-    print("STEP 4: Testing inference on MS MARCO")
-    print("=" * 60)
+    # Get tokenizer
+    tokenizer = get_tokenizer()
     
     encoder.eval()
     decoder.eval()
     
-    # Load one example from MS MARCO
-    print("Loading MS MARCO dataset...")
-    dataset = load_dataset("ms_marco", "v2.1", split="validation", streaming=True)
+    return encoder, decoder, tokenizer
+
+
+def run_inference(encoder, decoder, tokenizer, context, question, device='cuda:0', max_tokens=50):
+    """
+    Run inference on a context-question pair.
     
-    # Get first example
-    example = next(iter(dataset))
+    Args:
+        encoder: Encoder model
+        decoder: Decoder model
+        tokenizer: Tokenizer
+        context: Context text
+        question: Question text
+        device: Device to run on
+        max_tokens: Maximum tokens to generate
     
-    # Extract data
-    if 'passages' in example and 'query' in example:
-        passages = example['passages']
-        if isinstance(passages, dict) and 'passage_text' in passages:
-            context = passages['passage_text'][0] if isinstance(passages['passage_text'], list) else passages['passage_text']
-        else:
-            context = "This is a test context."
-        
-        question = example['query']
-    else:
-        context = "This is a test context."
-        question = "What is this?"
-    
-    print(f"\nContext: {context[:100]}...")
-    print(f"Question: {question}")
-    
-    # Tokenize
+    Returns:
+        Generated answer text
+    """
+    # Tokenize inputs
     context_tokens = tokenizer.encode(context)[:256]
     question_tokens = tokenizer.encode(question)[:64]
     
@@ -247,34 +104,95 @@ def main():
     ctx_tokens = c_marker + context_tokens + sep_marker + question_tokens
     ctx_tensor = torch.tensor(ctx_tokens, dtype=torch.long, device=device)
     
-    # Build decoder input: Question <A>
-    qa_tokens = question_tokens + a_marker
-    qa_tensor = torch.tensor(qa_tokens, dtype=torch.long, device=device)
-    
-    print(f"\nEncoding context ({len(ctx_tokens)} tokens)...")
-    print_gpu_memory("Before encoding")
-    
+    # Encode context
     with torch.no_grad():
         encoder_k, encoder_v = encoder(ctx_tensor, return_encoder_kv=True)
-        print(f"✓ Encoder output: K={encoder_k.shape}, V={encoder_v.shape}")
-        print_gpu_memory("After encoding")
-        
-        print("\nDecoding answer...")
-        decoder.reset_context()
-        logits = decoder(qa_tensor, encoder_k=encoder_k, encoder_v=encoder_v)
-        print(f"✓ Decoder output: {logits.shape}")
-        print_gpu_memory("After decoding")
-        
-        # Generate next token
-        next_token = logits[-1].argmax().item()
-        next_word = tokenizer.decode([next_token])
-        
-        print(f"\nGenerated next token: {next_word}")
     
-    print("\n" + "=" * 60)
-    print("✓ INFERENCE TEST COMPLETED SUCCESSFULLY")
-    print("=" * 60)
-    print_gpu_memory("Final")
+    # Build initial decoder input: Question <A>
+    current_tokens = question_tokens + a_marker
+    
+    # Generate tokens autoregressively
+    generated_tokens = []
+    
+    with torch.no_grad():
+        for _ in range(max_tokens):
+            # Create tensor for current sequence
+            qa_tensor = torch.tensor(current_tokens, dtype=torch.long, device=device)
+            
+            # Decode
+            decoder.reset_context()
+            logits = decoder(qa_tensor, encoder_k=encoder_k, encoder_v=encoder_v)
+            
+            # Get next token
+            next_token = logits[-1].argmax().item()
+            
+            # Check for end token or padding
+            if next_token == 0 or next_token == tokenizer.encode("<|endoftext|>")[0]:
+                break
+            
+            # Add to sequence
+            generated_tokens.append(next_token)
+            current_tokens.append(next_token)
+    
+    # Decode generated tokens
+    answer = tokenizer.decode(generated_tokens)
+    return answer
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file")
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--max_tokens", type=int, default=50, help="Max tokens to generate")
+    args = parser.parse_args()
+    
+    # Convert dtype string to torch dtype
+    dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    dtype = dtype_map[args.dtype]
+    
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    
+    # Load model
+    encoder, decoder, tokenizer = load_model_from_checkpoint(args.checkpoint, device, dtype)
+    
+    # Load MS MARCO dataset
+    print("="*60)
+    print("Loading MS MARCO dataset...")
+    print("="*60)
+    dataset = load_dataset("ms_marco", "v2.1", split="validation", streaming=True)
+    
+    # Get first example
+    example = next(iter(dataset))
+    
+    # Extract context and question
+    if 'passages' in example and 'query' in example:
+        passages = example['passages']
+        if isinstance(passages, dict) and 'passage_text' in passages:
+            context = passages['passage_text'][0] if isinstance(passages['passage_text'], list) else passages['passage_text']
+        else:
+            context = "This is a test context about machine learning and AI."
+        question = example['query']
+    else:
+        context = "Machine learning is a subset of artificial intelligence."
+        question = "What is machine learning?"
+    
+    print(f"\nContext: {context[:200]}...")
+    print(f"Question: {question}\n")
+    
+    # Run inference
+    print("="*60)
+    print("Generating answer...")
+    print("="*60)
+    
+    answer = run_inference(encoder, decoder, tokenizer, context, question, device, args.max_tokens)
+    
+    print(f"\n{'='*60}")
+    print(f"RESULT")
+    print(f"{'='*60}")
+    print(f"Question: {question}")
+    print(f"Answer: {answer}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
