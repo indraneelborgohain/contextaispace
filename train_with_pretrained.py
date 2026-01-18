@@ -1617,14 +1617,17 @@ def main():
         
         iter_num += 1
     
-    # Save final model
+    # Save final model (lightweight - model weights only, no checkpoint data)
     final_path = os.path.join(args.out_dir, "final_model.pt")
     torch.save({
         'encoder': encoder.state_dict(),
         'decoder': decoder.state_dict(),
         'encoder_config': encoder_config,
+        'decoder_config': decoder_config,
     }, final_path)
-    print(f"\nTraining complete! Final model saved to {final_path}")
+    final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
+    print(f"\nTraining complete! Final model saved to {final_path} ({final_size_mb:.1f} MB)")
+    print(f"Note: final_model.pt contains model weights only (no optimizer/checkpoint data)")
     
     if writer:
         writer.close()
