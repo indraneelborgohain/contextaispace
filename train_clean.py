@@ -239,16 +239,42 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.n_vocab
     
-    # Create encoder config (medium: bert-large compatible)
-    encoder_config = EncoderConfig(
-        vocab_size=vocab_size,
-        hidden_size=1024,
-        num_hidden_layers=12,
-        num_attention_heads=16,
-        num_key_value_heads=16
-    )
+    # Load BERT model first to get actual config
+    print("Loading BERT model to extract config...")
+    try:
+        from transformers import AutoModel
+        bert_model = AutoModel.from_pretrained(bert_model)
+        bert_config = bert_model.config
+        
+        # Create encoder config from BERT's actual config
+        encoder_config = EncoderConfig(
+            vocab_size=vocab_size,
+            hidden_size=bert_config.hidden_size,
+            num_hidden_layers=bert_config.num_hidden_layers,
+            num_attention_heads=bert_config.num_attention_heads,
+            num_key_value_heads=bert_config.num_attention_heads,  # BERT uses MHA
+            intermediate_size=bert_config.intermediate_size
+        )
+        
+        print(f"✓ Extracted config from BERT:")
+        print(f"  Hidden size: {bert_config.hidden_size}")
+        print(f"  Layers: {bert_config.num_hidden_layers}")
+        print(f"  Attention heads: {bert_config.num_attention_heads}")
+        print(f"  Intermediate size: {bert_config.intermediate_size}\n")
+        
+    except ImportError:
+        print("⚠️  transformers not installed, using default medium config")
+        encoder_config = EncoderConfig(
+            vocab_size=vocab_size,
+            hidden_size=1024,
+            num_hidden_layers=12,
+            num_attention_heads=16,
+            num_key_value_heads=16
+        )
+        bert_model = None
     
     # Create decoder config (medium: GPT-OSS compatible)
+    # Use encoder's actual hidden size for cross-attention compatibility
     decoder_config = ModelConfig(
         vocab_size=vocab_size,
         hidden_size=2880,
@@ -257,17 +283,81 @@ def main():
         num_attention_heads=64,
         num_key_value_heads=64,
         use_encoder_decoder_cross_attention=True,
-        encoder_hidden_size=1024
+        encoder_hidden_size=encoder_config.hidden_size  # Use actual encoder hidden size
     )
     
     print(f"Encoder config: {encoder_config.hidden_size}d, {encoder_config.num_hidden_layers} layers")
     print(f"Decoder config: {decoder_config.hidden_size}d, {decoder_config.num_hidden_layers} layers\n")
     
-    # Load encoder from BERT
-    encoder = load_bert_encoder(encoder_config, bert_model, device)
-    if encoder is None:
-        print("Failed to load BERT, creating random encoder")
+    # Load encoder from BERT (reuse loaded BERT model if available)
+    if bert_model is not None:
+        print("Loading BERT weights into encoder...")
         encoder = BidirectionalEncoder(encoder_config, device=device)
+        encoder_state = encoder.state_dict()
+        bert_state = bert_model.state_dict()
+        loaded_count = 0
+        
+        # Load embeddings
+        if 'embeddings.word_embeddings.weight' in bert_state:
+            bert_emb = bert_state['embeddings.word_embeddings.weight']
+            enc_emb = encoder_state['embedding.weight']
+            if enc_emb.shape == bert_emb.shape:
+                encoder_state['embedding.weight'] = bert_emb.to(device)
+                loaded_count += 1
+        
+        # Load encoder layers
+        for layer_idx in range(encoder_config.num_hidden_layers):
+            bert_prefix = f'encoder.layer.{layer_idx}'
+            enc_prefix = f'blocks.{layer_idx}'
+            
+            # Load attention QKV
+            if f'{bert_prefix}.attention.self.query.weight' in bert_state:
+                q_weight = bert_state[f'{bert_prefix}.attention.self.query.weight']
+                k_weight = bert_state[f'{bert_prefix}.attention.self.key.weight']
+                v_weight = bert_state[f'{bert_prefix}.attention.self.value.weight']
+                q_bias = bert_state[f'{bert_prefix}.attention.self.query.bias']
+                k_bias = bert_state[f'{bert_prefix}.attention.self.key.bias']
+                v_bias = bert_state[f'{bert_prefix}.attention.self.value.bias']
+                
+                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+                
+                encoder_state[f'{enc_prefix}.attn.qkv.weight'] = qkv_weight.to(device)
+                encoder_state[f'{enc_prefix}.attn.qkv.bias'] = qkv_bias.to(device)
+                loaded_count += 2
+            
+            # Load attention output
+            if f'{bert_prefix}.attention.output.dense.weight' in bert_state:
+                encoder_state[f'{enc_prefix}.attn.out.weight'] = bert_state[f'{bert_prefix}.attention.output.dense.weight'].to(device)
+                encoder_state[f'{enc_prefix}.attn.out.bias'] = bert_state[f'{bert_prefix}.attention.output.dense.bias'].to(device)
+                loaded_count += 2
+            
+            # Load FFN
+            if f'{bert_prefix}.intermediate.dense.weight' in bert_state:
+                encoder_state[f'{enc_prefix}.mlp.fc1.weight'] = bert_state[f'{bert_prefix}.intermediate.dense.weight'].to(device)
+                encoder_state[f'{enc_prefix}.mlp.fc1.bias'] = bert_state[f'{bert_prefix}.intermediate.dense.bias'].to(device)
+                loaded_count += 2
+            
+            if f'{bert_prefix}.output.dense.weight' in bert_state:
+                encoder_state[f'{enc_prefix}.mlp.fc2.weight'] = bert_state[f'{bert_prefix}.output.dense.weight'].to(device)
+                encoder_state[f'{enc_prefix}.mlp.fc2.bias'] = bert_state[f'{bert_prefix}.output.dense.bias'].to(device)
+                loaded_count += 2
+        
+        # Load state into encoder
+        for name, param in encoder.named_parameters():
+            if name in encoder_state:
+                param.data.copy_(encoder_state[name])
+        for name, buf in encoder.named_buffers():
+            if name in encoder_state:
+                buf.data.copy_(encoder_state[name])
+        
+        print(f"✓ Loaded {loaded_count} parameters from BERT")
+        del bert_model, bert_state  # Free memory
+    else:
+        encoder = load_bert_encoder(encoder_config, bert_model, device)
+        if encoder is None:
+            print("Failed to load BERT, creating random encoder")
+            encoder = BidirectionalEncoder(encoder_config, device=device)
     
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M\n")
     
