@@ -903,6 +903,48 @@ class BidirectionalEncoder(nn.Module):
         # The cross-attention output becomes both K and V for the decoder
         # This is the "question-aware context representation"
         return encoder_output, encoder_output
+    
+    def _compress_with_svd(self, X: torch.Tensor, n_components: int) -> torch.Tensor:
+        """
+        Compress tensor using SVD to keep top n_components.
+        
+        Args:
+            X: Input tensor (seq_len, hidden_size)
+            n_components: Number of components to keep (target seq_len)
+        
+        Returns:
+            Compressed tensor (n_components, hidden_size)
+        """
+        seq_len, hidden_size = X.shape
+        
+        # If already smaller or equal, just return (possibly padded)
+        if seq_len <= n_components:
+            if seq_len < n_components:
+                # Pad with zeros
+                padding = torch.zeros(
+                    n_components - seq_len,
+                    hidden_size,
+                    dtype=X.dtype,
+                    device=X.device
+                )
+                return torch.cat([X, padding], dim=0)
+            return X
+        
+        # Perform SVD: X = U @ S @ V^T
+        # X: (seq_len, hidden_size)
+        # We want to reduce seq_len dimension
+        U, S, Vh = torch.linalg.svd(X, full_matrices=False)  # U: (seq_len, min(seq_len, hidden_size)), S: (min(seq_len, hidden_size),), Vh: (min(seq_len, hidden_size), hidden_size)
+        
+        # Keep top n_components
+        U_reduced = U[:, :n_components]  # (seq_len, n_components)
+        S_reduced = S[:n_components]  # (n_components,)
+        
+        # Reconstruct with reduced dimensions
+        # We want output of shape (n_components, hidden_size)
+        # X_compressed = U_reduced.T @ X
+        X_compressed = U_reduced.T @ X  # (n_components, hidden_size)
+        
+        return X_compressed
 
 
 class EncoderForMaskedLM(nn.Module):
