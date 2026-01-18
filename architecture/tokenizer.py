@@ -23,6 +23,9 @@ def get_tokenizer():
             "<|reserved_200010|>": 200010,
             "<|reserved_200011|>": 200011,
             "<|call|>": 200012,
+            "<C>": 200088,
+            "<SEP>": 200089,
+            "<A>": 200090,
         } | {
             f"<|reserved_{i}|>": i for i in range(200013, 201088)
         },

@@ -322,7 +322,7 @@ def main():
     
     best_val_loss = float('inf')
     train_idx = 0
-    sep_token_id = tokenizer.special_tokens['<SEP>']
+    sep_token_id = tokenizer.encode("<SEP>", allowed_special={'<SEP>'})[0]
     
     for it in range(max_iters):
         # Get learning rates
@@ -460,12 +460,14 @@ def main():
                     
                     # Generate
                     generated = []
-                    current_token = torch.tensor([tokenizer.special_tokens.get('<A>', 0)], dtype=torch.long, device=device)
+                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                    current_token = torch.tensor([a_token_id], dtype=torch.long, device=device)
                     
+                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                     for _ in range(64):
                         logits = decoder(current_token, encoder_k=encoder_k, encoder_v=encoder_v)
                         next_token = torch.argmax(logits[-1], dim=-1).item()
-                        if next_token == tokenizer.special_tokens.get('<|endoftext|>', 0):
+                        if next_token == end_token_id:
                             break
                         generated.append(next_token)
                         current_token = torch.cat([current_token, torch.tensor([next_token], dtype=torch.long, device=device)])
