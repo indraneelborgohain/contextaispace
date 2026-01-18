@@ -32,14 +32,47 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda:0', dtype=torch.bfl
     print(f"✓ Checkpoint loaded")
     print(f"  Keys: {list(checkpoint.keys())}\n")
     
+    # Get tokenizer first (needed for vocab size)
+    tokenizer = get_tokenizer()
+    vocab_size = tokenizer.n_vocab
+    
     # Get configs
     encoder_config = checkpoint.get('encoder_config')
     if isinstance(encoder_config, dict):
         encoder_config = EncoderConfig(**encoder_config)
     
+    # If no encoder config, use medium default
+    if encoder_config is None:
+        print("⚠️  No encoder_config in checkpoint, using medium default")
+        encoder_config = EncoderConfig(
+            vocab_size=vocab_size, 
+            hidden_size=1024, 
+            num_hidden_layers=12,
+            num_attention_heads=16, 
+            num_key_value_heads=16
+        )
+    
     decoder_config = checkpoint.get('decoder_config')
+    if decoder_config is None:
+        # Try alternate key
+        decoder_config = checkpoint.get('config')
+    
     if isinstance(decoder_config, dict):
         decoder_config = ModelConfig(**decoder_config)
+    
+    # If no decoder config, use medium default
+    if decoder_config is None:
+        print("⚠️  No decoder_config in checkpoint, using medium default")
+        decoder_config = ModelConfig(
+            vocab_size=vocab_size,
+            hidden_size=2880,
+            num_hidden_layers=24,
+            num_experts=32,
+            num_attention_heads=64,
+            num_key_value_heads=64,
+            use_encoder_decoder_cross_attention=True,
+            encoder_hidden_size=1024
+        )
     
     print(f"Encoder: {encoder_config.hidden_size}d, {encoder_config.num_hidden_layers} layers")
     print(f"Decoder: {decoder_config.hidden_size}d, {decoder_config.num_hidden_layers} layers\n")
@@ -66,9 +99,6 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda:0', dtype=torch.bfl
     checkpoint.clear()
     del checkpoint
     torch.cuda.empty_cache()
-    
-    # Get tokenizer
-    tokenizer = get_tokenizer()
     
     encoder.eval()
     decoder.eval()
