@@ -346,9 +346,12 @@ def main():
             answer = example['answer'][:max_qa_len]
             
             # Tokenize
-            context_tokens = tokenizer.encode(context, bos=False, eos=False)[:max_context_len]
-            question_tokens = tokenizer.encode(question, bos=False, eos=False)[:max_qa_len]
-            answer_tokens = tokenizer.encode(answer, bos=False, eos=True)[:max_qa_len]
+            context_tokens = tokenizer.encode(context)[:max_context_len]
+            question_tokens = tokenizer.encode(question)[:max_qa_len]
+            answer_tokens = tokenizer.encode(answer)[:max_qa_len]
+            # Add EOS token to answer
+            end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+            answer_tokens = answer_tokens + [end_token_id]
             
             # Create encoder input: context <SEP> question
             encoder_input = torch.tensor(
@@ -415,9 +418,12 @@ def main():
                     answer = example['answer'][:max_qa_len]
                     
                     # Tokenize
-                    context_tokens = tokenizer.encode(context, bos=False, eos=False)[:max_context_len]
-                    question_tokens = tokenizer.encode(question, bos=False, eos=False)[:max_qa_len]
-                    answer_tokens = tokenizer.encode(answer, bos=False, eos=True)[:max_qa_len]
+                    context_tokens = tokenizer.encode(context)[:max_context_len]
+                    question_tokens = tokenizer.encode(question)[:max_qa_len]
+                    answer_tokens = tokenizer.encode(answer)[:max_qa_len]
+                    # Add EOS token to answer
+                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                    answer_tokens = answer_tokens + [end_token_id]
                     
                     # Encode
                     encoder_input = torch.tensor(
@@ -450,8 +456,8 @@ def main():
             print(f"Ground Truth: {example['answer']}")
             
             # Generate
-            context_tokens = tokenizer.encode(example['context'][:max_context_len*4], bos=False, eos=False)[:max_context_len]
-            question_tokens = tokenizer.encode(example['question'][:max_qa_len], bos=False, eos=False)[:max_qa_len]
+            context_tokens = tokenizer.encode(example['context'][:max_context_len*4])[:max_context_len]
+            question_tokens = tokenizer.encode(example['question'][:max_qa_len])[:max_qa_len]
             encoder_input = torch.tensor(context_tokens + [sep_token_id] + question_tokens, dtype=torch.long, device=device)
             
             with torch.no_grad():
