@@ -174,7 +174,7 @@ def main():
     gradient_accumulation_steps = 4
     max_context_len = 256
     max_qa_len = 128
-    max_iters = 10000
+    max_iters = 50000
     eval_interval = 100
     save_every = 500
     log_interval = 10
