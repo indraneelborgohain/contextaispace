@@ -164,8 +164,9 @@ def run_inference(encoder, decoder, tokenizer, context, question, device='cuda:0
             # Get next token
             next_token = logits[-1].argmax().item()
             
-            # Check for end token or padding
-            if next_token == 0 or next_token == tokenizer.encode("<|endoftext|>")[0]:
+            # Check for end token (padding or end of text)
+            # Token 0 is typically padding, token 50256 is <|endoftext|> in GPT-2 tokenizer
+            if next_token == 0 or next_token == 50256:
                 break
             
             # Add to sequence
