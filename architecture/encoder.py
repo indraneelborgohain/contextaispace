@@ -1331,7 +1331,7 @@ class EncoderForClassification(nn.Module):
         # Perform SVD: X = U @ S @ V^T
         # X: (seq_len, hidden_size)
         # We want to reduce seq_len dimension
-        U, S, Vt = torch.svd(X)  # U: (seq_len, seq_len), S: (min(seq_len, hidden_size),), Vt: (hidden_size, hidden_size)
+        U, S, Vh = torch.linalg.svd(X, full_matrices=False)  # U: (seq_len, min(seq_len, hidden_size)), S: (min(seq_len, hidden_size),), Vh: (min(seq_len, hidden_size), hidden_size)
         
         # Keep top n_components
         U_reduced = U[:, :n_components]  # (seq_len, n_components)
