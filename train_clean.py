@@ -415,9 +415,11 @@ def main():
             context_tokens = tokenizer.encode(context)[:max_context_len]
             question_tokens = tokenizer.encode(question)[:max_qa_len]
             answer_tokens = tokenizer.encode(answer)[:max_qa_len]
-            # Add EOS token to answer
+            
+            # Prepend <A> token to answer and add EOS token
+            a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
             end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-            answer_tokens = answer_tokens + [end_token_id]
+            answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
             
             # Create encoder input: context <SEP> question
             encoder_input = torch.tensor(
@@ -426,7 +428,7 @@ def main():
                 device=device
             )
             
-            # Create decoder input/target
+            # Create decoder input/target: <A> answer text -> answer text EOS
             decoder_input = torch.tensor(answer_tokens[:-1], dtype=torch.long, device=device)
             decoder_target = torch.tensor(answer_tokens[1:], dtype=torch.long, device=device)
             
@@ -493,9 +495,11 @@ def main():
                     context_tokens = tokenizer.encode(context)[:max_context_len]
                     question_tokens = tokenizer.encode(question)[:max_qa_len]
                     answer_tokens = tokenizer.encode(answer)[:max_qa_len]
-                    # Add EOS token to answer
+                    
+                    # Prepend <A> token to answer and add EOS token
+                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
                     end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                    answer_tokens = answer_tokens + [end_token_id]
+                    answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
                     
                     # Encode
                     encoder_input = torch.tensor(
