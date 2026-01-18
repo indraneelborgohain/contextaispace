@@ -511,80 +511,45 @@ class Transformer(torch.nn.Module):
         Forward pass with optional encoder-decoder cross-attention.
         
         Process:
-        1. If input is longer than max_seq_len, process in chunks
-        2. Each chunk: self-attention → cross-attention (if encoder K,V provided) → MLP
-        3. Collect context from last token of each chunk
+        1. Process each token individually (chunk size = 1)
+        2. Each token: self-attention → cross-attention (if encoder K,V provided) → MLP
+        3. Update context after each token
         
         Args:
             x: Input token IDs (seq_len,)
             update_context: Whether to update context state after processing
-            max_seq_len: Maximum sequence length per chunk. If None, uses config's sliding_window
+            max_seq_len: Ignored - always process token by token
             encoder_k: Optional encoder keys (enc_seq_len, hidden_size) - SVD compressed
             encoder_v: Optional encoder values (enc_seq_len, hidden_size) - SVD compressed
         
         Note: encoder_k and encoder_v are the SVD-compressed encoder outputs, 
-              used for cross-attention within each decoder chunk.
+              used for cross-attention within each decoder token.
         """
-        if max_seq_len is None:
-            max_seq_len = self.config.sliding_window
-        
         input_len = x.shape[0]
         
-        # If input is longer than max_seq_len, process in chunks
-        if input_len > max_seq_len:
-            all_logits = []
-            all_chunk_outputs = []  # Collect chunk outputs
-            num_chunks = (input_len + max_seq_len - 1) // max_seq_len
+        # Process each token individually
+        all_logits = []
+        
+        for token_idx in range(input_len):
+            # Single token
+            token = x[token_idx:token_idx+1]
             
-            for chunk_idx in range(num_chunks):
-                start_idx = chunk_idx * max_seq_len
-                end_idx = min(start_idx + max_seq_len, input_len)
-                chunk = x[start_idx:end_idx]
-                chunk_len = chunk.shape[0]
-                
-                # Pad chunk if needed
-                if chunk_len < max_seq_len:
-                    padding = torch.zeros(
-                        max_seq_len - chunk_len,
-                        dtype=chunk.dtype,
-                        device=chunk.device
-                    )
-                    chunk_padded = torch.cat([chunk, padding], dim=0)
-                else:
-                    chunk_padded = chunk
-                
-                # First chunk gets start token, subsequent chunks use context from previous
-                is_first_chunk = (chunk_idx == 0)
-                chunk_logits, chunk_output = self._forward_chunk(
-                    chunk_padded, 
-                    update_context=True, 
-                    is_first_chunk=is_first_chunk,
-                    encoder_k=encoder_k,
-                    encoder_v=encoder_v,
-                    return_hidden_states=True
-                )
-                
-                # Only keep outputs for actual tokens (not padding)
-                if chunk_len < max_seq_len:
-                    chunk_logits = chunk_logits[:chunk_len]
-                    chunk_output = chunk_output[:chunk_len]
-                all_logits.append(chunk_logits)
-                all_chunk_outputs.append(chunk_output)
-            
-            logits = torch.cat(all_logits, dim=0)
-            return logits
-        else:
-            # Normal processing for short sequences - this is always a first chunk
-            chunk_logits = self._forward_chunk(
-                x, 
+            # First token gets start token, subsequent tokens use context from previous
+            is_first_chunk = (token_idx == 0)
+            token_logits = self._forward_chunk(
+                token, 
                 update_context=update_context, 
-                is_first_chunk=True,
+                is_first_chunk=is_first_chunk,
                 encoder_k=encoder_k,
                 encoder_v=encoder_v,
                 return_hidden_states=False
             )
             
-            return chunk_logits
+            all_logits.append(token_logits)
+        
+        # Stack all token logits
+        logits = torch.cat(all_logits, dim=0)
+        return logits
     
     def _forward_chunk(
         self, 
