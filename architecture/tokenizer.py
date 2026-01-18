@@ -1,6 +1,17 @@
 import tiktoken
 
 def get_tokenizer():
+    """Get default tiktoken tokenizer (for backward compatibility)."""
+    return get_decoder_tokenizer()
+
+def get_encoder_tokenizer():
+    """Get BERT tokenizer for encoder."""
+    from transformers import BertTokenizer
+    tokenizer = BertTokenizer.from_pretrained("bert-large-uncased")
+    return tokenizer
+
+def get_decoder_tokenizer():
+    """Get tiktoken tokenizer for decoder (GPT-OSS style)."""
     o200k_base = tiktoken.get_encoding("o200k_base")
     tokenizer = tiktoken.Encoding(
         name="o200k_harmony",

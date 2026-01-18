@@ -17,7 +17,7 @@ from datasets import load_dataset
 from architecture.config import ModelConfig
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
 from architecture.transformer import Transformer
-from architecture.tokenizer import get_tokenizer
+from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 
 
 def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
@@ -203,9 +203,15 @@ def main():
     print(f"Effective batch: {batch_size * gradient_accumulation_steps}")
     print("="*60 + "\n")
     
-    # Get tokenizer
-    tokenizer = get_tokenizer()
-    vocab_size = tokenizer.n_vocab
+    # Get tokenizers - separate for encoder and decoder
+    encoder_tokenizer = get_encoder_tokenizer()
+    decoder_tokenizer = get_decoder_tokenizer()
+    
+    encoder_vocab_size = encoder_tokenizer.vocab_size  # BERT vocab: ~30522
+    decoder_vocab_size = decoder_tokenizer.n_vocab      # Tiktoken vocab: ~200000+
+    
+    print(f"Encoder vocab size (BERT): {encoder_vocab_size}")
+    print(f"Decoder vocab size (Tiktoken): {decoder_vocab_size}\n")
     
     # Check if loading from saved model
     if args.model_dir and os.path.exists(args.model_dir):
@@ -235,10 +241,8 @@ def main():
         
         encoder_config = create_encoder_config_from_bert(bert_model_name)
     
-        # Override vocab size to match our tokenizer
-        encoder_config.vocab_size = vocab_size
-        
-        print(f"\n✓ Encoder config created:")
+        # Encoder uses BERT vocab (already set correctly by create_encoder_config_from_bert)
+        # No need to override - BERT tokenizer matches BERT model vocab
         print(f"  Vocab size: {encoder_config.vocab_size}")
         print(f"  Hidden size: {encoder_config.hidden_size}")
         print(f"  Layers: {encoder_config.num_hidden_layers}")
@@ -270,7 +274,7 @@ def main():
         # Original GPT-OSS: 2880 hidden, 12 layers, 64 heads, 32 experts
         # Smaller config: 768 hidden, 6 layers, 12 heads, 8 experts
         decoder_config = ModelConfig(
-            vocab_size=vocab_size,
+            vocab_size=decoder_vocab_size,  # Use tiktoken vocab size
             hidden_size=768,          # Reduced from 2880
             num_hidden_layers=6,      # Reduced from 12
             num_experts=8,            # Reduced from 32
@@ -385,7 +389,6 @@ def main():
     
     best_val_loss = float('inf')
     train_idx = 0
-    sep_token_id = tokenizer.encode("<SEP>", allowed_special={'<SEP>'})[0]
     
     for it in range(max_iters):
         # Get learning rates
@@ -411,14 +414,17 @@ def main():
             question = example['question'][:max_qa_len]
             answer = example['answer'][:max_qa_len]
             
-            # Tokenize
-            context_tokens = tokenizer.encode(context)[:max_context_len]
-            question_tokens = tokenizer.encode(question)[:max_qa_len]
-            answer_tokens = tokenizer.encode(answer)[:max_qa_len]
+            # Tokenize context/question with BERT tokenizer
+            context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
+            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
+            sep_token_id = encoder_tokenizer.sep_token_id
+            
+            # Tokenize answer with decoder tokenizer (tiktoken)
+            answer_tokens = decoder_tokenizer.encode(answer)[:max_qa_len]
             
             # Prepend <A> token to answer and add EOS token
-            a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-            end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+            a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+            end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
             answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
             
             # Create encoder input: context <SEP> question
@@ -451,7 +457,7 @@ def main():
                 
                 # Loss
                 loss = F.cross_entropy(
-                    logits.view(-1, vocab_size),
+                    logits.view(-1, decoder_vocab_size),
                     decoder_target.view(-1)
                 )
                 loss = loss / gradient_accumulation_steps
@@ -491,14 +497,16 @@ def main():
                     question = example['question'][:max_qa_len]
                     answer = example['answer'][:max_qa_len]
                     
-                    # Tokenize
-                    context_tokens = tokenizer.encode(context)[:max_context_len]
-                    question_tokens = tokenizer.encode(question)[:max_qa_len]
-                    answer_tokens = tokenizer.encode(answer)[:max_qa_len]
+                    # Tokenize context/question with BERT tokenizer
+                    context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
+                    question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
+                    
+                    # Tokenize answer with decoder tokenizer
+                    answer_tokens = decoder_tokenizer.encode(answer)[:max_qa_len]
                     
                     # Prepend <A> token to answer and add EOS token
-                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                    a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                    end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                     answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
                     
                     # Encode
@@ -513,7 +521,7 @@ def main():
                     with torch.amp.autocast(device_type='cuda', dtype=dtype):
                         encoder_k, encoder_v = encoder(encoder_input, return_encoder_kv=True, sep_token_id=sep_token_id)
                         logits = decoder(decoder_input, encoder_k=encoder_k, encoder_v=encoder_v)
-                        loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
+                        loss = F.cross_entropy(logits.view(-1, decoder_vocab_size), decoder_target.view(-1))
                     
                     val_loss += loss.item()
             
@@ -531,9 +539,10 @@ def main():
             print(f"Question: {example['question']}")
             print(f"Ground Truth: {example['answer']}")
             
-            # Generate
-            context_tokens = tokenizer.encode(example['context'][:max_context_len*4])[:max_context_len]
-            question_tokens = tokenizer.encode(example['question'][:max_qa_len])[:max_qa_len]
+            # Tokenize with encoder tokenizer
+            context_tokens = encoder_tokenizer.encode(example['context'][:max_context_len*4], add_special_tokens=False)[:max_context_len]
+            question_tokens = encoder_tokenizer.encode(example['question'][:max_qa_len], add_special_tokens=False)[:max_qa_len]
+            sep_token_id = encoder_tokenizer.sep_token_id
             encoder_input = torch.tensor(context_tokens + [sep_token_id] + question_tokens, dtype=torch.long, device=device)
             
             with torch.no_grad():
@@ -544,10 +553,10 @@ def main():
                     # CRITICAL: Reset decoder context before generation
                     decoder.reset_context()
                     
-                    # Generate token by token
+                    # Generate token by token using decoder tokenizer
                     generated = []
-                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                    a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                    end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                     
                     current_token = a_token_id
                     max_gen_len = 64
@@ -581,7 +590,7 @@ def main():
                         generated.append(next_token)
                         current_token = next_token
             
-            generated_text = tokenizer.decode(generated)
+            generated_text = decoder_tokenizer.decode(generated)
             print(f"Generated: {generated_text}")
             print(f"{'='*60}\n")
             
