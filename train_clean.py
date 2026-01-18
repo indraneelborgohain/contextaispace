@@ -560,7 +560,6 @@ def main():
                     
                     current_token = a_token_id
                     max_gen_len = 64
-                    temperature = 0.8
                     
                     for step in range(max_gen_len):
                         # CRITICAL: Pass single token, let decoder handle context internally
@@ -573,15 +572,12 @@ def main():
                             update_context=True  # Update context after each token
                         )
                         
-                        # Get next token with temperature sampling
-                        next_logits = logits[-1] / temperature
-                        probs = F.softmax(next_logits, dim=-1)
-                        
-                        # Sample instead of argmax for better diversity
-                        next_token = torch.multinomial(probs, num_samples=1).item()
+                        # Use greedy decoding (argmax) for deterministic validation
+                        next_token = torch.argmax(logits[-1], dim=-1).item()
                         
                         # Debug first few tokens
                         if step < 5:
+                            probs = F.softmax(logits[-1], dim=-1)
                             print(f"  Gen step {step}: token={next_token}, prob={probs[next_token]:.4f}")
                         
                         if next_token == end_token_id:
