@@ -1472,3 +1472,169 @@ class EncoderForClassification(nn.Module):
         logits = self.classifier(pooled)
         
         return logits
+
+
+def create_encoder_config_from_bert(bert_model_name="bert-large-uncased"):
+    """Create encoder config matching BERT architecture"""
+    from transformers import BertConfig
+    bert_config = BertConfig.from_pretrained(bert_model_name)
+    
+    encoder_config = EncoderConfig(
+        vocab_size=bert_config.vocab_size,                    # 30522
+        hidden_size=bert_config.hidden_size,                  # 1024 for large, 768 for base
+        num_hidden_layers=bert_config.num_hidden_layers,      # 24 for large, 12 for base
+        num_attention_heads=bert_config.num_attention_heads,  # 16 for large, 12 for base
+        num_key_value_heads=bert_config.num_attention_heads,  # Same as num_attention_heads
+        head_dim=bert_config.hidden_size // bert_config.num_attention_heads,  # 64
+        intermediate_size=bert_config.intermediate_size,      # 4096 for large, 3072 for base
+        max_position_embeddings=bert_config.max_position_embeddings,  # 512
+        dropout=bert_config.hidden_dropout_prob,              # 0.1
+        use_moe=False,  # BERT doesn't have MoE
+        num_experts=8,   # Not used when use_moe=False
+        experts_per_token=2,  # Not used when use_moe=False
+    )
+    
+    return encoder_config
+
+
+def load_bert_encoder(encoder_config, bert_model_name, device):
+    """Load BERT weights with proper layer mapping"""
+    print(f"Loading BERT weights from: {bert_model_name}")
+    
+    from transformers import BertModel
+    bert = BertModel.from_pretrained(bert_model_name)
+    bert_state = bert.state_dict()
+    
+    encoder = BidirectionalEncoder(encoder_config, device=device)
+    
+    # Manual weight mapping
+    loaded_count = 0
+    skipped_count = 0
+    
+    # 1. Load embeddings
+    try:
+        encoder.embedding.weight.data.copy_(bert_state['embeddings.word_embeddings.weight'])
+        loaded_count += 1
+        print("✓ Loaded word embeddings")
+    except Exception as e:
+        print(f"⚠️  Could not load embeddings: {e}")
+        skipped_count += 1
+    
+    # 2. Load encoder blocks
+    for layer_idx in range(encoder_config.num_hidden_layers):
+        bert_prefix = f'encoder.layer.{layer_idx}'
+        encoder_block = encoder.blocks[layer_idx]
+        
+        # Attention weights
+        try:
+            # BERT uses: attention.self.query, key, value
+            # Your encoder uses: attn.qkv (combined)
+            
+            # Get BERT's Q, K, V
+            q_weight = bert_state[f'{bert_prefix}.attention.self.query.weight']
+            q_bias = bert_state[f'{bert_prefix}.attention.self.query.bias']
+            k_weight = bert_state[f'{bert_prefix}.attention.self.key.weight']
+            k_bias = bert_state[f'{bert_prefix}.attention.self.key.bias']
+            v_weight = bert_state[f'{bert_prefix}.attention.self.value.weight']
+            v_bias = bert_state[f'{bert_prefix}.attention.self.value.bias']
+            
+            # Concatenate into your qkv format
+            qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+            qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+            
+            encoder_block.attn.qkv.weight.data.copy_(qkv_weight)
+            encoder_block.attn.qkv.bias.data.copy_(qkv_bias)
+            
+            # Attention output projection
+            encoder_block.attn.out.weight.data.copy_(
+                bert_state[f'{bert_prefix}.attention.output.dense.weight']
+            )
+            encoder_block.attn.out.bias.data.copy_(
+                bert_state[f'{bert_prefix}.attention.output.dense.bias']
+            )
+            
+            loaded_count += 4
+            print(f"✓ Loaded layer {layer_idx} attention")
+            
+        except Exception as e:
+            print(f"⚠️  Could not load layer {layer_idx} attention: {e}")
+            skipped_count += 1
+        
+        # FFN/MLP weights (if not using MoE)
+        if not encoder_config.use_moe:
+            try:
+                # BERT: intermediate.dense (expansion), output.dense (projection)
+                # Your encoder: mlp.fc1 (expansion with SwiGLU), mlp.fc2 (projection)
+                
+                # Note: Your fc1 is 2x intermediate_size for SwiGLU
+                # BERT's is just intermediate_size
+                # So we'll duplicate BERT's weights
+                bert_fc1_weight = bert_state[f'{bert_prefix}.intermediate.dense.weight']
+                bert_fc1_bias = bert_state[f'{bert_prefix}.intermediate.dense.bias']
+                
+                # Duplicate for SwiGLU (gate and up projection)
+                fc1_weight = torch.cat([bert_fc1_weight, bert_fc1_weight], dim=0)
+                fc1_bias = torch.cat([bert_fc1_bias, bert_fc1_bias], dim=0)
+                
+                encoder_block.mlp.fc1.weight.data.copy_(fc1_weight)
+                encoder_block.mlp.fc1.bias.data.copy_(fc1_bias)
+                
+                # fc2 maps directly
+                encoder_block.mlp.fc2.weight.data.copy_(
+                    bert_state[f'{bert_prefix}.output.dense.weight']
+                )
+                encoder_block.mlp.fc2.bias.data.copy_(
+                    bert_state[f'{bert_prefix}.output.dense.bias']
+                )
+                
+                loaded_count += 2
+                print(f"✓ Loaded layer {layer_idx} FFN")
+                
+            except Exception as e:
+                print(f"⚠️  Could not load layer {layer_idx} FFN: {e}")
+                skipped_count += 1
+        else:
+            print(f"⚠️  Layer {layer_idx} uses MoE - skipping FFN (will be random)")
+            skipped_count += 1
+        
+        # Layer norms
+        try:
+            # BERT uses LayerNorm, you use RMSNorm
+            # RMSNorm only has scale (weight), no bias
+            # We can copy BERT's LayerNorm weight to RMSNorm scale
+            
+            # Attention norm
+            if hasattr(encoder_block.attn.norm, 'scale'):
+                encoder_block.attn.norm.scale.data.copy_(
+                    bert_state[f'{bert_prefix}.attention.output.LayerNorm.weight']
+                )
+            
+            # MLP norm
+            if hasattr(encoder_block.mlp.norm, 'scale'):
+                encoder_block.mlp.norm.scale.data.copy_(
+                    bert_state[f'{bert_prefix}.output.LayerNorm.weight']
+                )
+            
+            loaded_count += 2
+            print(f"✓ Loaded layer {layer_idx} norms")
+            
+        except Exception as e:
+            print(f"⚠️  Could not load layer {layer_idx} norms: {e}")
+            skipped_count += 1
+    
+    # 3. Final layer norm
+    try:
+        if hasattr(encoder.norm, 'scale'):
+            # BERT has a pooler, but we'll use the last encoder layer norm
+            # Or just skip if it doesn't match
+            print("⚠️  Skipping final norm (architecture difference)")
+            skipped_count += 1
+    except Exception as e:
+        skipped_count += 1
+    
+    print(f"\n{'='*60}")
+    print(f"✓ Successfully loaded {loaded_count} parameter groups")
+    print(f"⚠️  Skipped {skipped_count} parameter groups")
+    print(f"{'='*60}\n")
+    
+    return encoder
