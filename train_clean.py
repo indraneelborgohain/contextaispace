@@ -208,13 +208,16 @@ def main():
     # ========================================
     # STEP 3: Create decoder from GPT-OSS
     # ========================================
+    # Using SMALLER decoder config for GPU memory constraints
+    # Original GPT-OSS: 2880 hidden, 12 layers, 64 heads, 32 experts
+    # Smaller config: 768 hidden, 6 layers, 12 heads, 8 experts
     decoder_config = ModelConfig(
         vocab_size=vocab_size,
-        hidden_size=2880,
-        num_hidden_layers=12,
-        num_experts=32,
-        num_attention_heads=64,
-        num_key_value_heads=64,
+        hidden_size=768,          # Reduced from 2880
+        num_hidden_layers=6,      # Reduced from 12
+        num_experts=8,            # Reduced from 32
+        num_attention_heads=12,   # Reduced from 64
+        num_key_value_heads=12,   # Reduced from 64
         use_encoder_decoder_cross_attention=True,
         encoder_hidden_size=encoder_config.hidden_size
     )
