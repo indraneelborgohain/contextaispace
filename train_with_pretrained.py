@@ -104,6 +104,8 @@ def get_args():
                     choices=["float32", "bfloat16", "float16"], default="bfloat16")
     ap.add_argument("--compile", action="store_true", default=False,
                     help="Use torch.compile for faster training (requires PyTorch 2.0+)")
+    ap.add_argument("--gradient_checkpointing", action="store_true", default=False,
+                    help="Enable gradient checkpointing to save GPU memory (slower but uses less memory)")
     
     # Dataset
     ap.add_argument("--dataset", type=str, default="msmarco",
@@ -246,6 +248,10 @@ def load_bert_weights_partial(encoder, bert_model_name, device):
             if name in encoder_state:
                 buf.data.copy_(encoder_state[name])
         print("Encoder loaded")
+        
+        # Clear GPU cache after loading weights
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
     
     return loaded_count
 
@@ -372,6 +378,11 @@ def load_gpt2_weights_partial(decoder, gpt2_model_name, device, max_layers=None)
     for name, buf in decoder.named_buffers():
         if name in decoder_state:
             buf.data.copy_(decoder_state[name])
+    
+    # Clear GPU cache after loading weights
+    if hasattr(torch.cuda, 'empty_cache'):
+        torch.cuda.empty_cache()
+    
     return loaded_count
 
 
@@ -620,6 +631,10 @@ def load_gptoss_weights_partial(decoder, gptoss_weights_dir, device, max_layers=
             if name in decoder_state:
                 buf.data.copy_(decoder_state[name])
         print("Decoder loaded")
+        
+        # Clear GPU cache after loading weights
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
     
     return loaded_count
 
@@ -709,7 +724,9 @@ def main():
         # Load model weights only (fresh optimizer)
         checkpoint_size_mb = os.path.getsize(args.load_model) / (1024 * 1024)
         print(f"\n📦 Loading model weights from: {args.load_model} ({checkpoint_size_mb:.1f} MB)")
-        checkpoint = torch.load(args.load_model, map_location=device, weights_only=False)
+        # Load to CPU first to avoid OOM (checkpoint + new models would exceed GPU memory)
+        print(f"   → Loading to CPU first to save GPU memory...")
+        checkpoint = torch.load(args.load_model, map_location='cpu', weights_only=False)
         load_optimizer = False
         print(f"   → Will initialize fresh optimizer (continuing from iteration {checkpoint.get('iter', 0)})")
     elif args.resume:
@@ -721,7 +738,9 @@ def main():
             latest = max(checkpoints, key=lambda x: int(x.split('_')[-1].replace('.pt', '')))
             checkpoint_size_mb = os.path.getsize(latest) / (1024 * 1024)
             print(f"\n♻️  Resuming from: {latest} ({checkpoint_size_mb:.1f} MB)")
-            checkpoint = torch.load(latest, map_location=device, weights_only=False)
+            # Load to CPU first to avoid OOM
+            print(f"   → Loading to CPU first to save GPU memory...")
+            checkpoint = torch.load(latest, map_location='cpu', weights_only=False)
             load_optimizer = not args.no_resume_optimizer
             print(f"   → Will skip loading pretrained weights (using checkpoint instead)")
         else:
@@ -729,7 +748,9 @@ def main():
     elif args.checkpoint:
         checkpoint_size_mb = os.path.getsize(args.checkpoint) / (1024 * 1024)
         print(f"\nLoading models from: {args.checkpoint} ({checkpoint_size_mb:.1f} MB)")
-        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        # Load to CPU first to avoid OOM
+        print(f"   → Loading to CPU first to save GPU memory...")
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         load_optimizer = not args.no_resume_optimizer
     
     # Load encoder config
@@ -762,8 +783,13 @@ def main():
     
     # Only load encoder weights from checkpoint if NOT using BERT
     if checkpoint and not args.bert_model and 'encoder' in checkpoint:
-        encoder.load_state_dict(checkpoint['encoder'])
+        # Load state dict and move to device (checkpoint is on CPU)
+        encoder_state = checkpoint['encoder']
+        # Move state dict tensors to device
+        encoder_state = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in encoder_state.items()}
+        encoder.load_state_dict(encoder_state)
         print(f"✓ Loaded encoder from checkpoint ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
+        del encoder_state  # Free memory
     else:
         print(f"✓ Initialized encoder ({sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params)")
     
@@ -844,7 +870,8 @@ def main():
     if args.decoder_checkpoint:
         # Load from separate decoder checkpoint
         print(f"\nLoading decoder from: {args.decoder_checkpoint}")
-        decoder_ckpt = torch.load(args.decoder_checkpoint, map_location=device, weights_only=False)
+        # Load to CPU first
+        decoder_ckpt = torch.load(args.decoder_checkpoint, map_location='cpu', weights_only=False)
         
         # Handle different checkpoint formats
         if 'decoder' in decoder_ckpt:
@@ -856,18 +883,26 @@ def main():
             decoder_state = decoder_ckpt
         
         try:
+            # Move state dict to device
+            decoder_state = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in decoder_state.items()}
             decoder.load_state_dict(decoder_state, strict=False)
             print(f"✓ Loaded decoder from {args.decoder_checkpoint} ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+            del decoder_state, decoder_ckpt  # Free memory
             decoder_loaded = True
         except RuntimeError as e:
             print(f"❌ Error loading decoder from {args.decoder_checkpoint}: {str(e)[:200]}")
             print(f"⚠️  Continuing with randomly initialized decoder")
+            del decoder_ckpt  # Free memory even on error
     
     elif checkpoint and 'decoder' in checkpoint:
         # Load from full checkpoint
         try:
-            decoder.load_state_dict(checkpoint['decoder'], strict=True)
+            # Move decoder state dict to device (checkpoint is on CPU)
+            decoder_state = checkpoint['decoder']
+            decoder_state = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in decoder_state.items()}
+            decoder.load_state_dict(decoder_state, strict=True)
             print(f"✓ Loaded decoder from checkpoint ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+            del decoder_state  # Free memory
             decoder_loaded = True
         except RuntimeError as e:
             print(f"❌ Error loading decoder weights:")
@@ -879,6 +914,16 @@ def main():
     
     if not decoder_loaded:
         print(f"✓ Initialized decoder ({sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params)")
+    
+    # Delete checkpoint from memory (we've extracted what we need)
+    if checkpoint is not None:
+        # Keep only config data if needed, delete state dicts
+        if 'encoder' in checkpoint:
+            del checkpoint['encoder']
+        if 'decoder' in checkpoint:
+            del checkpoint['decoder']
+        if 'optimizer' in checkpoint and not load_optimizer:
+            del checkpoint['optimizer']
     
     # Clear GPU cache after loading large models
     if 'cuda' in str(device):
@@ -892,6 +937,14 @@ def main():
         encoder = encoder.to(device)
     elif args.bert_model and checkpoint:
         print(f"⚠️  Skipping BERT weight loading (using checkpoint weights instead)")
+    
+    # Enable gradient checkpointing if requested (saves memory)
+    if args.gradient_checkpointing:
+        if hasattr(encoder, 'gradient_checkpointing_enable'):
+            encoder.gradient_checkpointing_enable()
+            print(f"✓ Enabled gradient checkpointing for encoder")
+        else:
+            print(f"⚠️  Encoder does not support gradient checkpointing")
     
     # Optionally load GPT-2 weights for decoder (skip if resuming - checkpoint already has weights)
     if args.gpt2_model and not (checkpoint and 'decoder' in checkpoint):
@@ -909,9 +962,18 @@ def main():
     elif args.gptoss_weights and checkpoint:
         print(f"⚠️  Skipping GPT-OSS weight loading (using checkpoint weights instead)")
     
+    # Enable gradient checkpointing if requested (saves memory)
+    if args.gradient_checkpointing:
+        if hasattr(decoder, 'gradient_checkpointing_enable'):
+            decoder.gradient_checkpointing_enable()
+            print(f"✓ Enabled gradient checkpointing for decoder")
+        else:
+            print(f"⚠️  Decoder does not support gradient checkpointing")
+    
     # Clear GPU cache after all model loading
     if 'cuda' in str(device):
         torch.cuda.empty_cache()
+        print(f"🧹 Cleared GPU cache after all model loading")
     
     # Setup optimizer with different learning rates
     encoder_params = list(encoder.parameters())
@@ -950,8 +1012,16 @@ def main():
     # Restore optimizer state from checkpoint (unless disabled to save memory)
     if checkpoint and 'optimizer' in checkpoint and load_optimizer:
         try:
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            # Move optimizer state to device
+            optimizer_state = checkpoint['optimizer']
+            # Move tensors in optimizer state to GPU
+            for state in optimizer_state.get('state', {}).values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+            optimizer.load_state_dict(optimizer_state)
             print(f"✓ Restored optimizer state (momentum/variance)")
+            del optimizer_state  # Free memory
         except Exception as e:
             print(f"⚠️  Failed to load optimizer state: {e}")
             print(f"   Continuing with fresh optimizer (momentum reset)")
@@ -960,6 +1030,14 @@ def main():
         print(f"   This saves GPU memory but resets Adam momentum/variance")
     elif checkpoint:
         print(f"⚠️  No optimizer state in checkpoint")
+    
+    # Delete remaining checkpoint data from memory
+    if checkpoint is not None:
+        del checkpoint
+        checkpoint = None
+        if 'cuda' in str(device):
+            torch.cuda.empty_cache()
+            print(f"🧹 Deleted checkpoint from memory and cleared cache")
     
     # TensorBoard
     writer = None
@@ -1236,6 +1314,15 @@ def main():
     encoder.train()
     decoder.train()
     
+    # Show GPU memory usage before training
+    if 'cuda' in str(device):
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated(device) / (1024**3)
+        reserved = torch.cuda.memory_reserved(device) / (1024**3)
+        print(f"\n📊 GPU Memory before training:")
+        print(f"   Allocated: {allocated:.2f} GB")
+        print(f"   Reserved: {reserved:.2f} GB")
+    
     # Restore training state from checkpoint
     iter_num = checkpoint.get('iter', 0) if checkpoint else 0
     best_val_loss = checkpoint.get('best_val_loss', float('inf')) if checkpoint else float('inf')
@@ -1318,7 +1405,7 @@ def main():
             total_loss += loss
             
             # Clear intermediate tensors to save memory
-            del encoder_k, encoder_v, logits, loss_mask, ce_loss, masked_loss
+            del encoder_k, encoder_v, logits, loss_mask, ce_loss, masked_loss, loss
         
         # Average loss over batch (still a tensor, like train_msmarco)
         loss = total_loss / batch_ctx.shape[0]
@@ -1347,13 +1434,9 @@ def main():
             # Reset accumulation counter
             accum_step = 0
             
-            # Clear cache after optimizer step
+            # Clear cache after every optimizer step (more aggressive)
             if 'cuda' in str(device):
                 torch.cuda.empty_cache()
-        
-        # Clear GPU cache periodically
-        if (iter_num + 1) % 10 == 0:
-            torch.cuda.empty_cache()
         
         # Logging (get loss value before deleting)
         loss_val = loss.item()
@@ -1368,14 +1451,20 @@ def main():
             t1 = time.time()
             dt = t1 - t0
             
+            # Monitor GPU memory
+            mem_info = ""
+            if 'cuda' in str(device):
+                allocated = torch.cuda.memory_allocated(device) / (1024**3)
+                mem_info = f" | mem {allocated:.2f}GB"
+            
             if use_three_tier:
                 custom_lr = optimizer.param_groups[2]['lr']
                 print(f"iter {iter_num + 1:5d} | loss {avg_loss:.4f} | "
                       f"enc_lr {encoder_lr:.2e} | dec_lr {decoder_lr:.2e} | "
-                      f"custom_lr {custom_lr:.2e} | {dt*1000:.2f}ms")
+                      f"custom_lr {custom_lr:.2e} | {dt*1000:.2f}ms{mem_info}")
             else:
                 print(f"iter {iter_num + 1:5d} | loss {avg_loss:.4f} | "
-                      f"enc_lr {encoder_lr:.2e} | dec_lr {decoder_lr:.2e} | {dt*1000:.2f}ms")
+                      f"enc_lr {encoder_lr:.2e} | dec_lr {decoder_lr:.2e} | {dt*1000:.2f}ms{mem_info}")
             
             if writer:
                 writer.add_scalar('Loss/train', avg_loss, iter_num + 1)
@@ -1392,6 +1481,10 @@ def main():
         if (iter_num + 1) % args.eval_interval == 0:
             encoder.eval()
             decoder.eval()
+            
+            # Clear cache before validation
+            if 'cuda' in str(device):
+                torch.cuda.empty_cache()
             
             val_loss = 0.0
             val_count = 0
@@ -1438,9 +1531,20 @@ def main():
                             loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)
                         
                         batch_loss += loss.item()
+                        
+                        # Clear intermediate tensors immediately
+                        del encoder_k, encoder_v, logits, loss_mask, ce_loss, masked_loss, loss
+                        del ctx_tokens, qa_tokens
                     
                     val_loss += batch_loss / batch_ctx.shape[0]
                     val_count += 1
+                    
+                    # Clear batch tensors
+                    del batch_ctx, batch_qa, a_position_batch
+                
+                # Clear cache after validation
+                if 'cuda' in str(device):
+                    torch.cuda.empty_cache()
             
             val_loss = val_loss / val_count if val_count > 0 else float('inf')
             print(f"iter {iter_num + 1:5d} | val_loss {val_loss:.4f}")
