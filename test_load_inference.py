@@ -66,7 +66,7 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda:0', dtype=torch.bfl
         decoder_config = ModelConfig(
             vocab_size=vocab_size,
             hidden_size=2880,
-            num_hidden_layers=24,
+            num_hidden_layers=12,  # Match checkpoint (12 layers, not 24)
             num_experts=32,
             num_attention_heads=64,
             num_key_value_heads=64,
