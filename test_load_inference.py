@@ -77,38 +77,30 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda:0', dtype=torch.bfl
     print(f"Encoder: {encoder_config.hidden_size}d, {encoder_config.num_hidden_layers} layers")
     print(f"Decoder: {decoder_config.hidden_size}d, {decoder_config.num_hidden_layers} layers\n")
     
-    # Create encoder
+    # Create encoder directly on target device (so RoPE buffers are created on GPU)
     print("Creating encoder...")
-    encoder = BidirectionalEncoder(encoder_config, device='cpu')
+    encoder = BidirectionalEncoder(encoder_config, device=device)
     if 'encoder' in checkpoint:
-        encoder.load_state_dict(checkpoint['encoder'], strict=False)
+        # Move checkpoint weights to target device before loading
+        encoder_state = {k: v.to(device) for k, v in checkpoint['encoder'].items()}
+        encoder.load_state_dict(encoder_state, strict=False)
         del checkpoint['encoder']
-    # Ensure all parameters and buffers are on target device
-    encoder = encoder.to(device=device, dtype=dtype)
-    # Double-check all components are on correct device
-    for name, param in encoder.named_parameters():
-        if param.device != device:
-            param.data = param.data.to(device)
-    for name, buffer in encoder.named_buffers():
-        if buffer.device != device:
-            buffer.data = buffer.data.to(device)
+        del encoder_state
+    # Ensure dtype conversion
+    encoder = encoder.to(dtype=dtype)
     print(f"✓ Encoder loaded: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params")
     
-    # Create decoder
+    # Create decoder directly on target device (so RoPE buffers are created on GPU)
     print("Creating decoder...")
-    decoder = Transformer(decoder_config, device='cpu')
+    decoder = Transformer(decoder_config, device=device)
     if 'decoder' in checkpoint:
-        decoder.load_state_dict(checkpoint['decoder'], strict=False)
+        # Move checkpoint weights to target device before loading
+        decoder_state = {k: v.to(device) for k, v in checkpoint['decoder'].items()}
+        decoder.load_state_dict(decoder_state, strict=False)
         del checkpoint['decoder']
-    # Ensure all parameters and buffers are on target device
-    decoder = decoder.to(device=device, dtype=dtype)
-    # Double-check all components are on correct device
-    for name, param in decoder.named_parameters():
-        if param.device != device:
-            param.data = param.data.to(device)
-    for name, buffer in decoder.named_buffers():
-        if buffer.device != device:
-            buffer.data = buffer.data.to(device)
+        del decoder_state
+    # Ensure dtype conversion
+    decoder = decoder.to(dtype=dtype)
     print(f"✓ Decoder loaded: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params\n")
     
     # Cleanup
