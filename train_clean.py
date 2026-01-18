@@ -613,6 +613,13 @@ def main():
                 }
                 torch.save(encoder_checkpoint, os.path.join(args.out_dir, 'encoder.pt'))
                 torch.save(decoder_checkpoint, os.path.join(args.out_dir, 'decoder.pt'))
+                
+                # Save tokenizers
+                encoder_tokenizer.save_pretrained(os.path.join(args.out_dir, 'encoder_tokenizer'))
+                # For decoder tokenizer (tiktoken), just save a marker file since it's reconstructed by code
+                with open(os.path.join(args.out_dir, 'decoder_tokenizer.txt'), 'w') as f:
+                    f.write('Use get_decoder_tokenizer() to load this tokenizer')
+                
                 print(f"✓ Saved best model (val_loss: {val_loss:.4f})\n")
             
             encoder.train()
@@ -636,6 +643,12 @@ def main():
             }
             torch.save(encoder_checkpoint, os.path.join(checkpoint_dir, 'encoder.pt'))
             torch.save(decoder_checkpoint, os.path.join(checkpoint_dir, 'decoder.pt'))
+            
+            # Save tokenizers
+            encoder_tokenizer.save_pretrained(os.path.join(checkpoint_dir, 'encoder_tokenizer'))
+            with open(os.path.join(checkpoint_dir, 'decoder_tokenizer.txt'), 'w') as f:
+                f.write('Use get_decoder_tokenizer() to load this tokenizer')
+            
             print(f"✓ Saved checkpoint at iter {it}\n")
         
         # Clear cache periodically
