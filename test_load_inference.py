@@ -7,6 +7,13 @@ import argparse
 import torch
 from datasets import load_dataset
 
+try:
+    from accelerate import load_checkpoint_in_model, init_empty_weights
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    print("⚠️  accelerate not installed. Install with: pip install accelerate")
+    ACCELERATE_AVAILABLE = False
+
 from architecture.config import ModelConfig
 from architecture.encoder import BidirectionalEncoder, EncoderConfig
 from architecture.transformer import Transformer
@@ -21,33 +28,50 @@ def print_gpu_memory(label):
         print(f"[{label}] GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
 
 
+def load_checkpoint_metadata_only(checkpoint_path):
+    """Load only the config metadata without loading full state dicts"""
+    # Use mmap if available (PyTorch 2.0+)
+    try:
+        checkpoint = torch.load(
+            checkpoint_path, 
+            map_location='cpu', 
+            weights_only=False,
+            mmap=True  # Memory-mapped loading
+        )
+    except TypeError:
+        # Fallback for older PyTorch versions
+        checkpoint = torch.load(
+            checkpoint_path, 
+            map_location='cpu', 
+            weights_only=False
+        )
+    return checkpoint
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file")
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--use-bfloat16", action="store_true", help="Use bfloat16 precision")
     args = parser.parse_args()
     
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}\n")
+    dtype = torch.bfloat16 if args.use_bfloat16 else torch.float32
+    print(f"Using device: {device}, dtype: {dtype}\n")
     
     # Get tokenizer
     tokenizer = get_tokenizer()
     
-    # STEP 1: Load checkpoint to CPU
+    # STEP 1: Load checkpoint metadata only (configs)
     print("=" * 60)
-    print("STEP 1: Loading checkpoint to CPU")
+    print("STEP 1: Loading checkpoint metadata")
     print("=" * 60)
     print_gpu_memory("Before loading checkpoint")
     
-    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    print(f"✓ Checkpoint loaded to CPU")
+    # Load checkpoint with memory mapping
+    checkpoint = load_checkpoint_metadata_only(args.checkpoint)
+    print(f"✓ Checkpoint loaded")
     print(f"  Keys in checkpoint: {list(checkpoint.keys())}")
-    print_gpu_memory("After loading checkpoint to CPU")
-    
-    # STEP 2: Extract configs
-    print("\n" + "=" * 60)
-    print("STEP 2: Extracting configs")
-    print("=" * 60)
     
     encoder_config = checkpoint.get('encoder_config')
     if isinstance(encoder_config, dict):
@@ -60,86 +84,115 @@ def main():
     print(f"Encoder config: {encoder_config.hidden_size}d, {encoder_config.num_hidden_layers} layers")
     print(f"Decoder config: {decoder_config.hidden_size}d, {decoder_config.num_hidden_layers} layers")
     
-    # STEP 3: Create encoder on GPU
+    # STEP 2: Create models and load weights efficiently
     print("\n" + "=" * 60)
-    print("STEP 3: Creating encoder on GPU")
+    print("STEP 2: Creating and loading models")
     print("=" * 60)
-    print_gpu_memory("Before creating encoder")
+    print_gpu_memory("Before creating models")
     
-    encoder = BidirectionalEncoder(encoder_config, device=device)
-    encoder.to(device)
+    if ACCELERATE_AVAILABLE:
+        print("🚀 Using Accelerate for memory-efficient loading\n")
+        
+        # NOTE: Accelerate's load_checkpoint_in_model expects a file path, not state dict
+        # So we'll use init_empty_weights + manual loading for better memory efficiency
+        
+        # Create encoder with empty weights (no memory allocated)
+        print("Creating encoder with empty weights...")
+        with init_empty_weights():
+            encoder = BidirectionalEncoder(encoder_config, device='meta')
+        print(f"  Encoder params: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M (meta device)")
+        
+        # Load encoder weights directly to target device/dtype
+        if 'encoder' in checkpoint:
+            print("Loading encoder weights to GPU...")
+            # Load state dict directly with target device/dtype
+            encoder_state = checkpoint['encoder']
+            
+            # Move model to device first (creates actual tensors)
+            encoder = encoder.to_empty(device=device)
+            
+            # Load weights piece by piece to target device/dtype
+            for name, param in encoder.named_parameters():
+                if name in encoder_state:
+                    param.data.copy_(encoder_state[name].to(device=device, dtype=dtype))
+            
+            for name, buffer in encoder.named_buffers():
+                if name in encoder_state:
+                    buffer.data.copy_(encoder_state[name].to(device=device, dtype=dtype))
+            
+            print(f"✓ Encoder loaded to {device} with {dtype}")
+            print_gpu_memory("After loading encoder")
+            
+            # Free encoder weights from CPU memory
+            del checkpoint['encoder']
+            del encoder_state
+            torch.cuda.empty_cache() 
+        
+        # Create decoder with empty weights
+        print("\nCreating decoder with empty weights...")
+        with init_empty_weights():
+            decoder = Transformer(decoder_config, device='meta')
+        print(f"  Decoder params: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M (meta device)")
+        
+        # Load decoder weights directly to target device/dtype
+        if 'decoder' in checkpoint:
+            print("Loading decoder weights to GPU...")
+            decoder_state = checkpoint['decoder']
+            
+            # Move model to device first
+            decoder = decoder.to_empty(device=device)
+            
+            # Load weights piece by piece to target device/dtype
+            for name, param in decoder.named_parameters():
+                if name in decoder_state:
+                    param.data.copy_(decoder_state[name].to(device=device, dtype=dtype))
+            
+            for name, buffer in decoder.named_buffers():
+                if name in decoder_state:
+                    buffer.data.copy_(decoder_state[name].to(device=device, dtype=dtype))
+            
+            print(f"✓ Decoder loaded to {device} with {dtype}")
+            print_gpu_memory("After loading decoder")
+            
+            # Free decoder weights from CPU memory
+            del checkpoint['decoder']
+            del decoder_state
+            torch.cuda.empty_cache()
+            
+    else:
+        print("📦 Using standard PyTorch loading\n")
+        
+        # Load encoder directly to target device
+        print("Creating and loading encoder...")
+        encoder = BidirectionalEncoder(encoder_config, device='cpu')
+        
+        if 'encoder' in checkpoint:
+            encoder.load_state_dict(checkpoint['encoder'], strict=True)
+            del checkpoint['encoder']
+            
+        encoder = encoder.to(device=device, dtype=dtype)
+        print(f"✓ Encoder: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params")
+        print_gpu_memory("After loading encoder")
+        
+        torch.cuda.empty_cache()
+        
+        # Load decoder directly to target device
+        print("\nCreating and loading decoder...")
+        decoder = Transformer(decoder_config, device='cpu')
+        
+        if 'decoder' in checkpoint:
+            decoder.load_state_dict(checkpoint['decoder'], strict=True)
+            del checkpoint['decoder']
+            
+        decoder = decoder.to(device=device, dtype=dtype)
+        print(f"✓ Decoder: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params")
+        print_gpu_memory("After loading decoder")
+        
+        torch.cuda.empty_cache()
     
-    print(f"✓ Encoder created: {sum(p.numel() for p in encoder.parameters())/1e6:.2f}M params")
-    print_gpu_memory("After creating encoder")
-    
-    # STEP 4: Load encoder weights
+    # STEP 3: Clean up checkpoint
     print("\n" + "=" * 60)
-    print("STEP 4: Loading encoder weights")
-    print("=" * 60)
-    
-    if 'encoder' in checkpoint:
-        print("Loading encoder state dict...")
-        encoder_state = checkpoint['encoder']
-        print(f"  Encoder state dict has {len(encoder_state)} keys")
-        print(f"  First few keys: {list(encoder_state.keys())[:3]}")
-        
-        # Load parameter by parameter
-        for name, param in encoder.named_parameters():
-            if name in encoder_state:
-                param.data.copy_(encoder_state[name].to(device))
-        
-        for name, buffer in encoder.named_buffers():
-            if name in encoder_state:
-                buffer.data.copy_(encoder_state[name].to(device))
-        
-        print("✓ Encoder weights loaded")
-        del checkpoint['encoder']
-        print_gpu_memory("After loading encoder weights")
-    
-    torch.cuda.empty_cache()
-    print_gpu_memory("After clearing cache")
-    
-    # STEP 5: Create decoder on GPU
-    print("\n" + "=" * 60)
-    print("STEP 5: Creating decoder on GPU")
-    print("=" * 60)
-    print_gpu_memory("Before creating decoder")
-    
-    decoder = Transformer(decoder_config, device=device)
-    decoder.to(device)
-    
-    print(f"✓ Decoder created: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M params")
-    print_gpu_memory("After creating decoder")
-    
-    # STEP 6: Load decoder weights
-    print("\n" + "=" * 60)
-    print("STEP 6: Loading decoder weights")
-    print("=" * 60)
-    
-    if 'decoder' in checkpoint:
-        print("Loading decoder state dict...")
-        decoder_state = checkpoint['decoder']
-        print(f"  Decoder state dict has {len(decoder_state)} keys")
-        
-        # Load parameter by parameter
-        for name, param in decoder.named_parameters():
-            if name in decoder_state:
-                param.data.copy_(decoder_state[name].to(device))
-        
-        for name, buffer in decoder.named_buffers():
-            if name in decoder_state:
-                buffer.data.copy_(decoder_state[name].to(device))
-        
-        print("✓ Decoder weights loaded")
-        del checkpoint['decoder']
-        print_gpu_memory("After loading decoder weights")
-    
-    torch.cuda.empty_cache()
-    print_gpu_memory("After clearing cache")
-    
-    # STEP 7: Delete checkpoint completely
-    print("\n" + "=" * 60)
-    print("STEP 7: Cleaning up checkpoint")
+    print("STEP 3: Cleaning up checkpoint")
     print("=" * 60)
     
     checkpoint.clear()
@@ -149,11 +202,11 @@ def main():
     torch.cuda.empty_cache()
     
     print("✓ Checkpoint deleted from memory")
-    print_gpu_memory("After deleting checkpoint")
+    print_gpu_memory("After cleanup")
     
-    # STEP 8: Load test data and do inference
+    # STEP 4: Test inference
     print("\n" + "=" * 60)
-    print("STEP 8: Testing inference on MS MARCO")
+    print("STEP 4: Testing inference on MS MARCO")
     print("=" * 60)
     
     encoder.eval()
