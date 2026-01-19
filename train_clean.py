@@ -264,7 +264,11 @@ def main():
             print("Creating encoder with random weights...")
             encoder = BidirectionalEncoder(encoder_config, device=device)
         
-        print(f"\n✓ Encoder ready")
+        # Freeze all encoder parameters
+        for param in encoder.parameters():
+            param.requires_grad = False
+        
+        print(f"\n✓ Encoder ready (FROZEN)")
         print(f"Encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.1f}M\n")
         
         # ========================================
@@ -294,6 +298,18 @@ def main():
         print(f"  Encoder hidden size: {decoder_config.encoder_hidden_size}")
         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
+        
+        # Freeze all decoder parameters except cross-attention layers
+        for name, param in decoder.named_parameters():
+            if 'context_proj' in name or 'cross_attn' in name:
+                param.requires_grad = True
+                print(f"  ✓ Trainable: {name}")
+            else:
+                param.requires_grad = False
+        
+        trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in decoder.parameters())
+        print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total\n")
     
     # ========================================
     # Training setup
@@ -302,28 +318,19 @@ def main():
     print("TRAINING SETUP")
     print("="*60)
     
-    # Setup optimizer with 3-tier learning rates
-    encoder_params = list(encoder.parameters())
+    # Setup optimizer with only cross-attention parameters (encoder and decoder base are frozen)
+    trainable_params = [p for p in decoder.parameters() if p.requires_grad]
     
-    # Separate decoder params
-    decoder_base_params = []
-    decoder_custom_params = []
-    for name, param in decoder.named_parameters():
-        if 'context_proj' in name or 'cross_attn' in name:
-            decoder_custom_params.append(param)
-        else:
-            decoder_base_params.append(param)
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=cross_attn_lr,
+        betas=(0.9, 0.95),
+        weight_decay=0.1
+    )
     
-    optimizer = torch.optim.AdamW([
-        {'params': encoder_params, 'lr': encoder_lr, 'name': 'encoder'},
-        {'params': decoder_base_params, 'lr': decoder_lr, 'name': 'decoder_base'},
-        {'params': decoder_custom_params, 'lr': cross_attn_lr, 'name': 'cross_attn'}
-    ], betas=(0.9, 0.95), weight_decay=0.1)
-    
-    print("✓ Optimizer created with 3-tier learning rates:")
-    print(f"  Encoder: {encoder_lr}")
-    print(f"  Decoder base: {decoder_lr}")
-    print(f"  Cross-attention: {cross_attn_lr}\n")
+    print("✓ Optimizer created for cross-attention only:")
+    print(f"  Cross-attention LR: {cross_attn_lr}")
+    print(f"  Trainable params: {sum(p.numel() for p in trainable_params)/1e6:.1f}M\n")
     
     # Load dataset
     print("Loading MS MARCO dataset...")
@@ -391,14 +398,10 @@ def main():
     train_idx = 0
     
     for it in range(max_iters):
-        # Get learning rates
-        enc_lr = get_lr(it, warmup_iters, max_iters, encoder_lr, encoder_lr * min_lr_ratio)
-        dec_lr = get_lr(it, warmup_iters, max_iters, decoder_lr, decoder_lr * min_lr_ratio)
+        # Get learning rate for cross-attention (only trainable params)
         cross_lr = get_lr(it, warmup_iters, max_iters, cross_attn_lr, cross_attn_lr * min_lr_ratio)
         
-        optimizer.param_groups[0]['lr'] = enc_lr
-        optimizer.param_groups[1]['lr'] = dec_lr
-        optimizer.param_groups[2]['lr'] = cross_lr
+        optimizer.param_groups[0]['lr'] = cross_lr
         
         # Gradient accumulation
         total_loss = 0.0
@@ -414,11 +417,13 @@ def main():
             question = example['question'][:max_qa_len]
             answer = example['answer'][:max_qa_len]
             
-            # Clean question: strip leading periods and whitespace
-            question = question.lstrip('. \t\n\r')
+            # Clean question: strip all leading non-alphabetic characters
+            while question and not question[0].isalpha():
+                question = question[1:]
             
-            # Clean answer: strip leading periods and whitespace
-            answer = answer.lstrip('. \t\n\r')
+            # Clean answer: strip all leading non-alphabetic characters
+            while answer and not answer[0].isalpha():
+                answer = answer[1:]
             
             # Tokenize context/question with BERT tokenizer
             context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
@@ -473,8 +478,7 @@ def main():
             total_loss += loss.item()
         
         # Optimizer step
-        torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         
@@ -482,7 +486,7 @@ def main():
         if it % log_interval == 0:
             # Add context state diagnostic
             context_norm = decoder.context_state.norm().item() if hasattr(decoder, 'context_state') else 0.0
-            print(f"Iter {it:5d} | Loss: {total_loss:.4f} | LR: {enc_lr:.2e}/{dec_lr:.2e}/{cross_lr:.2e} | Ctx: {context_norm:.4f}")
+            print(f"Iter {it:5d} | Loss: {total_loss:.4f} | LR: {cross_lr:.2e} | Ctx: {context_norm:.4f}")
         
         # Validation
         if it > 0 and it % eval_interval == 0:
@@ -503,11 +507,13 @@ def main():
                     question = example['question'][:max_qa_len]
                     answer = example['answer'][:max_qa_len]
                     
-                    # Clean question: strip leading periods and whitespace
-                    question = question.lstrip('. \t\n\r')
+                    # Clean question: strip all leading non-alphabetic characters
+                    while question and not question[0].isalpha():
+                        question = question[1:]
                     
-                    # Clean answer: strip leading periods and whitespace
-                    answer = answer.lstrip('. \t\n\r')
+                    # Clean answer: strip all leading non-alphabetic characters
+                    while answer and not answer[0].isalpha():
+                        answer = answer[1:]
                     
                     # Tokenize context/question with BERT tokenizer
                     context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
@@ -551,9 +557,10 @@ def main():
             print(f"Question: {example['question']}")
             print(f"Ground Truth: {example['answer']}")
             
-            # Prepare question (strip leading periods and whitespace)
+            # Prepare question (strip all leading non-alphabetic characters)
             question = example['question'][:max_qa_len]
-            question = question.lstrip('. \t\n\r')
+            while question and not question[0].isalpha():
+                question = question[1:]
             
             # Tokenize with encoder tokenizer
             context_tokens = encoder_tokenizer.encode(example['context'][:max_context_len*4], add_special_tokens=False)[:max_context_len]
