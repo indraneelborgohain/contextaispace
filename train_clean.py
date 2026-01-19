@@ -414,6 +414,10 @@ def main():
             question = example['question'][:max_qa_len]
             answer = example['answer'][:max_qa_len]
             
+            # Strip leading period from question if present
+            if question.startswith('.'):
+                question = question[1:].lstrip()
+            
             # Tokenize context/question with BERT tokenizer
             context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
             question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
@@ -497,6 +501,10 @@ def main():
                     question = example['question'][:max_qa_len]
                     answer = example['answer'][:max_qa_len]
                     
+                    # Strip leading period from question if present
+                    if question.startswith('.'):
+                        question = question[1:].lstrip()
+                    
                     # Tokenize context/question with BERT tokenizer
                     context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
                     question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
@@ -539,9 +547,14 @@ def main():
             print(f"Question: {example['question']}")
             print(f"Ground Truth: {example['answer']}")
             
+            # Prepare question (strip leading period if present)
+            question = example['question'][:max_qa_len]
+            if question.startswith('.'):
+                question = question[1:].lstrip()
+            
             # Tokenize with encoder tokenizer
             context_tokens = encoder_tokenizer.encode(example['context'][:max_context_len*4], add_special_tokens=False)[:max_context_len]
-            question_tokens = encoder_tokenizer.encode(example['question'][:max_qa_len], add_special_tokens=False)[:max_qa_len]
+            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
             sep_token_id = encoder_tokenizer.sep_token_id
             encoder_input = torch.tensor(context_tokens + [sep_token_id] + question_tokens, dtype=torch.long, device=device)
             
