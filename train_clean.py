@@ -355,9 +355,6 @@ def main():
             'question': question,
             'answer': answer
         })
-        
-        if len(train_examples) >= 50000:
-            break
     
     print(f"✓ Loaded {len(train_examples)} training examples\n")
     
