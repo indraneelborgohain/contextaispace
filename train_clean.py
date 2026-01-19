@@ -414,9 +414,11 @@ def main():
             question = example['question'][:max_qa_len]
             answer = example['answer'][:max_qa_len]
             
-            # Strip leading period from question if present
-            if question.startswith('.'):
-                question = question[1:].lstrip()
+            # Clean question: strip leading periods and whitespace
+            question = question.lstrip('. \t\n\r')
+            
+            # Clean answer: strip leading periods and whitespace
+            answer = answer.lstrip('. \t\n\r')
             
             # Tokenize context/question with BERT tokenizer
             context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
@@ -501,9 +503,11 @@ def main():
                     question = example['question'][:max_qa_len]
                     answer = example['answer'][:max_qa_len]
                     
-                    # Strip leading period from question if present
-                    if question.startswith('.'):
-                        question = question[1:].lstrip()
+                    # Clean question: strip leading periods and whitespace
+                    question = question.lstrip('. \t\n\r')
+                    
+                    # Clean answer: strip leading periods and whitespace
+                    answer = answer.lstrip('. \t\n\r')
                     
                     # Tokenize context/question with BERT tokenizer
                     context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
@@ -547,10 +551,9 @@ def main():
             print(f"Question: {example['question']}")
             print(f"Ground Truth: {example['answer']}")
             
-            # Prepare question (strip leading period if present)
+            # Prepare question (strip leading periods and whitespace)
             question = example['question'][:max_qa_len]
-            if question.startswith('.'):
-                question = question[1:].lstrip()
+            question = question.lstrip('. \t\n\r')
             
             # Tokenize with encoder tokenizer
             context_tokens = encoder_tokenizer.encode(example['context'][:max_context_len*4], add_special_tokens=False)[:max_context_len]
