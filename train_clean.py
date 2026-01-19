@@ -380,9 +380,6 @@ def main():
             'question': question,
             'answer': answer
         })
-        
-        if len(val_examples) >= 1000:
-            break
     
     print(f"✓ Loaded {len(val_examples)} validation examples\n")
     
@@ -414,8 +411,8 @@ def main():
             train_idx += 1
             
             context = example['context'][:max_context_len*4]
-            question = example['question'][:max_qa_len]
-            answer = example['answer'][:max_qa_len]
+            question = example['question']
+            answer = example['answer']
             
             # Clean question: strip all leading non-alphabetic characters
             while question and not question[0].isalpha():
@@ -427,11 +424,11 @@ def main():
             
             # Tokenize context/question with BERT tokenizer
             context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
-            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
+            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
             sep_token_id = encoder_tokenizer.sep_token_id
             
             # Tokenize answer with decoder tokenizer (tiktoken)
-            answer_tokens = decoder_tokenizer.encode(answer)[:max_qa_len]
+            answer_tokens = decoder_tokenizer.encode(answer)
             
             # Prepend <A> token to answer and add EOS token
             a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
@@ -504,8 +501,8 @@ def main():
                     example = val_examples[val_idx]
                     
                     context = example['context'][:max_context_len*4]
-                    question = example['question'][:max_qa_len]
-                    answer = example['answer'][:max_qa_len]
+                    question = example['question']
+                    answer = example['answer']
                     
                     # Clean question: strip all leading non-alphabetic characters
                     while question and not question[0].isalpha():
@@ -517,10 +514,10 @@ def main():
                     
                     # Tokenize context/question with BERT tokenizer
                     context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
-                    question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
+                    question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
                     
                     # Tokenize answer with decoder tokenizer
-                    answer_tokens = decoder_tokenizer.encode(answer)[:max_qa_len]
+                    answer_tokens = decoder_tokenizer.encode(answer)
                     
                     # Prepend <A> token to answer and add EOS token
                     a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
@@ -558,13 +555,13 @@ def main():
             print(f"Ground Truth: {example['answer']}")
             
             # Prepare question (strip all leading non-alphabetic characters)
-            question = example['question'][:max_qa_len]
+            question = example['question']
             while question and not question[0].isalpha():
                 question = question[1:]
             
             # Tokenize with encoder tokenizer
             context_tokens = encoder_tokenizer.encode(example['context'][:max_context_len*4], add_special_tokens=False)[:max_context_len]
-            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)[:max_qa_len]
+            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
             sep_token_id = encoder_tokenizer.sep_token_id
             encoder_input = torch.tensor(context_tokens + [sep_token_id] + question_tokens, dtype=torch.long, device=device)
             
