@@ -384,6 +384,13 @@ class CrossAttentionLayer(torch.nn.Module):
         )
         
         self.sm_scale = 1 / math.sqrt(config.head_dim)
+        
+        # Gated tanh parameter: initialized to 0 so initially no cross-attention
+        # When angle=0: tanh(0)=0 → output = residual (original GPT-OSS)
+        # As angle increases: tanh(angle)→1 → gradually incorporate cross-attention
+        self.angle = torch.nn.Parameter(
+            torch.zeros(1, device=device, dtype=torch.bfloat16)
+        )
     
     def forward(
         self, 
@@ -448,8 +455,11 @@ class CrossAttentionLayer(torch.nn.Module):
         attn_output = attn_output.reshape(seq_len, -1)  # (seq_len, num_heads * head_dim)
         output = self.out(attn_output)
         
-        # Residual connection
-        return residual + output
+        # Gated residual connection with tanh
+        # Initially (angle=0): tanh(0)=0, so output = residual (no cross-attention)
+        # As training progresses: tanh(angle) increases, gradually adding cross-attention
+        gate = torch.tanh(self.angle)
+        return residual + gate * output
 
 
 class Transformer(torch.nn.Module):
