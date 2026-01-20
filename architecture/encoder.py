@@ -375,6 +375,7 @@ class BidirectionalEncoder(nn.Module):
         input_ids: torch.Tensor, 
         attention_mask: torch.Tensor | None = None,
         return_encoder_kv: bool = False,
+        return_hidden_states: bool = False,
         sequence_length: int | None = None,
         sep_token_id: int | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -385,14 +386,16 @@ class BidirectionalEncoder(nn.Module):
             input_ids: Input token IDs (total_sequence_length,)
             attention_mask: Optional mask (total_sequence_length,) where 1 = real token, 0 = padding
             return_encoder_kv: If True, returns (encoder_key, encoder_value) for decoder cross-attention
+            return_hidden_states: If True, returns raw hidden states without compression (for encoder cross-attention)
             sequence_length: Maximum sequence length per chunk. If None, uses max_position_embeddings
             sep_token_id: Token ID for <SEP> to split context and question. 
                          If provided, tokens before <SEP> = context (compressed), after <SEP> = question (query).
                          If None, falls back to last-chunk-as-question logic.
         
         Returns:
-            If return_encoder_kv=False: Encoded representations (total_sequence_length, hidden_size)
+            If return_encoder_kv=False and return_hidden_states=False: Encoded representations (total_sequence_length, hidden_size)
             If return_encoder_kv=True: Tuple of (encoder_key, encoder_value) each (question_length, hidden_size)
+            If return_hidden_states=True: Raw hidden states (total_sequence_length, hidden_size) - no compression
         """
         if sequence_length is None:
             sequence_length = self.config.max_position_embeddings
@@ -402,12 +405,19 @@ class BidirectionalEncoder(nn.Module):
         # Single chunk case - no chunking needed
         if total_length <= sequence_length and sep_token_id is None:
             x = self._process_single_chunk(input_ids, attention_mask)
+            if return_hidden_states:
+                # Return raw hidden states (for encoder cross-attention)
+                return x
             if return_encoder_kv:
                 # For single chunk, just return the output as both K and V
                 return x, x
             return x
         
         # Multi-chunk case or <SEP> splitting
+        if return_hidden_states:
+            # Return raw hidden states without compression
+            x = self._process_single_chunk(input_ids, attention_mask)
+            return x
         if return_encoder_kv:
             return self._forward_with_chunking(input_ids, attention_mask, sequence_length, sep_token_id)
         else:

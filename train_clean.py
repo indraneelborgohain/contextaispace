@@ -16,7 +16,7 @@ from datasets import load_dataset
 
 from architecture.config import ModelConfig
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
-from architecture.transformer import Transformer
+from architecture.transformer import Transformer, EncoderCrossAttentionLayer
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 
 
@@ -312,6 +312,25 @@ def main():
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total\n")
     
     # ========================================
+    # Create encoder cross-attention layer
+    # ========================================
+    print("="*60)
+    print("ENCODER CROSS-ATTENTION LAYER")
+    print("="*60)
+    
+    # Create trainable encoder cross-attention layer
+    encoder_cross_attn = EncoderCrossAttentionLayer(
+        encoder_hidden_size=encoder_config.hidden_size,  # 1024 for BERT-large
+        num_attention_heads=16,
+        head_dim=64,
+        device=device
+    )
+    
+    encoder_cross_attn_params = sum(p.numel() for p in encoder_cross_attn.parameters())
+    print(f"✓ Encoder cross-attention layer created")
+    print(f"  Parameters: {encoder_cross_attn_params/1e6:.1f}M (trainable)\n")
+    
+    # ========================================
     # Training setup
     # ========================================
     print("="*60)
@@ -319,7 +338,10 @@ def main():
     print("="*60)
     
     # Setup optimizer with only cross-attention parameters (encoder and decoder base are frozen)
-    trainable_params = [p for p in decoder.parameters() if p.requires_grad]
+    trainable_params = [
+        *[p for p in decoder.parameters() if p.requires_grad],
+        *encoder_cross_attn.parameters()
+    ]
     
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -330,7 +352,9 @@ def main():
     
     print("✓ Optimizer created for cross-attention only:")
     print(f"  Cross-attention LR: {cross_attn_lr}")
-    print(f"  Trainable params: {sum(p.numel() for p in trainable_params)/1e6:.1f}M\n")
+    print(f"  Trainable params: {sum(p.numel() for p in trainable_params)/1e6:.1f}M")
+    print(f"    - Encoder cross-attn: {encoder_cross_attn_params/1e6:.1f}M")
+    print(f"    - Decoder cross-attn: {sum(p.numel() for p in decoder.parameters() if p.requires_grad)/1e6:.1f}M\n")
     
     # Load dataset
     print("Loading MS MARCO dataset...")
@@ -419,10 +443,9 @@ def main():
             while answer and not answer[0].isalpha():
                 answer = answer[1:]
             
-            # Tokenize context/question with BERT tokenizer
+            # Tokenize context and question separately with BERT tokenizer
             context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
             question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
-            sep_token_id = encoder_tokenizer.sep_token_id
             
             # Tokenize answer with decoder tokenizer (tiktoken)
             answer_tokens = decoder_tokenizer.encode(answer)
@@ -432,12 +455,9 @@ def main():
             end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
             answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
             
-            # Create encoder input: context <SEP> question
-            encoder_input = torch.tensor(
-                context_tokens + [sep_token_id] + question_tokens,
-                dtype=torch.long,
-                device=device
-            )
+            # Create separate tensors for context and question
+            context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
+            question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
             
             # Create decoder input/target: <A> answer text -> answer text EOS
             decoder_input = torch.tensor(answer_tokens[:-1], dtype=torch.long, device=device)
@@ -445,14 +465,17 @@ def main():
             
             # Forward pass
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                # Encode
-                encoder_k, encoder_v = encoder(
-                    encoder_input,
-                    return_encoder_kv=True,
-                    sep_token_id=sep_token_id
-                )
+                # STEP 1: Encode question and context separately
+                question_hidden = encoder(question_input, return_hidden_states=True)
+                context_hidden = encoder(context_input, return_hidden_states=True)
                 
-                # Decode
+                # STEP 2: Encoder-level cross-attention (question attends to context)
+                attended_question = encoder_cross_attn(question_hidden, context_hidden)
+                
+                # STEP 3: SVD compress attended question (1024 -> 768)
+                encoder_k, encoder_v = encoder._compress_with_svd(attended_question)
+                
+                # STEP 4: Decode using attended question
                 logits = decoder(
                     decoder_input,
                     encoder_k=encoder_k,
@@ -509,7 +532,7 @@ def main():
                     while answer and not answer[0].isalpha():
                         answer = answer[1:]
                     
-                    # Tokenize context/question with BERT tokenizer
+                    # Tokenize context and question separately with BERT tokenizer
                     context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
                     question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
                     
@@ -521,17 +544,18 @@ def main():
                     end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                     answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
                     
-                    # Encode
-                    encoder_input = torch.tensor(
-                        context_tokens + [sep_token_id] + question_tokens,
-                        dtype=torch.long,
-                        device=device
-                    )
+                    # Create separate tensors
+                    context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
+                    question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
                     decoder_input = torch.tensor(answer_tokens[:-1], dtype=torch.long, device=device)
                     decoder_target = torch.tensor(answer_tokens[1:], dtype=torch.long, device=device)
                     
                     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        encoder_k, encoder_v = encoder(encoder_input, return_encoder_kv=True, sep_token_id=sep_token_id)
+                        # Two-encoder architecture
+                        question_hidden = encoder(question_input, return_hidden_states=True)
+                        context_hidden = encoder(context_input, return_hidden_states=True)
+                        attended_question = encoder_cross_attn(question_hidden, context_hidden)
+                        encoder_k, encoder_v = encoder._compress_with_svd(attended_question)
                         logits = decoder(decoder_input, encoder_k=encoder_k, encoder_v=encoder_v)
                         loss = F.cross_entropy(logits.view(-1, decoder_vocab_size), decoder_target.view(-1))
                     
@@ -556,16 +580,19 @@ def main():
             while question and not question[0].isalpha():
                 question = question[1:]
             
-            # Tokenize with encoder tokenizer
+            # Tokenize context and question separately
             context_tokens = encoder_tokenizer.encode(example['context'][:max_context_len*4], add_special_tokens=False)[:max_context_len]
             question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
-            sep_token_id = encoder_tokenizer.sep_token_id
-            encoder_input = torch.tensor(context_tokens + [sep_token_id] + question_tokens, dtype=torch.long, device=device)
+            context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
+            question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
             
             with torch.no_grad():
                 with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                    # Encode
-                    encoder_k, encoder_v = encoder(encoder_input, return_encoder_kv=True, sep_token_id=sep_token_id)
+                    # Two-encoder architecture
+                    question_hidden = encoder(question_input, return_hidden_states=True)
+                    context_hidden = encoder(context_input, return_hidden_states=True)
+                    attended_question = encoder_cross_attn(question_hidden, context_hidden)
+                    encoder_k, encoder_v = encoder._compress_with_svd(attended_question)
                     
                     # CRITICAL: Reset decoder context before generation
                     decoder.reset_context()

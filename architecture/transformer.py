@@ -466,6 +466,115 @@ class ContextStateCrossAttention(torch.nn.Module):
         return residual + output
 
 
+class EncoderCrossAttentionLayer(torch.nn.Module):
+    """
+    Encoder-level cross-attention layer for question attending to context.
+    
+    Takes raw encoder hidden states and performs cross-attention.
+    Q: from question encoder hidden states
+    K, V: from context encoder hidden states
+    
+    This layer is trainable (not frozen).
+    """
+    def __init__(
+        self,
+        encoder_hidden_size: int = 1024,
+        num_attention_heads: int = 16,
+        head_dim: int = 64,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_attention_heads = num_attention_heads
+        self.encoder_hidden_size = encoder_hidden_size
+        
+        self.norm_q = RMSNorm(encoder_hidden_size, device=device)
+        self.norm_kv = RMSNorm(encoder_hidden_size, device=device)
+        
+        # Q, K, V projections (all from encoder hidden size)
+        self.q_proj = torch.nn.Linear(
+            encoder_hidden_size,
+            head_dim * num_attention_heads,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        self.k_proj = torch.nn.Linear(
+            encoder_hidden_size,
+            head_dim * num_attention_heads,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        self.v_proj = torch.nn.Linear(
+            encoder_hidden_size,
+            head_dim * num_attention_heads,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        
+        # Output projection
+        self.out = torch.nn.Linear(
+            head_dim * num_attention_heads,
+            encoder_hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        
+        self.sm_scale = 1 / math.sqrt(head_dim)
+    
+    def forward(
+        self, 
+        query_hidden: torch.Tensor, 
+        key_value_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Cross-attention from question to context at encoder level.
+        
+        Args:
+            query_hidden: Question encoder hidden states (q_seq_len, encoder_hidden_size)
+            key_value_hidden: Context encoder hidden states (c_seq_len, encoder_hidden_size)
+        
+        Returns:
+            Attended question representation (q_seq_len, encoder_hidden_size)
+        """
+        residual = query_hidden
+        
+        # Normalize
+        query_hidden = self.norm_q(query_hidden)
+        key_value_hidden = self.norm_kv(key_value_hidden)
+        
+        q_seq_len = query_hidden.shape[0]
+        kv_seq_len = key_value_hidden.shape[0]
+        
+        # Project to Q, K, V
+        q = self.q_proj(query_hidden)  # (q_seq_len, num_heads * head_dim)
+        k = self.k_proj(key_value_hidden)  # (kv_seq_len, num_heads * head_dim)
+        v = self.v_proj(key_value_hidden)  # (kv_seq_len, num_heads * head_dim)
+        
+        # Reshape for multi-head attention
+        q = q.view(q_seq_len, self.num_attention_heads, self.head_dim)
+        k = k.view(kv_seq_len, self.num_attention_heads, self.head_dim)
+        v = v.view(kv_seq_len, self.num_attention_heads, self.head_dim)
+        
+        # Compute attention scores: Q @ K^T
+        # q: (q_seq_len, num_heads, head_dim)
+        # k: (kv_seq_len, num_heads, head_dim)
+        attn_scores = torch.einsum('qhd,khd->hqk', q, k)  # (num_heads, q_seq_len, kv_seq_len)
+        attn_scores = attn_scores * self.sm_scale
+        
+        # No causal mask for cross-attention
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        
+        # Apply attention to values
+        attn_output = torch.einsum('hqk,khd->qhd', attn_weights, v)  # (q_seq_len, num_heads, head_dim)
+        
+        # Reshape and project
+        attn_output = attn_output.reshape(q_seq_len, -1)  # (q_seq_len, num_heads * head_dim)
+        output = self.out(attn_output)
+        
+        # Residual connection
+        return residual + output
+
+
 class CrossAttentionLayer(torch.nn.Module):
     """
     Cross-attention layer for decoder to attend to encoder outputs.
