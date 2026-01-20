@@ -116,7 +116,7 @@ class ContextMLPBlock(torch.nn.Module):
 
 
 class ContextTransformerBlock(torch.nn.Module):
-    """Transformer block with context-aware attention and MLP."""
+    """Transformer block with self-attention, context cross-attention, and MLP."""
     def __init__(
         self,
         config: ModelConfig,
@@ -125,12 +125,24 @@ class ContextTransformerBlock(torch.nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
-        self.attn = ContextAttentionBlock(config, layer_idx, device)
-        self.mlp = ContextMLPBlock(config, device)
+        # Use standard attention instead of context-aware
+        self.attn = AttentionBlock(config, layer_idx, device)
+        # Add context state cross-attention
+        self.context_cross_attn = ContextStateCrossAttention(config, device)
+        # Use standard MLP instead of context-aware
+        self.mlp = MLPBlock(config, device)
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x, context)
-        x = self.mlp(x, context)
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        context_state: torch.Tensor
+    ) -> torch.Tensor:
+        # Self-attention
+        x = self.attn(x)
+        # Context cross-attention
+        x = self.context_cross_attn(x, context_state)
+        # MLP
+        x = self.mlp(x)
         return x
 
 
@@ -292,7 +304,7 @@ class MLPBlock(torch.nn.Module):
 
 
 class TransformerBlock(torch.nn.Module):
-    """Standard transformer block without context, but with optional encoder cross-attention."""
+    """Standard transformer block with context cross-attention and optional encoder cross-attention."""
     def __init__(
         self,
         config: ModelConfig,
@@ -302,31 +314,154 @@ class TransformerBlock(torch.nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn = AttentionBlock(config, layer_idx, device)
-        self.mlp = MLPBlock(config, device)
+        
+        # Context state cross-attention (always enabled)
+        self.context_cross_attn = ContextStateCrossAttention(config, device)
         
         # Optional cross-attention to encoder
         if config.use_encoder_decoder_cross_attention:
             encoder_size = config.encoder_hidden_size if config.encoder_hidden_size else config.hidden_size
-            self.cross_attn = CrossAttentionLayer(config, encoder_hidden_size=encoder_size, device=device)
+            self.encoder_cross_attn = CrossAttentionLayer(config, encoder_hidden_size=encoder_size, device=device)
         else:
-            self.cross_attn = None
+            self.encoder_cross_attn = None
+        
+        self.mlp = MLPBlock(config, device)
 
     def forward(
         self, 
         x: torch.Tensor,
+        context_state: torch.Tensor,
         encoder_k: torch.Tensor | None = None,
         encoder_v: torch.Tensor | None = None
     ) -> torch.Tensor:
         # Self-attention
         x = self.attn(x)
         
-        # Cross-attention (if enabled and encoder K, V provided)
-        if self.cross_attn is not None and encoder_k is not None and encoder_v is not None:
-            x = self.cross_attn(x, encoder_k, encoder_v)
+        # Context cross-attention
+        x = self.context_cross_attn(x, context_state)
+        
+        # Encoder cross-attention (if enabled and encoder K, V provided)
+        if self.encoder_cross_attn is not None and encoder_k is not None and encoder_v is not None:
+            x = self.encoder_cross_attn(x, encoder_k, encoder_v)
         
         # MLP
         x = self.mlp(x)
         return x
+
+
+class ContextStateCrossAttention(torch.nn.Module):
+    """
+    Cross-attention layer for attending to context state.
+    
+    Q: from current token hidden states
+    K, V: from context_state (previous token's hidden state)
+    
+    No gating needed - first token naturally has zero context.
+    """
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.head_dim = config.head_dim
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        
+        # Q, K, V projections (all use decoder hidden size)
+        self.q_proj = torch.nn.Linear(
+            config.hidden_size,
+            config.head_dim * config.num_attention_heads,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        self.k_proj = torch.nn.Linear(
+            config.hidden_size,
+            config.head_dim * config.num_key_value_heads,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        self.v_proj = torch.nn.Linear(
+            config.hidden_size,
+            config.head_dim * config.num_key_value_heads,
+            device=device,
+            dtype=torch.bfloat16
+        )
+        
+        # Output projection
+        self.out = torch.nn.Linear(
+            config.head_dim * config.num_attention_heads,
+            config.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        
+        self.sm_scale = 1 / math.sqrt(config.head_dim)
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        context_state: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Cross-attention to context state.
+        
+        Args:
+            x: Current token hidden states (seq_len, hidden_size)
+            context_state: Previous token's hidden state (hidden_size,)
+        
+        Returns:
+            Output (seq_len, hidden_size)
+        """
+        residual = x
+        x = self.norm(x)
+        
+        seq_len = x.shape[0]
+        
+        # Project queries from current token
+        q = self.q_proj(x)  # (seq_len, num_heads * head_dim)
+        
+        # Context state is a single vector, unsqueeze to make it a sequence of length 1
+        context_seq = context_state.unsqueeze(0)  # (1, hidden_size)
+        
+        # Project keys and values from context
+        k = self.k_proj(context_seq)  # (1, num_kv_heads * head_dim)
+        v = self.v_proj(context_seq)  # (1, num_kv_heads * head_dim)
+        
+        # Reshape for multi-head attention
+        q = q.view(
+            seq_len,
+            self.num_key_value_heads,
+            self.num_attention_heads // self.num_key_value_heads,
+            self.head_dim
+        )  # (seq_len, num_kv_heads, q_mult, head_dim)
+        
+        k = k.view(1, self.num_key_value_heads, self.head_dim)
+        v = v.view(1, self.num_key_value_heads, self.head_dim)
+        
+        # Grouped query attention - expand K and V
+        q_mult = self.num_attention_heads // self.num_key_value_heads
+        k = k[:, :, None, :].expand(-1, -1, q_mult, -1)  # (1, num_kv_heads, q_mult, head_dim)
+        v = v[:, :, None, :].expand(-1, -1, q_mult, -1)
+        
+        # Compute attention scores: Q @ K^T
+        attn_scores = torch.einsum('qhmd,khmd->hmqk', q, k)  # (num_kv_heads, q_mult, seq_len, 1)
+        attn_scores = attn_scores * self.sm_scale
+        
+        # No causal mask needed (attending to single context vector)
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        
+        # Apply attention to values
+        attn_output = torch.einsum('hmqk,khmd->qhmd', attn_weights, v)  # (seq_len, num_kv_heads, q_mult, head_dim)
+        
+        # Reshape and project
+        attn_output = attn_output.reshape(seq_len, -1)  # (seq_len, num_heads * head_dim)
+        output = self.out(attn_output)
+        
+        # Residual connection (no gating - first token naturally has zero context)
+        return residual + output
 
 
 class CrossAttentionLayer(torch.nn.Module):
@@ -571,7 +706,7 @@ class Transformer(torch.nn.Module):
         return_hidden_states: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
-        Process a single chunk of tokens with optional encoder cross-attention.
+        Process a single chunk of tokens with context and encoder cross-attention.
         
         Args:
             x: Input token IDs (chunk_size,)
@@ -584,54 +719,28 @@ class Transformer(torch.nn.Module):
         Returns:
             logits (chunk_size, vocab_size) or tuple of (logits, hidden_states)
         """
-        token_embeds = self.embedding(x)
+        # Embed tokens (no prepending of context)
+        x = self.embedding(x)
         
-        # Always prepend a token at the beginning of each sequence
-        if self.config.use_context_embedding:
-            # Use learnable <start> token only for the first chunk of a new sequence
-            # For subsequent chunks, use context_state from previous chunk
-            if is_first_chunk:
-                # First chunk: use learnable <start> token
-                prepend_embed = self.start_token_embedding.unsqueeze(0)
-                context_vector = self.start_token_embedding
-            else:
-                # Continuation chunk: use context from previous chunk/sequence
-                prepend_embed = self.context_state.unsqueeze(0)
-                context_vector = self.context_state
-            
-            x = torch.cat([prepend_embed, token_embeds], dim=0)
-            context_offset = 1  # Account for prepended token
-        else:
-            x = token_embeds
-            context_offset = 0  # No token prepended
-            context_vector = self.context_state
+        # Use context_state for cross-attention
+        # First token: context_state is zeros (after reset)
+        # Subsequent tokens: context_state contains previous token's hidden state
+        context_state = self.context_state
         
-        # Pass context to first block, then use standard blocks with encoder cross-attention
-        context = context_vector.unsqueeze(0).expand(x.shape[0], -1)
-        
-        # First block with context (ContextTransformerBlock doesn't have cross-attention)
-        x = self.block[0](x, context)
-        
-        # Remaining blocks with optional encoder cross-attention
-        for i in range(1, len(self.block)):
-            x = self.block[i](x, encoder_k=encoder_k, encoder_v=encoder_v)
+        # Pass through all layers with context cross-attention
+        # All blocks now use context cross-attention instead of prepending
+        for i in range(len(self.block)):
+            x = self.block[i](x, context_state=context_state, encoder_k=encoder_k, encoder_v=encoder_v)
         
         x = self.norm(x)
+        logits = self.unembedding(x)
         
-        # Remove context embedding if it was prepended
-        if context_offset > 0:
-            x_tokens = x[context_offset:]
-        else:
-            x_tokens = x
-        
-        logits = self.unembedding(x_tokens)
-        
-        # Update context state
-        if x_tokens.shape[0] > 0 and update_context:
-            self.context_state = x_tokens[-1].detach().clone()
+        # Update context state with last token's hidden state
+        if x.shape[0] > 0 and update_context:
+            self.context_state = x[-1].detach().clone()
         
         if return_hidden_states:
-            return logits, x_tokens
+            return logits, x
         else:
             return logits
 
