@@ -135,7 +135,9 @@ class ContextTransformerBlock(torch.nn.Module):
     def forward(
         self, 
         x: torch.Tensor, 
-        context_state: torch.Tensor
+        context_state: torch.Tensor,
+        encoder_k: torch.Tensor | None = None,
+        encoder_v: torch.Tensor | None = None
     ) -> torch.Tensor:
         # Self-attention
         x = self.attn(x)
