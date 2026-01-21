@@ -525,9 +525,11 @@ class EncoderCrossAttentionLayer(torch.nn.Module):
             key_value_hidden: Context encoder hidden states (c_seq_len, encoder_hidden_size)
         
         Returns:
-            tuple: (attended_question, context_values)
-                - attended_question: Question after attending to context (q_seq_len, encoder_hidden_size)
-                - context_values: Raw context hidden states (c_seq_len, encoder_hidden_size)
+            tuple: (attended_question, attended_question)
+                - Returns the same attended_question for both K and V to ensure
+                  they have matching sequence lengths for decoder cross-attention.
+                - attended_question contains information from both question and context
+                  via the cross-attention mechanism.
         """
         residual = query_hidden
         
@@ -567,8 +569,9 @@ class EncoderCrossAttentionLayer(torch.nn.Module):
         # Residual connection
         attended_question = residual + output
         
-        # Return both attended question (key) and raw context (value)
-        return attended_question, key_value_hidden
+        # Return attended question for both K and V (it already contains context information)
+        # This ensures K and V have the same sequence length for decoder cross-attention
+        return attended_question, attended_question
 
 
 class CrossAttentionLayer(torch.nn.Module):
@@ -654,47 +657,88 @@ class CrossAttentionLayer(torch.nn.Module):
         residual = x
         x = self.norm(x)
         
-        seq_len = x.shape[0]
-        enc_seq_len = encoder_k.shape[0]
-        
         # Project queries from decoder
-        q = self.q_proj(x)  # (seq_len, num_heads * head_dim)
+        q = self.q_proj(x)  # (..., num_heads * head_dim)
         
         # Project keys and values from encoder
-        k = self.k_proj(encoder_k)  # (enc_seq_len, num_kv_heads * head_dim)
-        v = self.v_proj(encoder_v)  # (enc_seq_len, num_kv_heads * head_dim)
+        k = self.k_proj(encoder_k)  # (..., num_kv_heads * head_dim)
+        v = self.v_proj(encoder_v)  # (..., num_kv_heads * head_dim)
         
-        # Reshape for multi-head attention
-        q = q.view(
-            seq_len,
-            self.num_key_value_heads,
-            self.num_attention_heads // self.num_key_value_heads,
-            self.head_dim
-        )  # (seq_len, num_kv_heads, q_mult, head_dim)
-        
-        k = k.view(enc_seq_len, self.num_key_value_heads, self.head_dim)
-        v = v.view(enc_seq_len, self.num_key_value_heads, self.head_dim)
+        # Infer dimensions from the projected tensors
+        # Handle both batched and unbatched cases
+        if q.dim() == 2:
+            # Unbatched: (seq_len, num_heads * head_dim)
+            seq_len = q.shape[0]
+            enc_seq_len = k.shape[0]
+            
+            q = q.view(
+                seq_len,
+                self.num_key_value_heads,
+                self.num_attention_heads // self.num_key_value_heads,
+                self.head_dim
+            )  # (seq_len, num_kv_heads, q_mult, head_dim)
+            
+            k = k.view(enc_seq_len, self.num_key_value_heads, self.head_dim)
+            v = v.view(enc_seq_len, self.num_key_value_heads, self.head_dim)
+        else:
+            # Batched: (batch_size, seq_len, num_heads * head_dim)
+            batch_size = q.shape[0]
+            seq_len = q.shape[1]
+            enc_seq_len = k.shape[1]
+            
+            q = q.view(
+                batch_size,
+                seq_len,
+                self.num_key_value_heads,
+                self.num_attention_heads // self.num_key_value_heads,
+                self.head_dim
+            )  # (batch_size, seq_len, num_kv_heads, q_mult, head_dim)
+            
+            k = k.view(batch_size, enc_seq_len, self.num_key_value_heads, self.head_dim)
+            v = v.view(batch_size, enc_seq_len, self.num_key_value_heads, self.head_dim)
         
         # Grouped query attention
         # Expand K and V to match Q's group dimension
         q_mult = self.num_attention_heads // self.num_key_value_heads
-        k = k[:, :, None, :].expand(-1, -1, q_mult, -1)  # (enc_seq_len, num_kv_heads, q_mult, head_dim)
-        v = v[:, :, None, :].expand(-1, -1, q_mult, -1)
         
-        # Compute attention scores: Q @ K^T
-        # q: (seq_len, num_kv_heads, q_mult, head_dim)
-        # k: (enc_seq_len, num_kv_heads, q_mult, head_dim)
-        attn_scores = torch.einsum('qhmd,khmd->hmqk', q, k)  # (num_kv_heads, q_mult, seq_len, enc_seq_len)
-        attn_scores = attn_scores * self.sm_scale
+        if q.dim() == 4:
+            # Unbatched case
+            k = k[:, :, None, :].expand(-1, -1, q_mult, -1)  # (enc_seq_len, num_kv_heads, q_mult, head_dim)
+            v = v[:, :, None, :].expand(-1, -1, q_mult, -1)
+            
+            # Compute attention scores: Q @ K^T
+            attn_scores = torch.einsum('qhmd,khmd->hmqk', q, k)  # (num_kv_heads, q_mult, seq_len, enc_seq_len)
+            attn_scores = attn_scores * self.sm_scale
+            
+            # No causal mask for cross-attention
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            
+            # Apply attention to values
+            attn_output = torch.einsum('hmqk,khmd->qhmd', attn_weights, v)  # (seq_len, num_kv_heads, q_mult, head_dim)
+            
+            # Reshape and project
+            seq_len = q.shape[0]
+            attn_output = attn_output.reshape(seq_len, -1)  # (seq_len, num_heads * head_dim)
+        else:
+            # Batched case
+            k = k[:, :, :, None, :].expand(-1, -1, -1, q_mult, -1)  # (batch, enc_seq_len, num_kv_heads, q_mult, head_dim)
+            v = v[:, :, :, None, :].expand(-1, -1, -1, q_mult, -1)
+            
+            # Compute attention scores: Q @ K^T
+            attn_scores = torch.einsum('bqhmd,bkhmd->bhmqk', q, k)  # (batch, num_kv_heads, q_mult, seq_len, enc_seq_len)
+            attn_scores = attn_scores * self.sm_scale
+            
+            # No causal mask for cross-attention
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            
+            # Apply attention to values
+            attn_output = torch.einsum('bhmqk,bkhmd->bqhmd', attn_weights, v)  # (batch, seq_len, num_kv_heads, q_mult, head_dim)
+            
+            # Reshape and project
+            batch_size = q.shape[0]
+            seq_len = q.shape[1]
+            attn_output = attn_output.reshape(batch_size, seq_len, -1)  # (batch, seq_len, num_heads * head_dim)
         
-        # No causal mask for cross-attention (decoder can attend to all encoder positions)
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        
-        # Apply attention to values
-        attn_output = torch.einsum('hmqk,khmd->qhmd', attn_weights, v)  # (seq_len, num_kv_heads, q_mult, head_dim)
-        
-        # Reshape and project
-        attn_output = attn_output.reshape(seq_len, -1)  # (seq_len, num_heads * head_dim)
         output = self.out(attn_output)
         
         # Gated residual connection with tanh

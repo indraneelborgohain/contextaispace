@@ -471,7 +471,7 @@ def main():
                 context_hidden = encoder(context_input, return_hidden_states=True)
                 
                 # STEP 2: Encoder-level cross-attention (question attends to context)
-                # Returns both attended question (key) and context (value)
+                # Returns attended question for both key and value (same sequence)
                 encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
                 
                 # STEP 4: Decode
