@@ -182,16 +182,7 @@ class AttentionBlock(torch.nn.Module):
             dtype=torch.bfloat16,
         )
         self.sm_scale = 1 / math.sqrt(config.head_dim)
-        self.rope = RotaryEmbedding(
-            config.head_dim,
-            config.rope_theta,
-            torch.float32,
-            initial_context_length=config.initial_context_length,
-            scaling_factor=config.rope_scaling_factor,
-            ntk_alpha=config.rope_ntk_alpha,
-            ntk_beta=config.rope_ntk_beta,
-            device=device,
-        )
+        # No RoPE - processing one token at a time with context state for sequential info
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
@@ -218,7 +209,7 @@ class AttentionBlock(torch.nn.Module):
         )
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
+        # No RoPE applied - context state handles sequential information
         t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
         t = self.out(t)
         t = x + t
@@ -525,7 +516,7 @@ class EncoderCrossAttentionLayer(torch.nn.Module):
         self, 
         query_hidden: torch.Tensor, 
         key_value_hidden: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Cross-attention from question to context at encoder level.
         
@@ -534,7 +525,9 @@ class EncoderCrossAttentionLayer(torch.nn.Module):
             key_value_hidden: Context encoder hidden states (c_seq_len, encoder_hidden_size)
         
         Returns:
-            Attended question representation (q_seq_len, encoder_hidden_size)
+            tuple: (attended_question, context_values)
+                - attended_question: Question after attending to context (q_seq_len, encoder_hidden_size)
+                - context_values: Raw context hidden states (c_seq_len, encoder_hidden_size)
         """
         residual = query_hidden
         
@@ -572,7 +565,10 @@ class EncoderCrossAttentionLayer(torch.nn.Module):
         output = self.out(attn_output)
         
         # Residual connection
-        return residual + output
+        attended_question = residual + output
+        
+        # Return both attended question (key) and raw context (value)
+        return attended_question, key_value_hidden
 
 
 class CrossAttentionLayer(torch.nn.Module):

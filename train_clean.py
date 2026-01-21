@@ -411,6 +411,7 @@ def main():
     
     encoder.train()
     decoder.train()
+    encoder_cross_attn.train()
     
     best_val_loss = float('inf')
     train_idx = 0
@@ -470,12 +471,10 @@ def main():
                 context_hidden = encoder(context_input, return_hidden_states=True)
                 
                 # STEP 2: Encoder-level cross-attention (question attends to context)
-                attended_question = encoder_cross_attn(question_hidden, context_hidden)
+                # Returns both attended question (key) and context (value)
+                encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
                 
-                # STEP 3: SVD compress attended question (1024 -> 768)
-                encoder_k, encoder_v = encoder._compress_with_svd(attended_question)
-                
-                # STEP 4: Decode using attended question
+                # STEP 4: Decode
                 logits = decoder(
                     decoder_input,
                     encoder_k=encoder_k,
@@ -509,6 +508,7 @@ def main():
         if it > 0 and it % eval_interval == 0:
             encoder.eval()
             decoder.eval()
+            encoder_cross_attn.eval()
             
             val_loss = 0.0
             num_val = min(10, len(val_examples))
@@ -554,8 +554,7 @@ def main():
                         # Two-encoder architecture
                         question_hidden = encoder(question_input, return_hidden_states=True)
                         context_hidden = encoder(context_input, return_hidden_states=True)
-                        attended_question = encoder_cross_attn(question_hidden, context_hidden)
-                        encoder_k, encoder_v = encoder._compress_with_svd(attended_question)
+                        encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
                         logits = decoder(decoder_input, encoder_k=encoder_k, encoder_v=encoder_v)
                         loss = F.cross_entropy(logits.view(-1, decoder_vocab_size), decoder_target.view(-1))
                     
@@ -591,8 +590,7 @@ def main():
                     # Two-encoder architecture
                     question_hidden = encoder(question_input, return_hidden_states=True)
                     context_hidden = encoder(context_input, return_hidden_states=True)
-                    attended_question = encoder_cross_attn(question_hidden, context_hidden)
-                    encoder_k, encoder_v = encoder._compress_with_svd(attended_question)
+                    encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
                     
                     # CRITICAL: Reset decoder context before generation
                     decoder.reset_context()
@@ -664,6 +662,7 @@ def main():
             
             encoder.train()
             decoder.train()
+            encoder_cross_attn.train()
         
         # Save checkpoint
         if it > 0 and it % save_every == 0:
