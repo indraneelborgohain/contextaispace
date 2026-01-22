@@ -172,12 +172,11 @@ def main():
     
     batch_size = 1
     gradient_accumulation_steps = 4
-    max_context_len = 256
     max_qa_len = 128
     max_iters = 50000
     eval_interval = 100
     save_every = 500
-    log_interval = 10
+    log_interval = 100
     
     encoder_lr = 1e-5
     decoder_lr = 1e-6
@@ -432,7 +431,7 @@ def main():
             example = train_examples[train_idx % len(train_examples)]
             train_idx += 1
             
-            context = example['context'][:max_context_len*4]
+            context = example['context']
             question = example['question']
             answer = example['answer']
             
@@ -445,7 +444,7 @@ def main():
                 answer = answer[1:]
             
             # Tokenize context and question separately with BERT tokenizer
-            context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
+            context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)
             question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
             
             # Tokenize answer with decoder tokenizer (tiktoken)
@@ -466,13 +465,18 @@ def main():
             
             # Forward pass
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                # STEP 1: Encode question and context separately
-                question_hidden = encoder(question_input, return_hidden_states=True)
-                context_hidden = encoder(context_input, return_hidden_states=True)
-                
-                # STEP 2: Encoder-level cross-attention (question attends to context)
-                # Returns attended question for both key and value (same sequence)
-                encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
+                # Skip encoder if both context and question are empty
+                if len(context_tokens) == 0 and len(question_tokens) == 0:
+                    encoder_k = None
+                    encoder_v = None
+                else:
+                    # STEP 1: Encode question and context separately
+                    question_hidden = encoder(question_input, return_hidden_states=True)
+                    context_hidden = encoder(context_input, return_hidden_states=True)
+                    
+                    # STEP 2: Encoder-level cross-attention (question attends to context)
+                    # Returns attended question for both key and value (same sequence)
+                    encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
                 
                 # STEP 4: Decode
                 logits = decoder(
@@ -520,7 +524,7 @@ def main():
                     
                     example = val_examples[val_idx]
                     
-                    context = example['context'][:max_context_len*4]
+                    context = example['context']
                     question = example['question']
                     answer = example['answer']
                     
@@ -533,7 +537,7 @@ def main():
                         answer = answer[1:]
                     
                     # Tokenize context and question separately with BERT tokenizer
-                    context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)[:max_context_len]
+                    context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)
                     question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
                     
                     # Tokenize answer with decoder tokenizer
@@ -569,18 +573,19 @@ def main():
             
             # Generate sample
             example = val_examples[0]
-            print(f"\nSample Generation:")
-            print(f"Context: {example['context'][:200]}...")
-            print(f"Question: {example['question']}")
-            print(f"Ground Truth: {example['answer']}")
+           
             
             # Prepare question (strip all leading non-alphabetic characters)
             question = example['question']
             while question and not question[0].isalpha():
                 question = question[1:]
+            print(f"\nSample Generation:")
+            print(f"Context: {example['context'][:200]}...")
+            print(f"Question: {question}")
+            print(f"Ground Truth: {example['answer']}")
             
             # Tokenize context and question separately
-            context_tokens = encoder_tokenizer.encode(example['context'][:max_context_len*4], add_special_tokens=False)[:max_context_len]
+            context_tokens = encoder_tokenizer.encode(example['context'], add_special_tokens=False)
             question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
             context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
             question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)

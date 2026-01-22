@@ -120,6 +120,11 @@ class RotaryEmbedding(torch.nn.Module):
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = query.shape[0]
+        
+        # Handle empty tensors (0 tokens)
+        if num_tokens == 0:
+            return query, key
+        
         cos, sin = self._compute_cos_sin(num_tokens)
 
         query_shape = query.shape

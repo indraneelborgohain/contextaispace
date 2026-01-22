@@ -45,42 +45,72 @@ def bidirectional_sdpa(Q, K, V, sm_scale, attention_mask=None):
     """
     Scaled Dot-Product Attention WITHOUT causal masking (bidirectional).
     Supports cross-attention where Q and K/V can have different sequence lengths.
+    Handles both batched and unbatched inputs.
     
     Args:
-        Q: Query tensor (q_len, n_heads, q_mult, d_head)
-        K: Key tensor (k_len, n_heads, d_head)
-        V: Value tensor (k_len, n_heads, d_head)
+        Q: Query tensor - unbatched: (q_len, n_heads, q_mult, d_head) or batched: (batch_size, q_len, n_heads, q_mult, d_head)
+        K: Key tensor - unbatched: (k_len, n_heads, d_head) or batched: (batch_size, k_len, n_heads, d_head)
+        V: Value tensor - unbatched: (k_len, n_heads, d_head) or batched: (batch_size, k_len, n_heads, d_head)
         sm_scale: Scaling factor for attention scores
-        attention_mask: Optional attention mask (q_len, k_len), True = keep, False = mask
+        attention_mask: Optional attention mask (q_len, k_len) or (batch_size, q_len, k_len), True = keep, False = mask
     
     Returns:
-        Attention output (q_len, n_heads * q_mult * d_head)
+        Attention output - unbatched: (q_len, n_heads * q_mult * d_head) or batched: (batch_size, q_len, n_heads * q_mult * d_head)
     """
-    q_len, n_heads, q_mult, d_head = Q.shape
-    k_len = K.shape[0]
-    assert K.shape == (k_len, n_heads, d_head), f"K shape mismatch: expected ({k_len}, {n_heads}, {d_head}), got {K.shape}"
-    assert V.shape == (k_len, n_heads, d_head), f"V shape mismatch: expected ({k_len}, {n_heads}, {d_head}), got {V.shape}"
-    
-    # Expand K and V for grouped query attention
-    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
-    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
-    
-    # Compute attention scores: Q @ K^T
-    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
-    QK *= sm_scale
-    
-    # Apply optional attention mask (but NO causal mask)
-    if attention_mask is not None:
-        # attention_mask should be (q_len, k_len) with True for positions to keep
-        mask_value = torch.finfo(QK.dtype).min
-        mask = attention_mask[None, None, :, :]  # Broadcast to (1, 1, q_len, k_len)
-        QK = QK.masked_fill(~mask, mask_value)
-    
-    # Softmax and compute attention
-    W = torch.softmax(QK, dim=-1)
-    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
-    
-    return attn.reshape(q_len, -1)
+    if Q.dim() == 4:
+        # Unbatched case
+        q_len, n_heads, q_mult, d_head = Q.shape
+        k_len = K.shape[0]
+        assert K.shape == (k_len, n_heads, d_head), f"K shape mismatch: expected ({k_len}, {n_heads}, {d_head}), got {K.shape}"
+        assert V.shape == (k_len, n_heads, d_head), f"V shape mismatch: expected ({k_len}, {n_heads}, {d_head}), got {V.shape}"
+        
+        # Expand K and V for grouped query attention
+        K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
+        V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
+        
+        # Compute attention scores: Q @ K^T
+        QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
+        QK *= sm_scale
+        
+        # Apply optional attention mask (but NO causal mask)
+        if attention_mask is not None:
+            # attention_mask should be (q_len, k_len) with True for positions to keep
+            mask_value = torch.finfo(QK.dtype).min
+            mask = attention_mask[None, None, :, :]  # Broadcast to (1, 1, q_len, k_len)
+            QK = QK.masked_fill(~mask, mask_value)
+        
+        # Softmax and compute attention
+        W = torch.softmax(QK, dim=-1)
+        attn = torch.einsum("hmqk,khmd->qhmd", W, V)
+        
+        return attn.reshape(q_len, -1)
+    else:
+        # Batched case
+        batch_size, q_len, n_heads, q_mult, d_head = Q.shape
+        k_len = K.shape[1]
+        assert K.shape == (batch_size, k_len, n_heads, d_head), f"K shape mismatch: expected ({batch_size}, {k_len}, {n_heads}, {d_head}), got {K.shape}"
+        assert V.shape == (batch_size, k_len, n_heads, d_head), f"V shape mismatch: expected ({batch_size}, {k_len}, {n_heads}, {d_head}), got {V.shape}"
+        
+        # Expand K and V for grouped query attention
+        K = K[:, :, :, None, :].expand(-1, -1, -1, q_mult, -1)
+        V = V[:, :, :, None, :].expand(-1, -1, -1, q_mult, -1)
+        
+        # Compute attention scores: Q @ K^T
+        QK = torch.einsum("bqhmd,bkhmd->bhmqk", Q, K)
+        QK *= sm_scale
+        
+        # Apply optional attention mask (but NO causal mask)
+        if attention_mask is not None:
+            # attention_mask should be (batch_size, q_len, k_len) with True for positions to keep
+            mask_value = torch.finfo(QK.dtype).min
+            mask = attention_mask[:, None, None, :, :]  # Broadcast to (batch_size, 1, 1, q_len, k_len)
+            QK = QK.masked_fill(~mask, mask_value)
+        
+        # Softmax and compute attention
+        W = torch.softmax(QK, dim=-1)
+        attn = torch.einsum("bhmqk,bkhmd->bqhmd", W, V)
+        
+        return attn.reshape(batch_size, q_len, -1)
 
 
 class BidirectionalAttentionBlock(nn.Module):
@@ -132,39 +162,73 @@ class BidirectionalAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward pass with bidirectional attention.
+        Handles both batched and unbatched inputs.
         
         Args:
-            x: Input tensor (seq_len, hidden_size)
-            attention_mask: Optional mask (seq_len, seq_len), True = keep, False = mask
+            x: Input tensor - unbatched: (seq_len, hidden_size) or batched: (batch_size, seq_len, hidden_size)
+            attention_mask: Optional mask - unbatched: (seq_len, seq_len) or batched: (batch_size, seq_len, seq_len), True = keep, False = mask
         
         Returns:
-            Output tensor (seq_len, hidden_size)
+            Output tensor - same shape as input
         """
         t = self.norm(x)
         qkv = self.qkv(t)
         
-        # Split into Q, K, V
-        q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
-        k = qkv[
-            :,
-            self.num_attention_heads * self.head_dim : 
-            (self.num_attention_heads + self.num_key_value_heads) * self.head_dim,
-        ].contiguous()
-        v = qkv[
-            :,
-            (self.num_attention_heads + self.num_key_value_heads) * self.head_dim : 
-            (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
-        ].contiguous()
+        # Determine if batched or unbatched
+        is_batched = x.dim() == 3
+        
+        if is_batched:
+            batch_size, seq_len = x.shape[0], x.shape[1]
+            
+            # Split into Q, K, V
+            q = qkv[:, :, : self.num_attention_heads * self.head_dim].contiguous()
+            k = qkv[
+                :, :,
+                self.num_attention_heads * self.head_dim : 
+                (self.num_attention_heads + self.num_key_value_heads) * self.head_dim,
+            ].contiguous()
+            v = qkv[
+                :, :,
+                (self.num_attention_heads + self.num_key_value_heads) * self.head_dim : 
+                (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
+            ].contiguous()
 
-        # Reshape for attention
-        q = q.view(
-            -1,
-            self.num_key_value_heads,
-            self.num_attention_heads // self.num_key_value_heads,
-            self.head_dim,
-        )
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
+            # Reshape for attention
+            q = q.view(
+                batch_size,
+                seq_len,
+                self.num_key_value_heads,
+                self.num_attention_heads // self.num_key_value_heads,
+                self.head_dim,
+            )
+            k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        else:
+            # Unbatched case
+            seq_len = x.shape[0]
+            
+            # Split into Q, K, V
+            q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
+            k = qkv[
+                :,
+                self.num_attention_heads * self.head_dim : 
+                (self.num_attention_heads + self.num_key_value_heads) * self.head_dim,
+            ].contiguous()
+            v = qkv[
+                :,
+                (self.num_attention_heads + self.num_key_value_heads) * self.head_dim : 
+                (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
+            ].contiguous()
+
+            # Reshape for attention
+            q = q.view(
+                seq_len,
+                self.num_key_value_heads,
+                self.num_attention_heads // self.num_key_value_heads,
+                self.head_dim,
+            )
+            k = k.view(seq_len, self.num_key_value_heads, self.head_dim)
+            v = v.view(seq_len, self.num_key_value_heads, self.head_dim)
         
         # Apply RoPE
         q, k = self.rope(q, k)
@@ -260,7 +324,14 @@ class EncoderMoEBlock(nn.Module):
         self.dropout_layer = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len, hidden_size = x.shape
+        """Forward pass supporting both batched and unbatched inputs."""
+        original_shape = x.shape
+        is_batched = x.dim() == 3
+        
+        if is_batched:
+            batch_size, seq_len, hidden_size = x.shape
+        else:
+            seq_len, hidden_size = x.shape
         
         t = self.norm(x)
         g = self.gate(t)
@@ -295,7 +366,7 @@ class EncoderMoEBlock(nn.Module):
             
             output[token_indices] += expert_out * weights.unsqueeze(-1)
         
-        output = output.view(seq_len, hidden_size)
+        output = output.view(*original_shape)
         output = self.dropout_layer(output)
         
         return x + output
@@ -321,13 +392,14 @@ class EncoderBlock(nn.Module):
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward pass through encoder block.
+        Handles both batched and unbatched inputs.
         
         Args:
-            x: Input tensor (seq_len, hidden_size)
-            attention_mask: Optional attention mask (seq_len, seq_len)
+            x: Input tensor - unbatched: (seq_len, hidden_size) or batched: (batch_size, seq_len, hidden_size)
+            attention_mask: Optional attention mask - unbatched: (seq_len, seq_len) or batched: (batch_size, seq_len, seq_len)
         
         Returns:
-            Output tensor (seq_len, hidden_size)
+            Output tensor - same shape as input
         """
         x = self.attn(x, attention_mask)
         x = self.mlp(x)
@@ -432,13 +504,14 @@ class BidirectionalEncoder(nn.Module):
     ) -> torch.Tensor:
         """
         Process a single chunk through transformer blocks.
+        Handles both batched and unbatched inputs.
         
         Args:
-            chunk_tokens: Token IDs (chunk_length,)
-            chunk_mask: Attention mask (chunk_length,) or None
+            chunk_tokens: Token IDs - unbatched: (chunk_length,) or batched: (batch_size, chunk_length)
+            chunk_mask: Attention mask - unbatched: (chunk_length,) or batched: (batch_size, chunk_length) or None
         
         Returns:
-            Encoded output (chunk_length, hidden_size)
+            Encoded output - same batch structure as input
         """
         # Embed tokens
         x = self.embedding(chunk_tokens)
@@ -446,8 +519,14 @@ class BidirectionalEncoder(nn.Module):
         
         # Create attention mask if provided
         if chunk_mask is not None:
-            seq_len = chunk_mask.shape[0]
-            attn_mask_2d = chunk_mask.unsqueeze(0) & chunk_mask.unsqueeze(1)
+            if chunk_mask.dim() == 1:
+                # Unbatched: (seq_len,) -> (seq_len, seq_len)
+                seq_len = chunk_mask.shape[0]
+                attn_mask_2d = chunk_mask.unsqueeze(0) & chunk_mask.unsqueeze(1)
+            else:
+                # Batched: (batch_size, seq_len) -> (batch_size, seq_len, seq_len)
+                batch_size, seq_len = chunk_mask.shape
+                attn_mask_2d = chunk_mask.unsqueeze(1) & chunk_mask.unsqueeze(2)
         else:
             attn_mask_2d = None
         
@@ -468,76 +547,63 @@ class BidirectionalEncoder(nn.Module):
         sep_token_id: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Process input in chunks with SVD compression for cross-attention.
+        Process input in chunks with sequential cross-attention (no SVD).
         
-        Strategy (Option 1 - Split at <SEP>):
-        1. Find <SEP> token to split context and question
-        2. Context (before <SEP>) → chunk → K,V → SVD compress
-        3. Question (after <SEP>) → chunk → Q → stack
-        4. Cross-attention: Q_question → compressed K,V_context
-        5. Output: (question_length, hidden_size)
+        Strategy:
+        - Chunk 1: Process with self-attention only
+        - Chunk 2: Q from chunk 2 attends to K,V from chunk 1
+        - Chunk 3: Q from chunk 3 attends to K,V from chunk 2
+        - etc.
+        - Return final chunk's output as encoder K,V
         
         Args:
             input_ids: Input token IDs (total_sequence_length,)
             attention_mask: Optional mask (total_sequence_length,)
             sequence_length: Target length for each chunk
-            sep_token_id: Token ID for <SEP>. If None, uses last chunk as question.
+            sep_token_id: Ignored in new implementation
         
         Returns:
-            Tuple of (encoder_key, encoder_value) each (question_length, hidden_size)
+            Tuple of (encoder_key, encoder_value) from final chunk
         """
         total_length = input_ids.shape[0]
         
-        # Find <SEP> position to split context and question
-        if sep_token_id is not None:
-            sep_positions = (input_ids == sep_token_id).nonzero(as_tuple=True)[0]
-            if len(sep_positions) > 0:
-                sep_idx = sep_positions[0].item()
-            else:
-                # No <SEP> found - treat everything as context, return as-is
-                sep_idx = total_length
-        else:
-            # No sep_token_id provided - fall back to last chunk as question
-            sep_idx = None
+        # Handle single chunk case
+        if total_length <= sequence_length:
+            chunk_output = self._process_single_chunk(input_ids, attention_mask)
+            # Return output as both K and V
+            return chunk_output, chunk_output
         
-        # If no <SEP> handling, use original logic (last chunk = question)
-        if sep_idx is None or sep_idx >= total_length - 1:
-            return self._forward_with_chunking_legacy(
-                input_ids, attention_mask, sequence_length
-            )
+        # Multi-chunk sequential cross-attention
+        chunks = self._create_chunks(total_length, sequence_length)
         
-        # Split at <SEP>
-        # Context: tokens [0:sep_idx] (everything before <SEP>)
-        # Question: tokens [sep_idx+1:end] (everything after <SEP>, skip <SEP> itself)
-        context_tokens = input_ids[:sep_idx]
-        question_tokens = input_ids[sep_idx + 1:]  # Skip <SEP> token
+        # Process first chunk (self-attention only)
+        start_idx, end_idx, actual_length = chunks[0]
+        chunk_tokens = input_ids[start_idx:end_idx]
+        chunk_mask = attention_mask[start_idx:end_idx] if attention_mask is not None else None
         
-        context_mask = attention_mask[:sep_idx] if attention_mask is not None else None
-        question_mask = attention_mask[sep_idx + 1:] if attention_mask is not None else None
+        # Pad first chunk if needed
+        if chunk_tokens.shape[0] < sequence_length:
+            padding_len = sequence_length - chunk_tokens.shape[0]
+            chunk_tokens = torch.cat([
+                chunk_tokens,
+                torch.zeros(padding_len, dtype=chunk_tokens.dtype, device=chunk_tokens.device)
+            ])
+            if chunk_mask is not None:
+                chunk_mask = torch.cat([
+                    chunk_mask,
+                    torch.zeros(padding_len, dtype=chunk_mask.dtype, device=chunk_mask.device)
+                ])
         
-        context_length = context_tokens.shape[0]
-        question_length = question_tokens.shape[0]
+        prev_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+        prev_K, prev_V = prev_output[:actual_length], prev_output[:actual_length]  # Only keep actual tokens
         
-        # Handle edge cases
-        if context_length == 0:
-            # No context, just process question and return
-            return self._process_question_only(question_tokens, question_mask, sequence_length)
-        
-        if question_length == 0:
-            # No question, just process context and return K,V
-            return self._process_context_only(context_tokens, context_mask, sequence_length)
-        
-        # === Process CONTEXT → K, V → SVD compress ===
-        context_chunks = self._create_chunks(context_length, sequence_length)
-        all_K = []
-        all_V = []
-        
-        for start_idx, end_idx, actual_length in context_chunks:
-            # Handle chunk boundaries
-            chunk_tokens = context_tokens[start_idx:end_idx]
-            chunk_mask = context_mask[start_idx:end_idx] if context_mask is not None else None
+        # Process remaining chunks with cross-attention to previous chunk
+        for i in range(1, len(chunks)):
+            start_idx, end_idx, actual_length = chunks[i]
+            chunk_tokens = input_ids[start_idx:end_idx]
+            chunk_mask = attention_mask[start_idx:end_idx] if attention_mask is not None else None
             
-            # Pad if chunk is smaller than sequence_length
+            # Pad if needed
             if chunk_tokens.shape[0] < sequence_length:
                 padding_len = sequence_length - chunk_tokens.shape[0]
                 chunk_tokens = torch.cat([
@@ -547,67 +613,24 @@ class BidirectionalEncoder(nn.Module):
                 if chunk_mask is not None:
                     chunk_mask = torch.cat([
                         chunk_mask,
-                        torch.zeros(padding_len, dtype=chunk_mask.dtype, device=chunk_mask.device)
+                        torch.zeros(padding_len, dtype=chunk_mask.dtype, device=chunk_mask.dtype)
                     ])
             
-            # Process chunk through transformer blocks
-            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
+            # Process current chunk
+            curr_output = self._process_single_chunk(chunk_tokens, chunk_mask)
             
-            # Extract K, V from chunk output
-            _, K_chunk, V_chunk = self._extract_qkv(chunk_output, chunk_mask)
+            # Extract Q from current chunk
+            Q_curr, _, _ = self._extract_qkv(curr_output[:actual_length], chunk_mask[:actual_length] if chunk_mask is not None else None)
             
-            # Collect K and V (only actual tokens)
-            all_K.append(K_chunk[:actual_length])
-            all_V.append(V_chunk[:actual_length])
-        
-        # Stack all K and V from context chunks
-        stacked_K = torch.cat(all_K, dim=0)  # (context_length, hidden_size)
-        stacked_V = torch.cat(all_V, dim=0)  # (context_length, hidden_size)
-        
-        # SVD compress context K, V to sequence_length
-        compressed_K = self._compress_with_svd(stacked_K, sequence_length)  # (sequence_length, hidden_size)
-        compressed_V = self._compress_with_svd(stacked_V, sequence_length)  # (sequence_length, hidden_size)
-        
-        # === Process QUESTION → Q ===
-        question_chunks = self._create_chunks(question_length, sequence_length)
-        all_Q = []
-        
-        for start_idx, end_idx, actual_length in question_chunks:
-            # Handle chunk boundaries
-            chunk_tokens = question_tokens[start_idx:end_idx]
-            chunk_mask = question_mask[start_idx:end_idx] if question_mask is not None else None
+            # Apply cross-attention: Q_curr attends to K,V from previous chunk
+            attended_output, _, _ = self._apply_cross_attention(Q_curr, prev_K, prev_V, None)
             
-            # Pad if chunk is smaller than sequence_length
-            if chunk_tokens.shape[0] < sequence_length:
-                padding_len = sequence_length - chunk_tokens.shape[0]
-                chunk_tokens = torch.cat([
-                    chunk_tokens,
-                    torch.zeros(padding_len, dtype=chunk_tokens.dtype, device=chunk_tokens.device)
-                ])
-                if chunk_mask is not None:
-                    chunk_mask = torch.cat([
-                        chunk_mask,
-                        torch.zeros(padding_len, dtype=chunk_mask.dtype, device=chunk_mask.device)
-                    ])
-            
-            # Process chunk through transformer blocks
-            chunk_output = self._process_single_chunk(chunk_tokens, chunk_mask)
-            
-            # Extract Q from chunk output
-            Q_chunk, _, _ = self._extract_qkv(chunk_output, chunk_mask)
-            
-            # Collect Q (only actual tokens)
-            all_Q.append(Q_chunk[:actual_length])
+            # Update prev_K, prev_V to current chunk's attended output
+            prev_K = attended_output
+            prev_V = attended_output
         
-        # Stack all Q from question chunks
-        Q_question = torch.cat(all_Q, dim=0)  # (question_length, hidden_size)
-        
-        # === Cross-attention: Q_question → compressed K,V_context ===
-        encoder_key, encoder_value = self._apply_final_cross_attention(
-            Q_question, compressed_K, compressed_V
-        )
-        
-        return encoder_key, encoder_value  # (question_length, hidden_size)
+        # Return final chunk's representation as both K and V
+        return prev_K, prev_V
     
     def _forward_with_chunking_legacy(
         self,
