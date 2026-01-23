@@ -430,8 +430,16 @@ def main():
             context_tokens = tokenizer.encode(context)
             question_tokens = tokenizer.encode(question)
             
+            # Skip this example if question is empty after cleaning/tokenization
+            if len(question_tokens) == 0:
+                continue
+            
             # Tokenize answer with GPT tokenizer
             answer_tokens = tokenizer.encode(answer)
+            
+            # Skip if answer is empty
+            if len(answer_tokens) == 0:
+                continue
             
             # Prepend <A> token to answer and add EOS token
             a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
