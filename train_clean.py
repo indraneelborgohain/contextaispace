@@ -262,12 +262,17 @@ def main():
             print("Creating encoder with random weights...")
             encoder = BidirectionalEncoder(encoder_config, device=device)
         
-        # Freeze all encoder parameters
-        for param in encoder.parameters():
-            param.requires_grad = False
+        # Freeze all encoder parameters except embeddings
+        for name, param in encoder.named_parameters():
+            if 'embedding' in name:
+                param.requires_grad = True
+                print(f"  ✓ Encoder trainable: {name}")
+            else:
+                param.requires_grad = False
         
-        print(f"\n✓ Encoder ready (FROZEN)")
-        print(f"Encoder parameters: {sum(p.numel() for p in encoder.parameters())/1e6:.1f}M\n")
+        encoder_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+        encoder_total = sum(p.numel() for p in encoder.parameters())
+        print(f"\n✓ Encoder ready: {encoder_trainable/1e6:.1f}M trainable / {encoder_total/1e6:.1f}M total\n")
         
         # ========================================
         # STEP 3: Create decoder from GPT-OSS
@@ -322,8 +327,9 @@ def main():
     print("  - Decoder queries: [dec_len, 768] attend to concatenated K,V")
     print(f"  - Decoder chunk size: {max_dec_length} (1=token-by-token, >1=chunked)\n")
     
-    # Setup optimizer with only decoder cross-attention parameters (encoders are frozen)
+    # Setup optimizer with encoder embeddings and decoder cross-attention parameters
     trainable_params = [
+        *[p for p in encoder.parameters() if p.requires_grad],
         *[p for p in decoder.parameters() if p.requires_grad]
     ]
     
@@ -334,9 +340,10 @@ def main():
         weight_decay=0.1
     )
     
-    print("✓ Optimizer created for decoder cross-attention only:")
+    print("✓ Optimizer created:")
     print(f"  Learning rate: {cross_attn_lr}")
     print(f"  Trainable params: {sum(p.numel() for p in trainable_params)/1e6:.1f}M")
+    print(f"    - Encoder embeddings: {sum(p.numel() for p in encoder.parameters() if p.requires_grad)/1e6:.1f}M")
     print(f"    - Decoder cross-attn + context layers: {sum(p.numel() for p in decoder.parameters() if p.requires_grad)/1e6:.1f}M\n")
     
     # Load dataset
