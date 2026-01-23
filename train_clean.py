@@ -204,12 +204,12 @@ def main():
     print("="*60 + "\n")
     
     # Get tokenizer - using GPT tokenizer for BOTH encoder and decoder
-    tokenizer = get_decoder_tokenizer()
+    tokenizer = get_decoder_tokenizer()  # GPT/Tiktoken tokenizer
     
     vocab_size = tokenizer.n_vocab  # Tiktoken vocab: ~200000+
     
     print(f"Vocab size (GPT/Tiktoken): {vocab_size}")
-    print("Using same tokenizer for context/question and answer generation\n")
+    print("Using GPT tokenizer for both encoder and decoder\n")
     
     # Check if loading from saved model
     if args.model_dir and os.path.exists(args.model_dir):
@@ -239,9 +239,9 @@ def main():
         
         encoder_config = create_encoder_config_from_bert(bert_model_name)
     
-        # Encoder uses BERT vocab (already set correctly by create_encoder_config_from_bert)
-        # No need to override - BERT tokenizer matches BERT model vocab
-        print(f"  Vocab size: {encoder_config.vocab_size}")
+        # Override encoder vocab to match GPT tokenizer
+        encoder_config.vocab_size = vocab_size
+        print(f"  Vocab size (overridden to GPT): {encoder_config.vocab_size}")
         print(f"  Hidden size: {encoder_config.hidden_size}")
         print(f"  Layers: {encoder_config.num_hidden_layers}")
         print(f"  Attention heads: {encoder_config.num_attention_heads}")
