@@ -453,13 +453,20 @@ def main():
                     encoder_k = None
                     encoder_v = None
                 else:
-                    # STEP 1: Encode question and context separately
-                    question_hidden = encoder(question_input, return_hidden_states=True)
-                    context_hidden = encoder(context_input, return_hidden_states=True)
+                    # STEP 1: Encode question and context separately (only if non-empty)
+                    hidden_states = []
+                    
+                    if len(question_tokens) > 0:
+                        question_hidden = encoder(question_input, return_hidden_states=True)
+                        hidden_states.append(question_hidden)
+                    
+                    if len(context_tokens) > 0:
+                        context_hidden = encoder(context_input, return_hidden_states=True)
+                        hidden_states.append(context_hidden)
                     
                     # STEP 2: Concatenate encoder outputs [q_len + c_len, hidden_dim]
                     # This becomes the K, V for decoder cross-attention
-                    encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
+                    encoder_kv = torch.cat(hidden_states, dim=0)
                     encoder_k = encoder_kv
                     encoder_v = encoder_kv
                 
