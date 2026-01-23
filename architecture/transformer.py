@@ -801,39 +801,43 @@ class Transformer(torch.nn.Module):
         update_context: bool = True,
         max_seq_len: int = None,
         encoder_k: torch.Tensor | None = None,
-        encoder_v: torch.Tensor | None = None
+        encoder_v: torch.Tensor | None = None,
+        max_dec_length: int = 1
     ) -> torch.Tensor:
         """
-        Forward pass with optional encoder-decoder cross-attention.
+        Forward pass with optional encoder-decoder cross-attention and chunked processing.
         
         Process:
-        1. Process each token individually (chunk size = 1)
-        2. Each token: self-attention → cross-attention (if encoder K,V provided) → MLP
-        3. Update context after each token
+        1. Split input into chunks of size max_dec_length
+        2. Process each chunk with self-attention and cross-attention
+        3. Use last token's hidden state from chunk N as context for chunk N+1
         
         Args:
             x: Input token IDs (seq_len,)
             update_context: Whether to update context state after processing
-            max_seq_len: Ignored - always process token by token
+            max_seq_len: Deprecated - use max_dec_length instead
             encoder_k: Optional encoder keys (enc_seq_len, hidden_size) - SVD compressed
             encoder_v: Optional encoder values (enc_seq_len, hidden_size) - SVD compressed
+            max_dec_length: Maximum chunk size for processing (default=1 for token-by-token)
         
-        Note: encoder_k and encoder_v are the SVD-compressed encoder outputs, 
-              used for cross-attention within each decoder token.
+        Note: encoder_k and encoder_v remain constant across all chunks.
         """
         input_len = x.shape[0]
         
-        # Process each token individually
+        # Split input into chunks
         all_logits = []
+        chunk_start = 0
         
-        for token_idx in range(input_len):
-            # Single token
-            token = x[token_idx:token_idx+1]
+        while chunk_start < input_len:
+            chunk_end = min(chunk_start + max_dec_length, input_len)
+            chunk = x[chunk_start:chunk_end]
             
-            # First token gets start token, subsequent tokens use context from previous
-            is_first_chunk = (token_idx == 0)
-            token_logits = self._forward_chunk(
-                token, 
+            # First chunk uses current context_state (zeros if reset)
+            # Subsequent chunks use context from previous chunk's last token
+            is_first_chunk = (chunk_start == 0)
+            
+            chunk_logits = self._forward_chunk(
+                chunk, 
                 update_context=update_context, 
                 is_first_chunk=is_first_chunk,
                 encoder_k=encoder_k,
@@ -841,9 +845,10 @@ class Transformer(torch.nn.Module):
                 return_hidden_states=False
             )
             
-            all_logits.append(token_logits)
+            all_logits.append(chunk_logits)
+            chunk_start = chunk_end
         
-        # Stack all token logits
+        # Concatenate all chunk logits
         logits = torch.cat(all_logits, dim=0)
         return logits
     

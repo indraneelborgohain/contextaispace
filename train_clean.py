@@ -16,7 +16,7 @@ from datasets import load_dataset
 
 from architecture.config import ModelConfig
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
-from architecture.transformer import Transformer, EncoderCrossAttentionLayer
+from architecture.transformer import Transformer
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 
 
@@ -173,6 +173,7 @@ def main():
     batch_size = 1
     gradient_accumulation_steps = 4
     max_qa_len = 128
+    max_dec_length = 128  # Decoder chunk size: matches encoder max length for efficient processing
     max_iters = 50000
     eval_interval = 100
     save_every = 500
@@ -202,15 +203,13 @@ def main():
     print(f"Effective batch: {batch_size * gradient_accumulation_steps}")
     print("="*60 + "\n")
     
-    # Get tokenizers - separate for encoder and decoder
-    encoder_tokenizer = get_encoder_tokenizer()
-    decoder_tokenizer = get_decoder_tokenizer()
+    # Get tokenizer - using GPT tokenizer for BOTH encoder and decoder
+    tokenizer = get_decoder_tokenizer()
     
-    encoder_vocab_size = encoder_tokenizer.vocab_size  # BERT vocab: ~30522
-    decoder_vocab_size = decoder_tokenizer.n_vocab      # Tiktoken vocab: ~200000+
+    vocab_size = tokenizer.n_vocab  # Tiktoken vocab: ~200000+
     
-    print(f"Encoder vocab size (BERT): {encoder_vocab_size}")
-    print(f"Decoder vocab size (Tiktoken): {decoder_vocab_size}\n")
+    print(f"Vocab size (GPT/Tiktoken): {vocab_size}")
+    print("Using same tokenizer for context/question and answer generation\n")
     
     # Check if loading from saved model
     if args.model_dir and os.path.exists(args.model_dir):
@@ -277,7 +276,7 @@ def main():
         # Original GPT-OSS: 2880 hidden, 12 layers, 64 heads, 32 experts
         # Smaller config: 768 hidden, 6 layers, 12 heads, 8 experts
         decoder_config = ModelConfig(
-            vocab_size=decoder_vocab_size,  # Use tiktoken vocab size
+            vocab_size=vocab_size,  # Use GPT/Tiktoken vocab size
             hidden_size=768,          # Reduced from 2880
             num_hidden_layers=6,      # Reduced from 12
             num_experts=8,            # Reduced from 32
@@ -311,35 +310,21 @@ def main():
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total\n")
     
     # ========================================
-    # Create encoder cross-attention layer
-    # ========================================
-    print("="*60)
-    print("ENCODER CROSS-ATTENTION LAYER")
-    print("="*60)
-    
-    # Create trainable encoder cross-attention layer
-    encoder_cross_attn = EncoderCrossAttentionLayer(
-        encoder_hidden_size=encoder_config.hidden_size,  # 1024 for BERT-large
-        num_attention_heads=16,
-        head_dim=64,
-        device=device
-    )
-    
-    encoder_cross_attn_params = sum(p.numel() for p in encoder_cross_attn.parameters())
-    print(f"✓ Encoder cross-attention layer created")
-    print(f"  Parameters: {encoder_cross_attn_params/1e6:.1f}M (trainable)\n")
-    
-    # ========================================
     # Training setup
     # ========================================
     print("="*60)
     print("TRAINING SETUP")
     print("="*60)
+    print("Architecture: Two encoders → concatenate outputs → decoder cross-attention")
+    print("  - Question encoder output: [q_len, 1024]")
+    print("  - Context encoder output: [c_len, 1024]")
+    print("  - Concatenated K,V: [q_len + c_len, 1024]")
+    print("  - Decoder queries: [dec_len, 768] attend to concatenated K,V")
+    print(f"  - Decoder chunk size: {max_dec_length} (1=token-by-token, >1=chunked)\n")
     
-    # Setup optimizer with only cross-attention parameters (encoder and decoder base are frozen)
+    # Setup optimizer with only decoder cross-attention parameters (encoders are frozen)
     trainable_params = [
-        *[p for p in decoder.parameters() if p.requires_grad],
-        *encoder_cross_attn.parameters()
+        *[p for p in decoder.parameters() if p.requires_grad]
     ]
     
     optimizer = torch.optim.AdamW(
@@ -349,11 +334,10 @@ def main():
         weight_decay=0.1
     )
     
-    print("✓ Optimizer created for cross-attention only:")
-    print(f"  Cross-attention LR: {cross_attn_lr}")
+    print("✓ Optimizer created for decoder cross-attention only:")
+    print(f"  Learning rate: {cross_attn_lr}")
     print(f"  Trainable params: {sum(p.numel() for p in trainable_params)/1e6:.1f}M")
-    print(f"    - Encoder cross-attn: {encoder_cross_attn_params/1e6:.1f}M")
-    print(f"    - Decoder cross-attn: {sum(p.numel() for p in decoder.parameters() if p.requires_grad)/1e6:.1f}M\n")
+    print(f"    - Decoder cross-attn + context layers: {sum(p.numel() for p in decoder.parameters() if p.requires_grad)/1e6:.1f}M\n")
     
     # Load dataset
     print("Loading MS MARCO dataset...")
@@ -410,7 +394,6 @@ def main():
     
     encoder.train()
     decoder.train()
-    encoder_cross_attn.train()
     
     best_val_loss = float('inf')
     train_idx = 0
@@ -443,16 +426,16 @@ def main():
             while answer and not answer[0].isalpha():
                 answer = answer[1:]
             
-            # Tokenize context and question separately with BERT tokenizer
-            context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)
-            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
+            # Tokenize context and question with GPT tokenizer
+            context_tokens = tokenizer.encode(context)
+            question_tokens = tokenizer.encode(question)
             
-            # Tokenize answer with decoder tokenizer (tiktoken)
-            answer_tokens = decoder_tokenizer.encode(answer)
+            # Tokenize answer with GPT tokenizer
+            answer_tokens = tokenizer.encode(answer)
             
             # Prepend <A> token to answer and add EOS token
-            a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-            end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+            a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+            end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
             answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
             
             # Create separate tensors for context and question
@@ -474,21 +457,24 @@ def main():
                     question_hidden = encoder(question_input, return_hidden_states=True)
                     context_hidden = encoder(context_input, return_hidden_states=True)
                     
-                    # STEP 2: Encoder-level cross-attention (question attends to context)
-                    # Returns attended question for both key and value (same sequence)
-                    encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
+                    # STEP 2: Concatenate encoder outputs [q_len + c_len, hidden_dim]
+                    # This becomes the K, V for decoder cross-attention
+                    encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
+                    encoder_k = encoder_kv
+                    encoder_v = encoder_kv
                 
                 # STEP 4: Decode
                 logits = decoder(
                     decoder_input,
                     encoder_k=encoder_k,
                     encoder_v=encoder_v,
-                    update_context=True  # Allow context updates during training
+                    update_context=True,  # Allow context updates during training
+                    max_dec_length=max_dec_length
                 )
                 
                 # Loss
                 loss = F.cross_entropy(
-                    logits.view(-1, decoder_vocab_size),
+                    logits.view(-1, vocab_size),
                     decoder_target.view(-1)
                 )
                 loss = loss / gradient_accumulation_steps
@@ -502,17 +488,64 @@ def main():
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         
-        # Logging
+        # Logging with quick prediction
         if it % log_interval == 0:
             # Add context state diagnostic
             context_norm = decoder.context_state.norm().item() if hasattr(decoder, 'context_state') else 0.0
             print(f"Iter {it:5d} | Loss: {total_loss:.4f} | LR: {cross_lr:.2e} | Ctx: {context_norm:.4f}")
+            
+            # Quick prediction sample (cycle through validation examples)
+            if len(val_examples) > 0:
+                encoder.eval()
+                decoder.eval()
+                
+                # Use different example each time
+                sample_idx = (it // log_interval) % len(val_examples)
+                example = val_examples[sample_idx]
+                question = example['question']
+                while question and not question[0].isalpha():
+                    question = question[1:]
+                
+                # Tokenize
+                context_tokens = tokenizer.encode(example['context'][:200])  # Truncate long context
+                question_tokens = tokenizer.encode(question)
+                context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
+                question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
+                
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                        # Get encoder outputs
+                        question_hidden = encoder(question_input, return_hidden_states=True)
+                        context_hidden = encoder(context_input, return_hidden_states=True)
+                        encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
+                        
+                        # Reset and generate
+                        decoder.reset_context()
+                        generated = []
+                        a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                        end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                        current_token = a_token_id
+                        
+                        for step in range(20):  # Short generation for quick check
+                            token_input = torch.tensor([current_token], dtype=torch.long, device=device)
+                            logits = decoder(token_input, encoder_k=encoder_kv, encoder_v=encoder_kv, 
+                                           update_context=True, max_dec_length=1)
+                            next_token = torch.argmax(logits[-1], dim=-1).item()
+                            if next_token == end_token_id:
+                                break
+                            generated.append(next_token)
+                            current_token = next_token
+                
+                gen_text = tokenizer.decode(generated) if generated else "[empty]"
+                print(f"  → Sample {sample_idx}: {gen_text}")
+                
+                encoder.train()
+                decoder.train()
         
         # Validation
         if it > 0 and it % eval_interval == 0:
             encoder.eval()
             decoder.eval()
-            encoder_cross_attn.eval()
             
             val_loss = 0.0
             num_val = min(10, len(val_examples))
@@ -536,16 +569,16 @@ def main():
                     while answer and not answer[0].isalpha():
                         answer = answer[1:]
                     
-                    # Tokenize context and question separately with BERT tokenizer
-                    context_tokens = encoder_tokenizer.encode(context, add_special_tokens=False)
-                    question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
+                    # Tokenize context and question with GPT tokenizer
+                    context_tokens = tokenizer.encode(context)
+                    question_tokens = tokenizer.encode(question)
                     
-                    # Tokenize answer with decoder tokenizer
-                    answer_tokens = decoder_tokenizer.encode(answer)
+                    # Tokenize answer with GPT tokenizer
+                    answer_tokens = tokenizer.encode(answer)
                     
                     # Prepend <A> token to answer and add EOS token
-                    a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-                    end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                     answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
                     
                     # Create separate tensors
@@ -555,12 +588,12 @@ def main():
                     decoder_target = torch.tensor(answer_tokens[1:], dtype=torch.long, device=device)
                     
                     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        # Two-encoder architecture
+                        # Two-encoder architecture: concatenate outputs
                         question_hidden = encoder(question_input, return_hidden_states=True)
                         context_hidden = encoder(context_input, return_hidden_states=True)
-                        encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
-                        logits = decoder(decoder_input, encoder_k=encoder_k, encoder_v=encoder_v)
-                        loss = F.cross_entropy(logits.view(-1, decoder_vocab_size), decoder_target.view(-1))
+                        encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
+                        logits = decoder(decoder_input, encoder_k=encoder_kv, encoder_v=encoder_kv, max_dec_length=max_dec_length)
+                        loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
                     
                     val_loss += loss.item()
             
@@ -584,26 +617,26 @@ def main():
             print(f"Question: {question}")
             print(f"Ground Truth: {example['answer']}")
             
-            # Tokenize context and question separately
-            context_tokens = encoder_tokenizer.encode(example['context'], add_special_tokens=False)
-            question_tokens = encoder_tokenizer.encode(question, add_special_tokens=False)
+            # Tokenize context and question with GPT tokenizer
+            context_tokens = tokenizer.encode(example['context'])
+            question_tokens = tokenizer.encode(question)
             context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
             question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
             
             with torch.no_grad():
                 with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                    # Two-encoder architecture
+                    # Two-encoder architecture: concatenate outputs
                     question_hidden = encoder(question_input, return_hidden_states=True)
                     context_hidden = encoder(context_input, return_hidden_states=True)
-                    encoder_k, encoder_v = encoder_cross_attn(question_hidden, context_hidden)
+                    encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
                     
                     # CRITICAL: Reset decoder context before generation
                     decoder.reset_context()
                     
-                    # Generate token by token using decoder tokenizer
+                    # Generate token by token using GPT tokenizer
                     generated = []
-                    a_token_id = decoder_tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-                    end_token_id = decoder_tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                     
                     current_token = a_token_id
                     max_gen_len = 64
@@ -614,9 +647,10 @@ def main():
                         
                         logits = decoder(
                             token_input,
-                            encoder_k=encoder_k,
-                            encoder_v=encoder_v,
-                            update_context=True  # Update context after each token
+                            encoder_k=encoder_kv,
+                            encoder_v=encoder_kv,
+                            update_context=True,  # Update context after each token
+                            max_dec_length=1  # Always token-by-token during generation
                         )
                         
                         # Use greedy decoding (argmax) for deterministic validation
@@ -633,7 +667,7 @@ def main():
                         generated.append(next_token)
                         current_token = next_token
             
-            generated_text = decoder_tokenizer.decode(generated)
+            generated_text = tokenizer.decode(generated)
             print(f"Generated: {generated_text}")
             print(f"{'='*60}\n")
             
@@ -657,17 +691,15 @@ def main():
                 torch.save(encoder_checkpoint, os.path.join(args.out_dir, 'encoder.pt'))
                 torch.save(decoder_checkpoint, os.path.join(args.out_dir, 'decoder.pt'))
                 
-                # Save tokenizers
-                encoder_tokenizer.save_pretrained(os.path.join(args.out_dir, 'encoder_tokenizer'))
-                # For decoder tokenizer (tiktoken), just save a marker file since it's reconstructed by code
-                with open(os.path.join(args.out_dir, 'decoder_tokenizer.txt'), 'w') as f:
-                    f.write('Use get_decoder_tokenizer() to load this tokenizer')
+                # Save tokenizer (unified GPT tokenizer)
+                # For tiktoken, just save a marker file since it's reconstructed by code
+                with open(os.path.join(args.out_dir, 'tokenizer.txt'), 'w') as f:
+                    f.write('Use get_decoder_tokenizer() to load this GPT tokenizer')
                 
                 print(f"✓ Saved best model (val_loss: {val_loss:.4f})\n")
             
             encoder.train()
             decoder.train()
-            encoder_cross_attn.train()
         
         # Save checkpoint
         if it > 0 and it % save_every == 0:
@@ -688,10 +720,9 @@ def main():
             torch.save(encoder_checkpoint, os.path.join(checkpoint_dir, 'encoder.pt'))
             torch.save(decoder_checkpoint, os.path.join(checkpoint_dir, 'decoder.pt'))
             
-            # Save tokenizers
-            encoder_tokenizer.save_pretrained(os.path.join(checkpoint_dir, 'encoder_tokenizer'))
-            with open(os.path.join(checkpoint_dir, 'decoder_tokenizer.txt'), 'w') as f:
-                f.write('Use get_decoder_tokenizer() to load this tokenizer')
+            # Save tokenizer (unified GPT tokenizer)
+            with open(os.path.join(checkpoint_dir, 'tokenizer.txt'), 'w') as f:
+                f.write('Use get_decoder_tokenizer() to load this GPT tokenizer')
             
             print(f"✓ Saved checkpoint at iter {it}\n")
         
