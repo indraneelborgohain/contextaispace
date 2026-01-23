@@ -449,18 +449,18 @@ def main():
             # Forward pass
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
                 # Skip encoder if both context and question are empty
-                if len(context_tokens) == 0 and len(question_tokens) == 0:
+                if question_input.numel() == 0 and context_input.numel() == 0:
                     encoder_k = None
                     encoder_v = None
                 else:
                     # STEP 1: Encode question and context separately (only if non-empty)
                     hidden_states = []
                     
-                    if len(question_tokens) > 0:
+                    if question_input.numel() > 0:
                         question_hidden = encoder(question_input, return_hidden_states=True)
                         hidden_states.append(question_hidden)
                     
-                    if len(context_tokens) > 0:
+                    if context_input.numel() > 0:
                         context_hidden = encoder(context_input, return_hidden_states=True)
                         hidden_states.append(context_hidden)
                     
