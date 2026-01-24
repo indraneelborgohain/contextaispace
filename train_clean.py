@@ -642,71 +642,71 @@ def main():
             print(f"{'='*60}")
             print(f"Val Loss: {val_loss:.4f}")
             
-            # Generate sample
-            example = val_examples[0]
-           
+            # Generate samples for ALL validation examples
+            print(f"\nSample Generations ({num_val} examples):")
+            print(f"{'='*60}")
             
-            # Prepare question (strip all leading non-alphabetic characters)
-            question = example['question']
-            while question and not question[0].isalpha():
-                question = question[1:]
-            print(f"\nSample Generation:")
-            print(f"Context: {example['context'][:200]}...")
-            print(f"Question: {question}")
-            print(f"Ground Truth: {example['answer']}")
+            for val_idx in range(num_val):
+                example = val_examples[val_idx]
+                
+                # Prepare question (strip all leading non-alphabetic characters)
+                question = example['question']
+                while question and not question[0].isalpha():
+                    question = question[1:]
+                
+                print(f"\n--- Example {val_idx + 1}/{num_val} ---")
+                print(f"Context: {example['context'][:150]}...")
+                print(f"Question: {question[:100]}")
+                print(f"Ground Truth: {example['answer']}")
+                
+                # Tokenize context and question with GPT tokenizer
+                context_tokens = tokenizer.encode(example['context'])
+                question_tokens = tokenizer.encode(question)
+                context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
+                question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
+                
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                        # Two-encoder architecture: concatenate outputs
+                        question_hidden = encoder(question_input, return_hidden_states=True)
+                        context_hidden = encoder(context_input, return_hidden_states=True)
+                        encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
+                        
+                        # CRITICAL: Reset decoder context before generation
+                        decoder.reset_context()
+                        
+                        # Generate token by token using GPT tokenizer
+                        generated = []
+                        a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                        end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                        
+                        current_token = a_token_id
+                        max_gen_len = 64
+                        
+                        for step in range(max_gen_len):
+                            # CRITICAL: Pass single token, let decoder handle context internally
+                            token_input = torch.tensor([current_token], dtype=torch.long, device=device)
+                            
+                            logits = decoder(
+                                token_input,
+                                encoder_k=encoder_kv,
+                                encoder_v=encoder_kv,
+                                update_context=True,  # Update context after each token
+                                max_dec_length=1  # Always token-by-token during generation
+                            )
+                            
+                            # Use greedy decoding (argmax) for deterministic validation
+                            next_token = torch.argmax(logits[-1], dim=-1).item()
+                            
+                            if next_token == end_token_id:
+                                break
+                            
+                            generated.append(next_token)
+                            current_token = next_token
+                
+                generated_text = tokenizer.decode(generated) if generated else "[empty]"
+                print(f"Generated: {generated_text}")
             
-            # Tokenize context and question with GPT tokenizer
-            context_tokens = tokenizer.encode(example['context'])
-            question_tokens = tokenizer.encode(question)
-            context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
-            question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
-            
-            with torch.no_grad():
-                with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                    # Two-encoder architecture: concatenate outputs
-                    question_hidden = encoder(question_input, return_hidden_states=True)
-                    context_hidden = encoder(context_input, return_hidden_states=True)
-                    encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
-                    
-                    # CRITICAL: Reset decoder context before generation
-                    decoder.reset_context()
-                    
-                    # Generate token by token using GPT tokenizer
-                    generated = []
-                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
-                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                    
-                    current_token = a_token_id
-                    max_gen_len = 64
-                    
-                    for step in range(max_gen_len):
-                        # CRITICAL: Pass single token, let decoder handle context internally
-                        token_input = torch.tensor([current_token], dtype=torch.long, device=device)
-                        
-                        logits = decoder(
-                            token_input,
-                            encoder_k=encoder_kv,
-                            encoder_v=encoder_kv,
-                            update_context=True,  # Update context after each token
-                            max_dec_length=1  # Always token-by-token during generation
-                        )
-                        
-                        # Use greedy decoding (argmax) for deterministic validation
-                        next_token = torch.argmax(logits[-1], dim=-1).item()
-                        
-                        # Debug first few tokens
-                        if step < 5:
-                            probs = F.softmax(logits[-1], dim=-1)
-                            print(f"  Gen step {step}: token={next_token}, prob={probs[next_token]:.4f}")
-                        
-                        if next_token == end_token_id:
-                            break
-                        
-                        generated.append(next_token)
-                        current_token = next_token
-            
-            generated_text = tokenizer.decode(generated)
-            print(f"Generated: {generated_text}")
             print(f"{'='*60}\n")
             
             # Save best model
