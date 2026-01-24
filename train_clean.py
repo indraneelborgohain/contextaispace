@@ -592,7 +592,7 @@ def main():
                             current_token = next_token
                 
                 gen_text = tokenizer.decode(generated) if generated else "[empty]"
-                print(f"  → Sample {sample_idx}: {gen_text}")
+                print(f"  → Sample {sample_idx} Answer: {gen_text}")
                 
                 encoder.train()
                 decoder.train()
@@ -681,8 +681,10 @@ def main():
                 
                 with torch.no_grad():
                     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                    # Encode only context (question is in decoder)
-                    encoder_kv = encoder(context_input, return_hidden_states=True)
+                        # Encode only context (question is in decoder)
+                        encoder_kv = encoder(context_input, return_hidden_states=True)
+                        
+                        # CRITICAL: Reset decoder context before generation
                         decoder.reset_context()
                         
                         # Generate token by token using GPT tokenizer
@@ -730,7 +732,7 @@ def main():
                             current_token = torch.argmax(logits[-1], dim=-1).item()
                 
                 generated_text = tokenizer.decode(generated) if generated else "[empty]"
-                print(f"Generated: {generated_text}")
+                print(f"Generated Answer: {generated_text}")
             
             print(f"{'='*60}\n")
             
