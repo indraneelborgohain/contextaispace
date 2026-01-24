@@ -262,17 +262,29 @@ def main():
             print("Creating encoder with random weights...")
             encoder = BidirectionalEncoder(encoder_config, device=device)
         
-        # Freeze all encoder parameters except embeddings
+        # Make encoder embeddings and top 3 layers trainable for semantic learning
+        num_layers = encoder_config.num_hidden_layers
+        trainable_layers = 3  # Train top 3 layers
+        
         for name, param in encoder.named_parameters():
+            # Always train embeddings (adapting to new tokenizer)
             if 'embedding' in name:
                 param.requires_grad = True
                 print(f"  ✓ Encoder trainable: {name}")
+            # Train top N layers (semantic adaptation)
+            elif any(f'layer.{i}.' in name for i in range(num_layers - trainable_layers, num_layers)):
+                param.requires_grad = True
+                if 'layer' in name and any(f'layer.{i}.' in name for i in range(num_layers - trainable_layers, num_layers)):
+                    layer_num = int(name.split('layer.')[1].split('.')[0])
+                    if layer_num >= num_layers - trainable_layers:
+                        print(f"  ✓ Encoder trainable: {name}")
             else:
                 param.requires_grad = False
         
         encoder_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
         encoder_total = sum(p.numel() for p in encoder.parameters())
-        print(f"\n✓ Encoder ready: {encoder_trainable/1e6:.1f}M trainable / {encoder_total/1e6:.1f}M total\n")
+        print(f"\n✓ Encoder ready: {encoder_trainable/1e6:.1f}M trainable / {encoder_total/1e6:.1f}M total")
+        print(f"  Training: embeddings + top {trainable_layers} layers (semantic adaptation)\n")
         
         # ========================================
         # STEP 3: Create decoder from GPT-OSS
@@ -302,17 +314,24 @@ def main():
         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
         
-        # Freeze all decoder parameters except cross-attention layers
+        # Train decoder embeddings, all attention, and cross-attention for semantic learning
         for name, param in decoder.named_parameters():
-            if 'context_proj' in name or 'cross_attn' in name:
+            # Train embeddings (semantic token representations)
+            if 'embedding' in name:
                 param.requires_grad = True
                 print(f"  ✓ Trainable: {name}")
+            # Train all attention layers (semantic understanding)
+            elif 'attn' in name or 'context_proj' in name or 'cross_attn' in name:
+                param.requires_grad = True
+                print(f"  ✓ Trainable: {name}")
+            # Keep FFN layers frozen (general knowledge)
             else:
                 param.requires_grad = False
         
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())
-        print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total\n")
+        print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total")
+        print(f"  Training: embeddings + all attention layers (semantic learning)\n")
     
     # ========================================
     # Training setup
