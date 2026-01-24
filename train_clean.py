@@ -311,6 +311,8 @@ def main():
         print(f"  Layers: {decoder_config.num_hidden_layers}")
         print(f"  Cross-attention: {decoder_config.use_encoder_decoder_cross_attention}")
         print(f"  Encoder hidden size: {decoder_config.encoder_hidden_size}")
+        print(f"  Sliding window: {decoder_config.sliding_window}")
+        print(f"  Initial context length: {decoder_config.initial_context_length}")
         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
         
@@ -339,11 +341,10 @@ def main():
     print("="*60)
     print("TRAINING SETUP")
     print("="*60)
-    print("Architecture: Two encoders → concatenate outputs → decoder cross-attention")
-    print("  - Question encoder output: [q_len, 1024]")
+    print("Architecture: Context encoder → decoder with question + answer")
     print("  - Context encoder output: [c_len, 1024]")
-    print("  - Concatenated K,V: [q_len + c_len, 1024]")
-    print("  - Decoder queries: [dec_len, 768] attend to concatenated K,V")
+    print("  - Decoder input: [question tokens] [answer tokens]")
+    print("  - Decoder cross-attention: attends to context encoder K,V")
     print(f"  - Decoder chunk size: {max_dec_length} (1=token-by-token, >1=chunked)\n")
     
     # Setup optimizer with encoder embeddings and decoder cross-attention parameters
@@ -483,42 +484,30 @@ def main():
             if len(answer_tokens) == 0:
                 continue
             
-            # Prepend <A> token to answer and add EOS token
-            a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+            # Concatenate question + answer (natural GPT-OSS format)
+            # Format: [question tokens] [answer tokens] [<|endoftext|>]
             end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-            answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
+            sequence_tokens = question_tokens + answer_tokens + [end_token_id]
             
-            # Create separate tensors for context and question
+            # Create separate tensors for context and question (for encoder)
             context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
             question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
             
-            # Create decoder input/target: <A> answer text -> answer text EOS
-            decoder_input = torch.tensor(answer_tokens[:-1], dtype=torch.long, device=device)
-            decoder_target = torch.tensor(answer_tokens[1:], dtype=torch.long, device=device)
+            # Create decoder input/target from concatenated sequence
+            # Input: question + answer[:-1]  Target: question[1:] + answer + EOS
+            decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
+            decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
             
             # Forward pass
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                # Skip encoder if both context and question are empty
-                if question_input.numel() == 0 and context_input.numel() == 0:
-                    encoder_k = None
-                    encoder_v = None
-                else:
-                    # STEP 1: Encode question and context separately (only if non-empty)
-                    hidden_states = []
-                    
-                    if question_input.numel() > 0:
-                        question_hidden = encoder(question_input, return_hidden_states=True)
-                        hidden_states.append(question_hidden)
-                    
-                    if context_input.numel() > 0:
-                        context_hidden = encoder(context_input, return_hidden_states=True)
-                        hidden_states.append(context_hidden)
-                    
-                    # STEP 2: Concatenate encoder outputs [q_len + c_len, hidden_dim]
-                    # This becomes the K, V for decoder cross-attention
-                    encoder_kv = torch.cat(hidden_states, dim=0)
+                # Encode only the context (question is already in decoder input)
+                if context_input.numel() > 0:
+                    encoder_kv = encoder(context_input, return_hidden_states=True)
                     encoder_k = encoder_kv
                     encoder_v = encoder_kv
+                else:
+                    encoder_k = None
+                    encoder_v = None
                 
                 # STEP 4: Decode
                 logits = decoder(
@@ -571,17 +560,26 @@ def main():
                 
                 with torch.no_grad():
                     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        # Get encoder outputs
-                        question_hidden = encoder(question_input, return_hidden_states=True)
-                        context_hidden = encoder(context_input, return_hidden_states=True)
-                        encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
+                        # Encode only context (question is in decoder)
+                        encoder_kv = encoder(context_input, return_hidden_states=True)
                         
-                        # Reset and generate
+                        # Reset and generate (start from question tokens)
                         decoder.reset_context()
                         generated = []
-                        a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
                         end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                        current_token = a_token_id
+                        
+                        # Feed question tokens first, then generate answer
+                        current_tokens = question_tokens.copy()
+                        for qt in current_tokens:
+                            token_input = torch.tensor([qt], dtype=torch.long, device=device)
+                            _ = decoder(token_input, encoder_k=encoder_kv, encoder_v=encoder_kv, 
+                                      update_context=True, max_dec_length=1)
+                        
+                        # Now generate answer tokens
+                        if len(current_tokens) > 0:
+                            current_token = current_tokens[-1]
+                        else:
+                            current_token = end_token_id
                         
                         for step in range(20):  # Short generation for quick check
                             token_input = torch.tensor([current_token], dtype=torch.long, device=device)
@@ -633,22 +631,19 @@ def main():
                     # Tokenize answer with GPT tokenizer
                     answer_tokens = tokenizer.encode(answer)
                     
-                    # Prepend <A> token to answer and add EOS token
-                    a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
+                    # Concatenate question + answer (natural GPT-OSS format)
                     end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                    answer_tokens = [a_token_id] + answer_tokens + [end_token_id]
+                    sequence_tokens = question_tokens + answer_tokens + [end_token_id]
                     
                     # Create separate tensors
                     context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
                     question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
-                    decoder_input = torch.tensor(answer_tokens[:-1], dtype=torch.long, device=device)
-                    decoder_target = torch.tensor(answer_tokens[1:], dtype=torch.long, device=device)
+                    decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
+                    decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
                     
                     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        # Two-encoder architecture: concatenate outputs
-                        question_hidden = encoder(question_input, return_hidden_states=True)
-                        context_hidden = encoder(context_input, return_hidden_states=True)
-                        encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
+                        # Encode only context (question is in decoder)
+                        encoder_kv = encoder(context_input, return_hidden_states=True)
                         logits = decoder(decoder_input, encoder_k=encoder_kv, encoder_v=encoder_kv, max_dec_length=max_dec_length)
                         loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
                     
@@ -686,42 +681,53 @@ def main():
                 
                 with torch.no_grad():
                     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        # Two-encoder architecture: concatenate outputs
-                        question_hidden = encoder(question_input, return_hidden_states=True)
-                        context_hidden = encoder(context_input, return_hidden_states=True)
-                        encoder_kv = torch.cat([question_hidden, context_hidden], dim=0)
-                        
-                        # CRITICAL: Reset decoder context before generation
+                    # Encode only context (question is in decoder)
+                    encoder_kv = encoder(context_input, return_hidden_states=True)
                         decoder.reset_context()
                         
                         # Generate token by token using GPT tokenizer
-                        generated = []
-                        a_token_id = tokenizer.encode("<A>", allowed_special={'<A>'})[0]
                         end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                         
-                        current_token = a_token_id
+                        # Feed question tokens first to set context
+                        for qt in question_tokens:
+                            token_input = torch.tensor([qt], dtype=torch.long, device=device)
+                            logits = decoder(
+                                token_input,
+                                encoder_k=encoder_kv,
+                                encoder_v=encoder_kv,
+                                update_context=True,
+                                max_dec_length=1
+                            )
+                        
+                        # Now generate answer tokens
+                        generated = []
+                        if len(question_tokens) > 0:
+                            # Start from last question token's prediction
+                            current_token = torch.argmax(logits[-1], dim=-1).item()
+                        else:
+                            current_token = end_token_id
+                        
                         max_gen_len = 64
                         
                         for step in range(max_gen_len):
-                            # CRITICAL: Pass single token, let decoder handle context internally
+                            if current_token == end_token_id:
+                                break
+                            
+                            generated.append(current_token)
+                            
+                            # Generate next token
                             token_input = torch.tensor([current_token], dtype=torch.long, device=device)
                             
                             logits = decoder(
                                 token_input,
                                 encoder_k=encoder_kv,
                                 encoder_v=encoder_kv,
-                                update_context=True,  # Update context after each token
-                                max_dec_length=1  # Always token-by-token during generation
+                                update_context=True,
+                                max_dec_length=1
                             )
                             
                             # Use greedy decoding (argmax) for deterministic validation
-                            next_token = torch.argmax(logits[-1], dim=-1).item()
-                            
-                            if next_token == end_token_id:
-                                break
-                            
-                            generated.append(next_token)
-                            current_token = next_token
+                            current_token = torch.argmax(logits[-1], dim=-1).item()
                 
                 generated_text = tokenizer.decode(generated) if generated else "[empty]"
                 print(f"Generated: {generated_text}")
