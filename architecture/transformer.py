@@ -393,10 +393,10 @@ class ContextStateCrossAttention(torch.nn.Module):
         
         self.sm_scale = 1 / math.sqrt(config.head_dim)
         
-        # Gated tanh parameter: initialized to 0 so initially no context state contribution
-        # Preserves GPT-OSS behavior initially
+        # Gated tanh parameter: initialized to small value for gradual integration
+        # Allows context state to contribute from the start while preserving GPT-OSS behavior
         self.angle = torch.nn.Parameter(
-            torch.zeros(1, device=device, dtype=torch.bfloat16)
+            torch.full((1,), 0.1, device=device, dtype=torch.bfloat16)
         )
     
     def forward(
@@ -639,11 +639,11 @@ class CrossAttentionLayer(torch.nn.Module):
         
         self.sm_scale = 1 / math.sqrt(config.head_dim)
         
-        # Gated tanh parameter: initialized to 0 so initially no cross-attention
-        # When angle=0: tanh(0)=0 → output = residual (original GPT-OSS)
-        # As angle increases: tanh(angle)→1 → gradually incorporate cross-attention
+        # Gated tanh parameter: initialized to small value for gradual integration
+        # When angle=0.1: tanh(0.1)≈0.1 → 10% cross-attention contribution initially
+        # This allows the model to use context from the start while preserving GPT-OSS
         self.angle = torch.nn.Parameter(
-            torch.zeros(1, device=device, dtype=torch.bfloat16)
+            torch.full((1,), 0.1, device=device, dtype=torch.bfloat16)
         )
     
     def forward(

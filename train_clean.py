@@ -316,14 +316,15 @@ def main():
         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
         
-        # Train decoder embeddings, all attention, and cross-attention for semantic learning
+        # FREEZE decoder embeddings to preserve GPT-OSS fluency
+        # Train only attention layers (cross-attention and self-attention adaptations)
         for name, param in decoder.named_parameters():
-            # Train embeddings (semantic token representations)
-            if 'embedding' in name:
-                param.requires_grad = True
-                print(f"  ✓ Trainable: {name}")
+            # FREEZE embeddings to preserve language fluency from GPT-OSS
+            if 'embedding' in name or 'unembedding' in name:
+                param.requires_grad = False
+                print(f"  ❄ Frozen (preserve fluency): {name}")
             # Train all attention layers (semantic understanding)
-            elif 'attn' in name or 'context_proj' in name or 'cross_attn' in name:
+            elif 'attn' in name or 'context_proj' in name or 'cross_attn' in name or 'angle' in name:
                 param.requires_grad = True
                 print(f"  ✓ Trainable: {name}")
             # Keep FFN layers frozen (general knowledge)
