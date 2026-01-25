@@ -442,6 +442,7 @@ def main():
         print(f"Test prompt: '{test_prompt}'")
         print(f"Tokens: {test_tokens[:10]}...")
         
+        # Use batched input [batch, seq_len]
         input_ids = torch.tensor([test_tokens], dtype=torch.long, device=device)
         
         with torch.amp.autocast(device_type='cuda', dtype=dtype):
@@ -453,7 +454,7 @@ def main():
                 # GPT-OSS forward: returns (logits, aux_dict)
                 logits, aux_dict = decoder(input_ids)
                 
-                # Get next token (greedy)
+                # Get next token (greedy) - batched, so logits is [batch, seq_len, vocab_size]
                 next_token = torch.argmax(logits[0, -1, :]).item()
                 
                 # Check for EOS
@@ -463,7 +464,7 @@ def main():
                 
                 generated_tokens.append(next_token)
                 
-                # Update input
+                # Update input - append to batched sequence
                 input_ids = torch.cat([
                     input_ids,
                     torch.tensor([[next_token]], dtype=torch.long, device=device)
