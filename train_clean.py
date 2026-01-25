@@ -223,7 +223,6 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
     with torch.no_grad():
         for val_idx in range(num_val):
             # CRITICAL: Reset context for each validation example
-            decoder.reset_context()
             
             example = val_examples[val_idx]
             
@@ -647,7 +646,6 @@ def main():
         total_loss = 0.0
         for micro_step in range(gradient_accumulation_steps):
             # CRITICAL: Reset context before each example to prevent bleeding
-            decoder.reset_context()
             
             # Get batch
             example = train_examples[train_idx % len(train_examples)]
