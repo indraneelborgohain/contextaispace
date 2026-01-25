@@ -477,17 +477,14 @@ def main():
         encoder_hidden_size = encoder_config.hidden_size  # 1024 for BERT-large
         decoder = load_decoder(decoder_config, device, encoder_hidden_size)
         
-        # Train cross-attention, embeddings, and LM head for better adaptation
+        # Train entire decoder from scratch
         for name, param in decoder.named_parameters():
-            if 'cross_attn' in name or 'embed' in name or 'lm_head' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+            param.requires_grad = True
         
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total")
-        print(f"  Training: Cross-attention, embeddings, and LM head\n")
+        print(f"  Training: ALL decoder layers (from scratch)\n")
     
     # ========================================
     # Training setup
