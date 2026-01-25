@@ -505,7 +505,7 @@ def main():
         
         decoder_config = gpt_oss_20b_config()
         # Override to use smaller model for GPU constraints
-        decoder_config.num_hidden_layers = 12  # Use 12 layers instead of 24
+        decoder_config.num_hidden_layers = 6  # Use 6 layers instead of 24
         
         # Enable cross-attention with BERT encoder (1024 hidden size)
         encoder_hidden_size = encoder_config.hidden_size  # 1024 for BERT-large
