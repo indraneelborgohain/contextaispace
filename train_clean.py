@@ -524,7 +524,7 @@ def main():
         print(f"  Layers: {decoder_config.num_hidden_layers}")
         print(f"  Attention heads: {decoder_config.num_attention_heads}")
         print(f"  KV heads (GQA): {decoder_config.num_key_value_heads}")
-        print(f"  MoE experts: {decoder_config.num_local_experts}")
+        print(f"  MoE experts: {decoder_config.num_experts}")
         print(f"  Experts per token: {decoder_config.experts_per_token}")
         print(f"  Sliding window: {decoder_config.sliding_window}\n")
         
