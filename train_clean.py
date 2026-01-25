@@ -427,6 +427,62 @@ def main():
     print(f"    - Encoder embeddings: {sum(p.numel() for p in encoder.parameters() if p.requires_grad)/1e6:.1f}M")
     print(f"    - Decoder cross-attn + context layers: {sum(p.numel() for p in decoder.parameters() if p.requires_grad)/1e6:.1f}M\n")
     
+    # ========================================
+    # SANITY CHECK: Test decoder fluency before training
+    # ========================================
+    print("="*60)
+    print("SANITY CHECK: Testing GPT-OSS decoder fluency")
+    print("="*60)
+    
+    decoder.eval()
+    with torch.no_grad():
+        # Test pure decoder generation (GPT-OSS native forward)
+        test_prompt = "The capital of France is"
+        test_tokens = tokenizer.encode(test_prompt)
+        print(f"Test prompt: '{test_prompt}'")
+        print(f"Tokens: {test_tokens[:10]}...")
+        
+        input_ids = torch.tensor([test_tokens], dtype=torch.long, device=device)
+        
+        with torch.amp.autocast(device_type='cuda', dtype=dtype):
+            # Generate tokens
+            max_new_tokens = 30
+            generated_tokens = test_tokens.copy()
+            
+            for _ in range(max_new_tokens):
+                # GPT-OSS forward: returns (logits, aux_dict)
+                logits, aux_dict = decoder(input_ids)
+                
+                # Get next token (greedy)
+                next_token = torch.argmax(logits[0, -1, :]).item()
+                
+                # Check for EOS
+                end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                if next_token == end_token_id:
+                    break
+                
+                generated_tokens.append(next_token)
+                
+                # Update input
+                input_ids = torch.cat([
+                    input_ids,
+                    torch.tensor([[next_token]], dtype=torch.long, device=device)
+                ], dim=1)
+            
+            full_text = tokenizer.decode(generated_tokens)
+            print(f"Generated: '{full_text}'")
+            
+            # Check if output is reasonable
+            if len(full_text) > len(test_prompt) + 10:
+                print("✅ Decoder generated text!")
+                if any(c.isalpha() for c in full_text[len(test_prompt):]):
+                    print("✅ Generated text contains letters - GPT-OSS is working!")
+                else:
+                    print("⚠️  Generated text has no letters")
+            else:
+                print("⚠️  Decoder generated very little text")
+    decoder.train()
+    
     # Load datasets
     print("="*60)
     print("LOADING DATASETS")
@@ -486,68 +542,12 @@ def main():
     train_examples = msmarco_train + processed_tinystories_train
     val_examples = msmarco_val + processed_tinystories_val
     
-    print(f"\n\u2713 Total training examples: {len(train_examples)}")
+    print(f"\n✓ Total training examples: {len(train_examples)}")
     print(f"  - MS MARCO: {len(msmarco_train)}")
     print(f"  - TinyStories: {len(processed_tinystories_train)}")
-    print(f"\n\u2713 Total validation examples: {len(val_examples)}")
+    print(f"\n✓ Total validation examples: {len(val_examples)}")
     print(f"  - MS MARCO: {len(msmarco_val)}")
     print(f"  - TinyStories: {len(processed_tinystories_val)}\n")
-    
-    # ========================================
-    # SANITY CHECK: Test decoder fluency before training
-    # ========================================
-    print("="*60)
-    print("SANITY CHECK: Testing GPT-OSS decoder fluency")
-    print("="*60)
-    
-    decoder.eval()
-    with torch.no_grad():
-        # Test pure decoder generation (GPT-OSS native forward)
-        test_prompt = "The capital of France is"
-        test_tokens = tokenizer.encode(test_prompt)
-        print(f"Test prompt: '{test_prompt}'")
-        print(f"Tokens: {test_tokens[:10]}...")
-        
-        input_ids = torch.tensor([test_tokens], dtype=torch.long, device=device)
-        
-        with torch.amp.autocast(device_type='cuda', dtype=dtype):
-            # Generate tokens
-            max_new_tokens = 30
-            generated_tokens = test_tokens.copy()
-            
-            for _ in range(max_new_tokens):
-                # GPT-OSS forward: returns (logits, aux_dict)
-                logits, aux_dict = decoder(input_ids)
-                
-                # Get next token (greedy)
-                next_token = torch.argmax(logits[0, -1, :]).item()
-                
-                # Check for EOS
-                end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                if next_token == end_token_id:
-                    break
-                
-                generated_tokens.append(next_token)
-                
-                # Update input
-                input_ids = torch.cat([
-                    input_ids,
-                    torch.tensor([[next_token]], dtype=torch.long, device=device)
-                ], dim=1)
-            
-            full_text = tokenizer.decode(generated_tokens)
-            print(f"Generated: '{full_text}'")
-            
-            # Check if output is reasonable
-            if len(full_text) > len(test_prompt) + 10:
-                print("✅ Decoder generated text!")
-                if any(c.isalpha() for c in full_text[len(test_prompt):]):
-                    print("✅ Generated text contains letters - GPT-OSS is working!")
-                else:
-                    print("⚠️  Generated text has no letters")
-            else:
-                print("⚠️  Decoder generated very little text")
-    decoder.train()
     
     best_val_loss = float('inf')
     train_idx = 0
