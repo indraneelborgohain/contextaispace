@@ -693,10 +693,6 @@ def main():
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
                 # Encode only the context (question is already in decoder input)
                 if context_input.numel() > 0:
-                    encoder_kv = encoder(context_input, return_hidden_states=True)
-                    encoder_k = encoder_kv
-                    encoder_v = encoder_kv
-                else:
                     encoder_output = encoder(context_input, return_hidden_states=True)
                     # Add batch dimension if needed
                     if encoder_output.dim() == 2:
@@ -709,7 +705,11 @@ def main():
                     decoder_input.unsqueeze(0),
                     encoder_output=encoder_output
                 )
-                logits = logits.squeeze(0    with torch.no_grad():
+                logits = logits.squeeze(0)
+                
+                # Debug: print predictions occasionally
+                if it % log_interval == 0 and micro_step == 0:
+                    with torch.no_grad():
                         predicted_tokens = torch.argmax(logits, dim=-1).cpu().tolist()
                         predicted_text = tokenizer.decode(predicted_tokens)
                         target_text = tokenizer.decode(decoder_target.cpu().tolist())
