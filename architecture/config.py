@@ -13,6 +13,7 @@ class ModelConfig:
     num_hidden_layers: int = 24
     num_experts: int = 32
     experts_per_token: int = 4
+    use_moe: bool = True  # Use MoE layers (False = standard FFN for GPT-OSS compatibility)
     vocab_size: int = 201088
     hidden_size: int = 2880
     intermediate_size: int = 2880

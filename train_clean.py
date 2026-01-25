@@ -565,7 +565,8 @@ def main():
             intermediate_size=2880,             # GPT-OSS FFN size
             num_experts=32,                     # GPT-OSS has 32 experts
             experts_per_token=4,                # GPT-OSS uses top-4 routing
-            head_dim=64,                        # 2880 / 64 = 45 (will be overridden by attention)
+            use_moe=True,                       # GPT-OSS uses MoE
+            head_dim=64,                        # 2880 / 45 ≈ 64 per head
             use_encoder_decoder_cross_attention=True,
             encoder_hidden_size=encoder_config.hidden_size,
             use_context_embedding=True,         # Enable context state tracking
