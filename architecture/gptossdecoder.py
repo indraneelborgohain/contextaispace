@@ -19,8 +19,8 @@ class ModelConfig:
     intermediate_size: int = 2880
     swiglu_limit: float = 7.0
     head_dim: int = 64
-    num_attention_heads: int = 64
-    num_key_value_heads: int = 8
+    num_attention_heads: int = 45  # 2880 / 64 = 45 heads
+    num_key_value_heads: int = 5   # Keep GQA ratio similar (45/5 = 9 vs 64/8 = 8)
     sliding_window: int = 128
     initial_context_length: int = 4096
     rope_theta: float = 150000.0
@@ -40,8 +40,8 @@ def gpt_oss_20b_config() -> ModelConfig:
         intermediate_size=2880,
         swiglu_limit=7.0,
         head_dim=64,
-        num_attention_heads=64,
-        num_key_value_heads=8,
+        num_attention_heads=45,  # 2880 / 64 = 45 heads
+        num_key_value_heads=5,   # Keep GQA ratio similar
         sliding_window=128,
         initial_context_length=4096,
         rope_theta=150000.0,
