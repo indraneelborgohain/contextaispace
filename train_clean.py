@@ -15,7 +15,8 @@ import torch.nn.functional as F
 from datasets import load_dataset
 
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
-from architecture.decoder import Transformer, load_decoder
+from architecture.decoder import Transformer
+from architecture.model_loader import load_decoder
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
 from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
