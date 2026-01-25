@@ -325,9 +325,6 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                 if val_idx == 0:
                     print(f"Encoder output shape: {encoder_kv.shape}")
                 
-                # CRITICAL: Reset decoder context before generation
-                decoder.reset_context()
-                
                 # Generate token by token using GPT tokenizer
                 end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
                 
