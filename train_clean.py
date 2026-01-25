@@ -131,12 +131,6 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
             
             print(f"  ✓ Layer {layer_idx} (attention + FFN)")
             break
-                decoder.state_dict()[f'{dec_prefix}.attn.out.weight'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_proj.weight'])
-                decoder.state_dict()[f'{dec_prefix}.attn.out.bias'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_proj.bias'])
-                loaded_count += 2
-            
-            print(f"  ✓ Layer {layer_idx} (attention + FFN)")
-            break
     
     print(f"\n✓ Successfully loaded {loaded_count} parameter groups from GPT-OSS")
     print(f"✓ Loaded: embeddings + attention + FFN (full GPT-OSS weights)")
