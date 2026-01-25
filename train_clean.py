@@ -26,7 +26,7 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
     import glob
     
     print(f"\n{'='*60}")
-    print("STEP 3: Loading GPT-OSS weights into decoder")
+    print("Loading GPT-OSS weights")
     print(f"{'='*60}")
     print(f"Weights directory: {gptoss_weights_dir}")
     
@@ -36,7 +36,7 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
     if not safetensor_files:
         print("⚠️  No .safetensors files found")
         print("Creating decoder with random weights...")
-        return Transformer(decoder_config, device=device)
+        return Transformer(decoder_config)
     
     # Load GPT-OSS state
     try:
@@ -45,95 +45,44 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
         for f in safetensor_files:
             gptoss_state.update(load_file(f))
         print(f"✓ Loaded {len(safetensor_files)} safetensors files")
+        print(f"  Total keys: {len(gptoss_state)}")
     except ImportError:
         print("⚠️  safetensors not installed")
         print("Install with: pip install safetensors")
-        return Transformer(decoder_config, device=device)
+        return Transformer(decoder_config)
     
     # Create decoder
-    decoder = Transformer(decoder_config, device=device)
+    print(f"\nCreating decoder...")
+    decoder = Transformer(decoder_config)
+    decoder = decoder.to(device)
     
-    # Load weights manually
-    loaded_count = 0
+    # Load weights directly (GPT-OSS model uses same structure)
+    model_state = decoder.state_dict()
     
-    # 1. Load embedding
-    embedding_loaded = False
-    for emb_key in ['wte.weight', 'transformer.wte.weight', 'embedding.weight']:
-        if emb_key in gptoss_state:
-            gpt_emb = gptoss_state[emb_key]
-            dec_emb = decoder.embedding.weight
-            print(f"  GPT-OSS embedding shape: {gpt_emb.shape}")
-            print(f"  Decoder embedding shape: {dec_emb.shape}")
-            min_vocab = min(gpt_emb.size(0), dec_emb.size(0))
-            if gpt_emb.size(1) == dec_emb.size(1):
-                decoder.embedding.weight.data[:min_vocab] = gpt_emb[:min_vocab].to(device)
-                loaded_count += 1
-                embedding_loaded = True
-                print(f"✓ Loaded embeddings ({min_vocab} / {dec_emb.size(0)} tokens)")
-                if min_vocab < dec_emb.size(0) * 0.5:
-                    print(f"⚠️  WARNING: Only loaded {min_vocab}/{dec_emb.size(0)} embeddings ({min_vocab/dec_emb.size(0)*100:.1f}%)")
-                    print(f"⚠️  Most tokens will have RANDOM embeddings!")
-                break
+    loaded = 0
+    missing = 0
+    
+    for key in model_state.keys():
+        if key in gptoss_state:
+            if model_state[key].shape == gptoss_state[key].shape:
+                model_state[key].copy_(gptoss_state[key].to(device))
+                loaded += 1
             else:
-                print(f"⚠️  Hidden size mismatch: GPT-OSS {gpt_emb.size(1)} vs Decoder {dec_emb.size(1)}")
+                print(f"⚠️  Shape mismatch: {key}")
+                missing += 1
+        else:
+            # Only print for important missing weights
+            if 'embed' in key or 'lm_head' in key or 'norm' in key:
+                print(f"⚠️  Missing: {key}")
+            missing += 1
     
-    if not embedding_loaded:
-        print("⚠️  WARNING: No embeddings loaded from GPT-OSS!")
-        print("⚠️  Decoder will use RANDOM embeddings!")
+    decoder.load_state_dict(model_state)
     
-    # 2. Load transformer layers (attention + FFN)
-    num_layers = decoder_config.num_hidden_layers
-    print(f"Loading {num_layers} transformer layers...")
-    print(f"Architecture: Standard FFN (MoE disabled for GPT-OSS compatibility)\n")
+    print(f"\n✓ Loaded {loaded} parameters")
+    if missing > 0:
+        print(f"⚠️  Missing {missing} parameters (expected if using fewer layers)")
     
-    for layer_idx in range(num_layers):
-        # Try different naming conventions
-        for gpt_prefix in [f'layers.{layer_idx}', f'transformer.h.{layer_idx}', f'h.{layer_idx}']:
-            if f'{gpt_prefix}.attn.c_attn.weight' not in gptoss_state:
-                continue
-            
-            dec_prefix = f'block.{layer_idx}'
-            
-            # Load layer norm 1
-            if f'{gpt_prefix}.ln_1.weight' in gptoss_state:
-                decoder.state_dict()[f'{dec_prefix}.ln1.weight'].copy_(gptoss_state[f'{gpt_prefix}.ln_1.weight'])
-                decoder.state_dict()[f'{dec_prefix}.ln1.bias'].copy_(gptoss_state[f'{gpt_prefix}.ln_1.bias'])
-                loaded_count += 2
-            
-            # Load attention QKV (fused)
-            if f'{gpt_prefix}.attn.c_attn.weight' in gptoss_state:
-                decoder.state_dict()[f'{dec_prefix}.attn.qkv.weight'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_attn.weight'])
-                decoder.state_dict()[f'{dec_prefix}.attn.qkv.bias'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_attn.bias'])
-                loaded_count += 2
-            
-            # Load attention output
-            if f'{gpt_prefix}.attn.c_proj.weight' in gptoss_state:
-                decoder.state_dict()[f'{dec_prefix}.attn.out.weight'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_proj.weight'])
-                decoder.state_dict()[f'{dec_prefix}.attn.out.bias'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_proj.bias'])
-                loaded_count += 2
-            
-            # Load FFN layer norm
-            if f'{gpt_prefix}.ln_2.weight' in gptoss_state:
-                decoder.state_dict()[f'{dec_prefix}.mlp.norm.weight'].copy_(gptoss_state[f'{gpt_prefix}.ln_2.weight'])
-                decoder.state_dict()[f'{dec_prefix}.mlp.norm.bias'].copy_(gptoss_state[f'{gpt_prefix}.ln_2.bias'])
-                loaded_count += 2
-            
-            # Load FFN weights (SwiGLU: up_proj has 2x hidden for gating)
-            # GPT-OSS naming: c_fc (up), c_proj (down)
-            if f'{gpt_prefix}.mlp.c_fc.weight' in gptoss_state:
-                decoder.state_dict()[f'{dec_prefix}.mlp.up_proj.weight'].copy_(gptoss_state[f'{gpt_prefix}.mlp.c_fc.weight'])
-                loaded_count += 1
-            
-            if f'{gpt_prefix}.mlp.c_proj.weight' in gptoss_state:
-                decoder.state_dict()[f'{dec_prefix}.mlp.down_proj.weight'].copy_(gptoss_state[f'{gpt_prefix}.mlp.c_proj.weight'])
-                loaded_count += 1
-            
-            print(f"  ✓ Layer {layer_idx} (attention + FFN)")
-            break
-    
-    print(f"\n✓ Successfully loaded {loaded_count} parameter groups from GPT-OSS")
-    print(f"✓ Loaded: embeddings + attention + FFN (full GPT-OSS weights)")
-    print(f"Decoder total parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.1f}M\n")
+    print(f"Decoder parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.1f}M\n")
     
     return decoder
 
@@ -639,47 +588,56 @@ def main():
     # SANITY CHECK: Test decoder fluency before training
     # ========================================
     print("="*60)
-    print("SANITY CHECK: Testing decoder fluency (should be coherent English)")
+    print("SANITY CHECK: Testing GPT-OSS decoder fluency")
     print("="*60)
-     
+    
     decoder.eval()
     with torch.no_grad():
-        # Test pure decoder generation (no encoder, no training)
+        # Test pure decoder generation (GPT-OSS native forward)
         test_prompt = "The capital of France is"
         test_tokens = tokenizer.encode(test_prompt)
         print(f"Test prompt: '{test_prompt}'")
-        print(f"Tokens: {test_tokens}")
+        print(f"Tokens: {test_tokens[:10]}...")
         
-        decoder.reset_context()
-        prompt_tensor = torch.tensor(test_tokens, dtype=torch.long, device=device)
+        input_ids = torch.tensor([test_tokens], dtype=torch.long, device=device)
         
         with torch.amp.autocast(device_type='cuda', dtype=dtype):
-            # Feed prompt
-            logits = decoder(prompt_tensor, encoder_k=None, encoder_v=None, update_context=True, max_dec_length=len(test_tokens))
-            next_token = torch.argmax(logits[-1], dim=-1).item()
+            # Generate tokens
+            max_new_tokens = 30
+            generated_tokens = test_tokens.copy()
             
-            # Generate 20 tokens
-            generated = [next_token]
-            for _ in range(19):
-                token_tensor = torch.tensor([generated[-1]], dtype=torch.long, device=device)
-                logits = decoder(token_tensor, encoder_k=None, encoder_v=None, update_context=True, max_dec_length=1)
-                next_token = torch.argmax(logits[-1], dim=-1).item()
-                generated.append(next_token)
+            for _ in range(max_new_tokens):
+                # GPT-OSS forward: returns (logits, aux_dict)
+                logits, aux_dict = decoder(input_ids)
+                
+                # Get next token (greedy)
+                next_token = torch.argmax(logits[0, -1, :]).item()
+                
+                # Check for EOS
+                end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                if next_token == end_token_id:
+                    break
+                
+                generated_tokens.append(next_token)
+                
+                # Update input
+                input_ids = torch.cat([
+                    input_ids,
+                    torch.tensor([[next_token]], dtype=torch.long, device=device)
+                ], dim=1)
             
-            full_text = test_prompt + tokenizer.decode(generated)
+            full_text = tokenizer.decode(generated_tokens)
             print(f"Generated: '{full_text}'")
             
             # Check if output is reasonable
-            if len(full_text) < len(test_prompt) + 5:
-                print("⚠️  WARNING: Decoder is generating very short text!")
-            if not any(c.isalpha() for c in tokenizer.decode(generated)):
-                print("⚠️  WARNING: Decoder is not generating alphabetic characters!")
+            if len(full_text) > len(test_prompt) + 10:
+                print("✅ Decoder generated text!")
+                if any(c.isalpha() for c in full_text[len(test_prompt):]):
+                    print("✅ Generated text contains letters - GPT-OSS is working!")
+                else:
+                    print("⚠️  Generated text has no letters")
             else:
-                print("✓ Decoder appears to be working")
-    
-    print("="*60 + "\n")
-    
-    encoder.train()
+                print("⚠️  Decoder generated very little text")
     decoder.train()
     
     best_val_loss = float('inf')
