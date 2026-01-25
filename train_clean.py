@@ -667,6 +667,16 @@ def main():
                     max_dec_length=max_dec_length
                 )
                 
+                # Debug: Print predicted text every 100 iterations
+                if it % 100 == 0 and micro_step == 0:
+                    with torch.no_grad():
+                        predicted_tokens = torch.argmax(logits, dim=-1).cpu().tolist()
+                        predicted_text = tokenizer.decode(predicted_tokens)
+                        target_text = tokenizer.decode(decoder_target.cpu().tolist())
+                        print(f"\n[Iter {it}] Training sample:")
+                        print(f"  Predicted: {predicted_text[:200]}")
+                        print(f"  Target:    {target_text[:200]}\n")
+                
                 # Loss
                 loss = F.cross_entropy(
                     logits.view(-1, vocab_size),
