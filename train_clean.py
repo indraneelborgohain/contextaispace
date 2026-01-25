@@ -17,7 +17,8 @@ from datasets import load_dataset
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
 from architecture.decoder import Transformer, ModelConfig as DecoderConfig
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
-from dataloader.msmarco_loader import load_and_prepare_data
+from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
+from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
 
 
 def load_decoder(decoder_config, device, encoder_hidden_size=None):
@@ -451,9 +452,71 @@ def main():
     print(f"    - Encoder embeddings: {sum(p.numel() for p in encoder.parameters() if p.requires_grad)/1e6:.1f}M")
     print(f"    - Decoder cross-attn + context layers: {sum(p.numel() for p in decoder.parameters() if p.requires_grad)/1e6:.1f}M\n")
     
-    # Load dataset
-    dataset = load_dataset("ms_marco", "v2.1")
-    train_examples, val_examples = load_and_prepare_data(dataset, tokenizer)
+    # Load datasets
+    print("="*60)
+    print("LOADING DATASETS")
+    print("="*60)
+    
+    # Load MS MARCO
+    print("\nLoading MS MARCO...")
+    msmarco_dataset = load_dataset("ms_marco", "v2.1")
+    msmarco_train, msmarco_val = load_msmarco(msmarco_dataset, tokenizer)
+    
+    # Load TinyStories
+    print("\nLoading TinyStories...")
+    tinystories_dataset = load_dataset("roneneldan/TinyStories")
+    tinystories_train, tinystories_val = load_tinystories(tinystories_dataset, tokenizer, max_length=2048)
+    
+    # Process TinyStories to split into context/target for encoder-decoder training
+    print("\nProcessing TinyStories for encoder-decoder training...")
+    processed_tinystories_train = []
+    for story_ex in tinystories_train:
+        story = story_ex['text']
+        # Split story roughly in half: first half = context, second half = answer
+        story_tokens = tokenizer.encode(story)
+        mid_point = len(story_tokens) // 2
+        
+        context_tokens = story_tokens[:mid_point]
+        answer_tokens = story_tokens[mid_point:]
+        
+        # Decode back to text
+        context = tokenizer.decode(context_tokens)
+        answer = tokenizer.decode(answer_tokens)
+        
+        processed_tinystories_train.append({
+            'context': context,
+            'question': '',  # No question for stories
+            'answer': answer
+        })
+    
+    processed_tinystories_val = []
+    for story_ex in tinystories_val:
+        story = story_ex['text']
+        story_tokens = tokenizer.encode(story)
+        mid_point = len(story_tokens) // 2
+        
+        context_tokens = story_tokens[:mid_point]
+        answer_tokens = story_tokens[mid_point:]
+        
+        context = tokenizer.decode(context_tokens)
+        answer = tokenizer.decode(answer_tokens)
+        
+        processed_tinystories_val.append({
+            'context': context,
+            'question': '',
+            'answer': answer
+        })
+    
+    # Combine datasets
+    train_examples = msmarco_train + processed_tinystories_train
+    val_examples = msmarco_val + processed_tinystories_val
+    
+    print(f"\n\u2713 Total training examples: {len(train_examples)}")
+    print(f"  - MS MARCO: {len(msmarco_train)}")
+    print(f"  - TinyStories: {len(processed_tinystories_train)}")
+    print(f"\n\u2713 Total validation examples: {len(val_examples)}")
+    print(f"  - MS MARCO: {len(msmarco_val)}")
+    print(f"  - TinyStories: {len(processed_tinystories_val)}\n")
     
     # ========================================
     # SANITY CHECK: Test decoder fluency before training
@@ -594,28 +657,15 @@ def main():
                     encoder_output=encoder_output
                 )
                 logits = logits.squeeze(0)
-                
-                # Debug: print predictions occasionally
-                #if it % log_interval == 0 and micro_step == 0:
-                 #   with torch.no_grad():
-                  #      predicted_tokens = torch.argmax(logits, dim=-1).cpu().tolist()
-                   #     predicted_text = tokenizer.decode(predicted_tokens)
-                    #    target_text = tokenizer.decode(decoder_target.cpu().tolist())
-                     #   print(f"\n[Iter {it}] Training sample:")
-                      #  print(f"  Predicted: {predicted_text[:200]}")
-                      
-                
                 # Loss
                 loss = F.cross_entropy(
                     logits.view(-1, vocab_size),
                     decoder_target.view(-1)
                 )
                 loss = loss / gradient_accumulation_steps
-            
             # Backward
             loss.backward()
             total_loss += loss.item()
-        
         # Optimizer step
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
