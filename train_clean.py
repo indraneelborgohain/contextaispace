@@ -17,6 +17,7 @@ from datasets import load_dataset
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
 from architecture.decoder import Transformer, ModelConfig as DecoderConfig
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
+from dataloader.msmarco_loader import load_and_prepare_data
 
 
 def load_decoder(decoder_config, device, encoder_hidden_size=None):
@@ -90,73 +91,6 @@ def load_saved_model(model_dir, device):
     except Exception as e:
         print(f"⚠️  Error loading model: {e}")
         return None, None
-
-
-def load_and_prepare_data(dataset, tokenizer):
-    """Load MS MARCO dataset and prepare training/validation examples."""
-    print("Loading MS MARCO dataset...")
-    
-    # Prepare training examples
-    train_examples = []
-    for example in dataset['train']:
-        if not example.get('passages') or not example['passages'].get('passage_text'):
-            continue
-        if not example.get('query'):
-            continue
-        if not example.get('answers') or len(example['answers']) == 0:
-            continue
-        
-        answer = example['answers'][0]
-        
-        # Skip unanswerable questions (MS MARCO has many "No Answer Present." examples)
-        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
-            continue
-        if len(answer.strip()) == 0:
-            continue
-        
-        # Concatenate all context passages (not just the first one)
-        context = ' '.join(example['passages']['passage_text'])
-        question = example['query']
-        
-        train_examples.append({
-            'context': context,
-            'question': question,
-            'answer': answer
-        })
-    
-    print(f"✓ Loaded {len(train_examples)} training examples\n")
-    
-    # Prepare validation examples
-    val_examples = []
-    for example in dataset['validation']:
-        if not example.get('passages') or not example['passages'].get('passage_text'):
-            continue
-        if not example.get('query'):
-            continue
-        if not example.get('answers') or len(example['answers']) == 0:
-            continue
-        
-        answer = example['answers'][0]
-        
-        # Skip unanswerable questions (MS MARCO has many "No Answer Present." examples)
-        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
-            continue
-        if len(answer.strip()) == 0:
-            continue
-        
-        # Concatenate all context passages (not just the first one)
-        context = ' '.join(example['passages']['passage_text'])
-        question = example['query']
-        
-        val_examples.append({
-            'context': context,
-            'question': question,
-            'answer': answer
-        })
-    
-    print(f"✓ Loaded {len(val_examples)} validation examples\n")
-    
-    return train_examples, val_examples
 
 
 def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max_dec_length, vocab_size, num_val=10):
