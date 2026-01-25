@@ -14,9 +14,8 @@ import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 
-from architecture.config import ModelConfig
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
-from architecture.transformer import Transformer
+from architecture.gptossdecoder import Transformer, ModelConfig as DecoderConfig, gpt_oss_20b_config
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 
 
@@ -561,32 +560,24 @@ def main():
         # ========================================
         # STEP 3: Create decoder from GPT-OSS
         # ========================================
-        # Match GPT-OSS architecture EXACTLY to load pretrained weights
-        # GPT-OSS config from open-gpt-oss/model.py:
-        #   vocab_size: 201_088
-        #   hidden_size: 2880
-        #   num_hidden_layers: 12
-        #   num_attention_heads: 64
-        #   num_key_value_heads: 8 (GQA with 8 groups)
-        #   intermediate_size: 2880
-        #   num_experts: 32
-        #   experts_per_token: 4
-        decoder_config = ModelConfig(
-            vocab_size=vocab_size,              # ~201k (tiktoken/GPT-OSS vocab)
-            hidden_size=2880,                   # MUST match GPT-OSS!
-            num_hidden_layers=12,               # GPT-OSS has 12 layers
-            num_attention_heads=64,             # GPT-OSS has 64 heads
-            num_key_value_heads=8,              # GPT-OSS uses GQA with 8 KV heads
-            intermediate_size=2880,             # GPT-OSS FFN size
-            num_experts=32,                     # GPT-OSS has 32 experts
-            experts_per_token=4,                # GPT-OSS uses top-4 routing
-            use_moe=False,                      # Disable MoE - use standard FFN for GPT-OSS compatibility
-            head_dim=64,                        # 2880 / 45 ≈ 64 per head
-            use_encoder_decoder_cross_attention=True,
-            encoder_hidden_size=encoder_config.hidden_size,
-            use_context_embedding=True,         # Enable context state tracking
-            sliding_window=512                  # Sliding window attention
-        )
+        # Use actual GPT-OSS 20B config (will load pretrained weights)
+        print("="*60)
+        print("STEP 3: Creating GPT-OSS decoder")
+        print("="*60)
+        
+        decoder_config = gpt_oss_20b_config()
+        # Override to use smaller model for GPU constraints
+        decoder_config.num_hidden_layers = 12  # Use 12 layers instead of 24
+        
+        print(f"Decoder config (GPT-OSS):")
+        print(f"  Vocab size: {decoder_config.vocab_size}")
+        print(f"  Hidden size: {decoder_config.hidden_size}")
+        print(f"  Layers: {decoder_config.num_hidden_layers}")
+        print(f"  Attention heads: {decoder_config.num_attention_heads}")
+        print(f"  KV heads (GQA): {decoder_config.num_key_value_heads}")
+        print(f"  MoE experts: {decoder_config.num_local_experts}")
+        print(f"  Experts per token: {decoder_config.experts_per_token}")
+        print(f"  Sliding window: {decoder_config.sliding_window}\n")
         
         print(f"Decoder config:")
         print(f"  Vocab size: {decoder_config.vocab_size}")
