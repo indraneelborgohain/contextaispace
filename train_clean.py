@@ -662,14 +662,14 @@ def main():
                 logits = logits.squeeze(0)
                 
                 # Debug: print predictions occasionally
-                if it % log_interval == 0 and micro_step == 0:
-                    with torch.no_grad():
-                        predicted_tokens = torch.argmax(logits, dim=-1).cpu().tolist()
-                        predicted_text = tokenizer.decode(predicted_tokens)
-                        target_text = tokenizer.decode(decoder_target.cpu().tolist())
-                        print(f"\n[Iter {it}] Training sample:")
-                        print(f"  Predicted: {predicted_text[:200]}")
-                        print(f"  Target:    {target_text[:200]}\n")
+                #if it % log_interval == 0 and micro_step == 0:
+                 #   with torch.no_grad():
+                  #      predicted_tokens = torch.argmax(logits, dim=-1).cpu().tolist()
+                   #     predicted_text = tokenizer.decode(predicted_tokens)
+                    #    target_text = tokenizer.decode(decoder_target.cpu().tolist())
+                     #   print(f"\n[Iter {it}] Training sample:")
+                      #  print(f"  Predicted: {predicted_text[:200]}")
+                      
                 
                 # Loss
                 loss = F.cross_entropy(
