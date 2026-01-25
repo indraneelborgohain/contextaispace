@@ -82,10 +82,10 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
         print("⚠️  WARNING: No embeddings loaded from GPT-OSS!")
         print("⚠️  Decoder will use RANDOM embeddings!")
     
-    # 2. Load transformer layers (attention only - MoE/FFN likely incompatible)
+    # 2. Load transformer layers (attention + FFN)
     num_layers = decoder_config.num_hidden_layers
     print(f"Loading {num_layers} transformer layers...")
-    print(f"Note: Only loading attention layers, NOT MoE/FFN (architecture may differ)\n")
+    print(f"Architecture: Standard FFN (MoE disabled for GPT-OSS compatibility)\n")
     
     for layer_idx in range(num_layers):
         # Try different naming conventions
@@ -113,12 +113,33 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
                 decoder.state_dict()[f'{dec_prefix}.attn.out.bias'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_proj.bias'])
                 loaded_count += 2
             
-            print(f"  ✓ Layer {layer_idx} (attention only)")
+            # Load FFN layer norm
+            if f'{gpt_prefix}.ln_2.weight' in gptoss_state:
+                decoder.state_dict()[f'{dec_prefix}.mlp.norm.weight'].copy_(gptoss_state[f'{gpt_prefix}.ln_2.weight'])
+                decoder.state_dict()[f'{dec_prefix}.mlp.norm.bias'].copy_(gptoss_state[f'{gpt_prefix}.ln_2.bias'])
+                loaded_count += 2
+            
+            # Load FFN weights (SwiGLU: up_proj has 2x hidden for gating)
+            # GPT-OSS naming: c_fc (up), c_proj (down)
+            if f'{gpt_prefix}.mlp.c_fc.weight' in gptoss_state:
+                decoder.state_dict()[f'{dec_prefix}.mlp.up_proj.weight'].copy_(gptoss_state[f'{gpt_prefix}.mlp.c_fc.weight'])
+                loaded_count += 1
+            
+            if f'{gpt_prefix}.mlp.c_proj.weight' in gptoss_state:
+                decoder.state_dict()[f'{dec_prefix}.mlp.down_proj.weight'].copy_(gptoss_state[f'{gpt_prefix}.mlp.c_proj.weight'])
+                loaded_count += 1
+            
+            print(f"  ✓ Layer {layer_idx} (attention + FFN)")
+            break
+                decoder.state_dict()[f'{dec_prefix}.attn.out.weight'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_proj.weight'])
+                decoder.state_dict()[f'{dec_prefix}.attn.out.bias'].copy_(gptoss_state[f'{gpt_prefix}.attn.c_proj.bias'])
+                loaded_count += 2
+            
+            print(f"  ✓ Layer {layer_idx} (attention + FFN)")
             break
     
     print(f"\n✓ Successfully loaded {loaded_count} parameter groups from GPT-OSS")
-    print(f"⚠️  MoE/FFN layers NOT loaded - will train from scratch")
-    print(f"⚠️  This means only embeddings + attention are pretrained")
+    print(f"✓ Loaded: embeddings + attention + FFN (full GPT-OSS weights)")
     print(f"Decoder total parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.1f}M\n")
     
     return decoder
@@ -565,7 +586,7 @@ def main():
             intermediate_size=2880,             # GPT-OSS FFN size
             num_experts=32,                     # GPT-OSS has 32 experts
             experts_per_token=4,                # GPT-OSS uses top-4 routing
-            use_moe=True,                       # GPT-OSS uses MoE
+            use_moe=False,                      # Disable MoE - use standard FFN for GPT-OSS compatibility
             head_dim=64,                        # 2880 / 45 ≈ 64 per head
             use_encoder_decoder_cross_attention=True,
             encoder_hidden_size=encoder_config.hidden_size,
@@ -584,38 +605,44 @@ def main():
         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
         
-        # Strategy: 
-        # FROZEN: Embeddings, attention layers (loaded from GPT-OSS pretrained)
-        # TRAINABLE: MoE/FFN, cross-attention, context layers (not in GPT-OSS weights)
+        # Strategy: Freeze ALL GPT-OSS weights, train only QA-specific layers
+        # FROZEN: Embeddings, attention, FFN (all loaded from GPT-OSS)
+        # TRAINABLE: Cross-attention to encoder, angle gates (QA-specific)
         for name, param in decoder.named_parameters():
-            # Freeze embeddings to preserve GPT-OSS language fluency
+            # Freeze embeddings (GPT-OSS pretrained)
             if 'embedding' in name or 'unembedding' in name:
                 param.requires_grad = False
-                print(f"  ❄️ Frozen (GPT-OSS pretrained): {name}")
-            # Freeze self-attention layers (loaded from GPT-OSS)
+                print(f"  ❄️ Frozen (GPT-OSS): {name}")
+            # Freeze self-attention (GPT-OSS pretrained)
             elif 'attn.qkv' in name or 'attn.out' in name:
                 param.requires_grad = False
-            # Train MoE/FFN layers (NOT loaded from GPT-OSS - random init)
-            elif 'mlp' in name or 'expert' in name or 'gate' in name.lower():
+            # Freeze FFN layers (GPT-OSS pretrained)
+            elif 'mlp.up_proj' in name or 'mlp.down_proj' in name or 'mlp.norm' in name:
+                param.requires_grad = False
+            # Train cross-attention to encoder (NEW for QA)
+            elif 'encoder_cross_attn' in name:
                 param.requires_grad = True
-                if 'experts.0' in name or 'gate.weight' in name:  # Log only first expert
-                    print(f"  ✓ Trainable (random init): {name}")
-            # Train cross-attention layers (NEW for QA task)
-            elif 'cross_attn' in name or 'context_proj' in name or 'angle' in name:
+                print(f"  ✓ Trainable (QA-specific): {name}")
+            # Train angle gates for blending (NEW for QA)
+            elif 'angle' in name:
+                param.requires_grad = True
+                print(f"  ✓ Trainable (QA-specific): {name}")
+            # Train context cross-attention (NEW for QA)
+            elif 'context_cross_attn' in name:
                 param.requires_grad = True
                 print(f"  ✓ Trainable (QA-specific): {name}")
             # Freeze layer norms (GPT-OSS)
             elif 'norm' in name or 'ln' in name:
                 param.requires_grad = False
             else:
-                # Default: check if it looks like something from GPT-OSS
+                # Default: freeze
                 param.requires_grad = False
         
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total")
-        print(f"  Frozen: embeddings + self-attention (GPT-OSS pretrained)")
-        print(f"  Training: MoE/FFN + cross-attention + context (QA-specific)\n")
+        print(f"  Frozen: ALL GPT-OSS weights (embeddings + attention + FFN)")
+        print(f"  Training: Cross-attention + angle gates (QA-specific only)\n")
     
     # ========================================
     # Training setup

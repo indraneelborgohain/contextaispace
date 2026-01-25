@@ -296,6 +296,47 @@ class MLPBlock(torch.nn.Module):
         return x + output
 
 
+class StandardFFN(torch.nn.Module):
+    """
+    Standard FFN block (non-MoE) for GPT-OSS compatibility.
+    Uses SwiGLU activation.
+    """
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.swiglu_limit = config.swiglu_limit
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        
+        # Up-projection (2x for SwiGLU gating)
+        self.up_proj = torch.nn.Linear(
+            config.hidden_size,
+            config.intermediate_size * 2,
+            device=device,
+            dtype=torch.bfloat16,
+            bias=False
+        )
+        
+        # Down-projection
+        self.down_proj = torch.nn.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+            bias=False
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x = self.up_proj(x)
+        x = swiglu(x, limit=self.swiglu_limit)
+        x = self.down_proj(x)
+        return residual + x
+
+
 class TransformerBlock(torch.nn.Module):
     """Standard transformer block with context cross-attention and optional encoder cross-attention."""
     def __init__(
@@ -318,7 +359,11 @@ class TransformerBlock(torch.nn.Module):
         else:
             self.encoder_cross_attn = None
         
-        self.mlp = MLPBlock(config, device)
+        # Use MoE or standard FFN based on config
+        if config.use_moe:
+            self.mlp = MLPBlock(config, device)
+        else:
+            self.mlp = StandardFFN(config, device)
 
     def forward(
         self, 
