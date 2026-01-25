@@ -434,9 +434,9 @@ def main():
     log_interval = 100
     
     encoder_lr = 1e-5
-    decoder_lr = 1e-6
-    cross_attn_lr = 3e-4
-    warmup_iters = 200
+    decoder_lr = 1e-6        # Keep low - only training cross-attention layers
+    cross_attn_lr = 3e-4     # Higher for new QA-specific layers
+    warmup_iters = 500       # Longer warmup for stability
     min_lr_ratio = 0.1
     
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -543,20 +543,30 @@ def main():
         # ========================================
         # STEP 3: Create decoder from GPT-OSS
         # ========================================
-        # CRITICAL: Must match GPT-OSS dimensions to load pretrained weights!
-        # GPT-OSS: 2880 hidden, 12 layers, 64 heads, 32 experts
-        # Using FULL GPT-OSS config to load embeddings properly
+        # Match GPT-OSS architecture EXACTLY to load pretrained weights
+        # GPT-OSS config from open-gpt-oss/model.py:
+        #   vocab_size: 201_088
+        #   hidden_size: 2880
+        #   num_hidden_layers: 12
+        #   num_attention_heads: 64
+        #   num_key_value_heads: 8 (GQA with 8 groups)
+        #   intermediate_size: 2880
+        #   num_experts: 32
+        #   experts_per_token: 4
         decoder_config = ModelConfig(
-            vocab_size=vocab_size,  # Use GPT/Tiktoken vocab size (~201k)
-            hidden_size=2880,         # MUST MATCH GPT-OSS for embedding loading!
-            num_hidden_layers=12,     # Full GPT-OSS depth
-            num_experts=32,           # Full GPT-OSS experts
-            num_attention_heads=64,   # Full GPT-OSS heads
-            num_key_value_heads=64,   # Full GPT-OSS KV heads
+            vocab_size=vocab_size,              # ~201k (tiktoken/GPT-OSS vocab)
+            hidden_size=2880,                   # MUST match GPT-OSS!
+            num_hidden_layers=12,               # GPT-OSS has 12 layers
+            num_attention_heads=64,             # GPT-OSS has 64 heads
+            num_key_value_heads=8,              # GPT-OSS uses GQA with 8 KV heads
+            intermediate_size=2880,             # GPT-OSS FFN size
+            num_experts=32,                     # GPT-OSS has 32 experts
+            experts_per_token=4,                # GPT-OSS uses top-4 routing
+            head_dim=64,                        # 2880 / 64 = 45 (will be overridden by attention)
             use_encoder_decoder_cross_attention=True,
             encoder_hidden_size=encoder_config.hidden_size,
-            use_context_embedding=True,  # Enable context state tracking
-            sliding_window=512           # Set sliding window size
+            use_context_embedding=True,         # Enable context state tracking
+            sliding_window=512                  # Sliding window attention
         )
         
         print(f"Decoder config:")
@@ -570,25 +580,42 @@ def main():
         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
         
-        # FREEZE decoder embeddings to preserve GPT-OSS fluency
-        # Train only attention layers (cross-attention and self-attention adaptations)
+        # Strategy: Freeze GPT-OSS pretrained weights, train only new components
+        # FROZEN: Embeddings, FFN layers (preserve language knowledge from GPT-OSS)
+        # TRAINABLE: Cross-attention layers, context layers (new QA-specific components)
         for name, param in decoder.named_parameters():
-            # FREEZE embeddings to preserve language fluency from GPT-OSS
+            # Freeze embeddings to preserve GPT-OSS language fluency
             if 'embedding' in name or 'unembedding' in name:
                 param.requires_grad = False
-                print(f"  ❄ Frozen (preserve fluency): {name}")
-            # Train all attention layers (semantic understanding)
-            elif 'attn' in name or 'context_proj' in name or 'cross_attn' in name or 'angle' in name:
+                print(f"  ❄️ Frozen (GPT-OSS): {name}")
+            # Freeze MoE FFN layers (preserve GPT-OSS knowledge)
+            elif 'mlp' in name or 'expert' in name or 'gate' in name.lower():
+                # But NOT the cross-attention angle gates
+                if 'angle' not in name:
+                    param.requires_grad = False
+                    if 'experts.0' in name or 'gate.weight' in name:  # Log only first expert to reduce spam
+                        print(f"  ❄️ Frozen (GPT-OSS): {name}")
+                else:
+                    param.requires_grad = True
+                    print(f"  ✓ Trainable (QA-specific): {name}")
+            # Freeze standard attention layers (GPT-OSS self-attention)
+            elif 'attn.qkv' in name or 'attn.out' in name:
+                param.requires_grad = False
+            # Train cross-attention layers (NEW for QA task)
+            elif 'cross_attn' in name or 'context_proj' in name or 'angle' in name:
                 param.requires_grad = True
-                print(f"  ✓ Trainable: {name}")
-            # Keep FFN layers frozen (general knowledge)
+                print(f"  ✓ Trainable (QA-specific): {name}")
+            # Freeze layer norms (GPT-OSS)
+            elif 'norm' in name or 'ln' in name:
+                param.requires_grad = False
             else:
+                # Default: freeze anything else from GPT-OSS
                 param.requires_grad = False
         
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total")
-        print(f"  Training: embeddings + all attention layers (semantic learning)\n")
+        print(f"  Strategy: Train only QA-specific layers (cross-attention, context), freeze GPT-OSS\n")
     
     # ========================================
     # Training setup
