@@ -15,80 +15,27 @@ import torch.nn.functional as F
 from datasets import load_dataset
 
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
-from architecture.gptossdecoder import Transformer, ModelConfig as DecoderConfig, gpt_oss_20b_config
+from architecture.decoder import Transformer, ModelConfig as DecoderConfig
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 
 
-def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device, encoder_hidden_size=None):
+def load_decoder(decoder_config, device, encoder_hidden_size=None):
     """
-    STEP 3: Load GPT-OSS weights into decoder.
+    Create decoder with optional cross-attention to encoder.
     
     Args:
-        decoder_config: ModelConfig for GPT-OSS
-        gptoss_weights_dir: Directory containing .safetensors files
+        decoder_config: ModelConfig for decoder
         device: torch device
         encoder_hidden_size: If provided, enables cross-attention to encoder (e.g., 1024 for BERT-large)
     """
-    import glob
-    
     print(f"\n{'='*60}")
-    print("Loading GPT-OSS weights")
+    print("Creating Decoder")
     print(f"{'='*60}")
-    print(f"Weights directory: {gptoss_weights_dir}")
     if encoder_hidden_size:
         print(f"Cross-attention enabled (encoder hidden size: {encoder_hidden_size})")
     
-    # Find safetensors files
-    safetensor_files = glob.glob(os.path.join(gptoss_weights_dir, "*.safetensors"))
-    
-    if not safetensor_files:
-        print("⚠️  No .safetensors files found")
-        print("Creating decoder with random weights...")
-        return Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size)
-    
-    # Load GPT-OSS state
-    try:
-        from safetensors.torch import load_file
-        gptoss_state = {}
-        for f in safetensor_files:
-            gptoss_state.update(load_file(f))
-        print(f"✓ Loaded {len(safetensor_files)} safetensors files")
-        print(f"  Total keys: {len(gptoss_state)}")
-    except ImportError:
-        print("⚠️  safetensors not installed")
-        print("Install with: pip install safetensors")
-        return Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size)
-    
-    # Create decoder
     print(f"\nCreating decoder...")
-    decoder = Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size)
-    decoder = decoder.to(device)
-    
-    # Load weights directly (GPT-OSS model uses same structure)
-    model_state = decoder.state_dict()
-    
-    loaded = 0
-    missing = 0
-    
-    for key in model_state.keys():
-        if key in gptoss_state:
-            if model_state[key].shape == gptoss_state[key].shape:
-                model_state[key].copy_(gptoss_state[key].to(device))
-                loaded += 1
-            else:
-                print(f"⚠️  Shape mismatch: {key}")
-                missing += 1
-        else:
-            # Only print for important missing weights
-            if 'embed' in key or 'lm_head' in key or 'norm' in key:
-                print(f"⚠️  Missing: {key}")
-            missing += 1
-    
-    decoder.load_state_dict(model_state)
-    
-    print(f"\n✓ Loaded {loaded} parameters")
-    if missing > 0:
-        print(f"⚠️  Missing {missing} parameters (expected if using fewer layers)")
+    decoder = Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size, device=device)
     
     print(f"Decoder parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.1f}M\n")
     
@@ -432,13 +379,13 @@ def main():
     print(f"Effective batch: {batch_size * gradient_accumulation_steps}")
     print("="*60 + "\n")
     
-    # Get tokenizer - using GPT tokenizer for BOTH encoder and decoder
-    tokenizer = get_decoder_tokenizer()  # GPT/Tiktoken tokenizer
+    # Get tokenizer - using BERT tokenizer for BOTH encoder and decoder
+    tokenizer = get_encoder_tokenizer()  # BERT tokenizer
     
-    vocab_size = tokenizer.n_vocab  # Tiktoken vocab: ~200000+
+    vocab_size = tokenizer.vocab_size  # BERT vocab: ~30K
     
-    print(f"Vocab size (GPT/Tiktoken): {vocab_size}")
-    print("Using GPT tokenizer for both encoder and decoder\n")
+    print(f"Vocab size (BERT): {vocab_size}")
+    print("Using BERT tokenizer for both encoder and decoder\n")
     
     # Check if loading from saved model
     if args.model_dir and os.path.exists(args.model_dir):
@@ -468,9 +415,8 @@ def main():
         
         encoder_config = create_encoder_config_from_bert(bert_model_name)
     
-        # Override encoder vocab to match GPT tokenizer
-        encoder_config.vocab_size = vocab_size
-        print(f"  Vocab size (overridden to GPT): {encoder_config.vocab_size}")
+        # Vocab size matches BERT tokenizer (no override needed)
+        print(f"  Vocab size: {encoder_config.vocab_size}")
         print(f"  Hidden size: {encoder_config.hidden_size}")
         print(f"  Layers: {encoder_config.num_hidden_layers}")
         print(f"  Attention heads: {encoder_config.num_attention_heads}")
@@ -491,37 +437,49 @@ def main():
             print("Creating encoder with random weights...")
             encoder = BidirectionalEncoder(encoder_config, device=device)
         
-        # Make only encoder embeddings trainable
+        # Freeze all encoder parameters (using pretrained BERT with BERT tokenizer)
         for name, param in encoder.named_parameters():
-            if 'embedding' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+            param.requires_grad = False
         
         encoder_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
         encoder_total = sum(p.numel() for p in encoder.parameters())
         print(f"\n✓ Encoder ready: {encoder_trainable/1e6:.1f}M trainable / {encoder_total/1e6:.1f}M total")
-        print(f"  Training: Only embeddings (adapting to new tokenizer)\n")
+        print(f"  Training: Encoder FROZEN (using pretrained BERT)\n")
         
         # ========================================
-        # STEP 3: Create decoder from GPT-OSS
+        # STEP 3: Create decoder
         # ========================================
-        # Use actual GPT-OSS 20B config (will load pretrained weights)
         print("="*60)
-        print("STEP 3: Creating GPT-OSS decoder")
+        print("STEP 3: Creating decoder")
         print("="*60)
         
-        decoder_config = gpt_oss_20b_config()
-        # Override to use smaller model for GPU constraints
-        decoder_config.num_hidden_layers = 6  # Use 6 layers instead of 24
+        # Create decoder config
+        decoder_config = DecoderConfig(
+            num_hidden_layers=6,
+            num_experts=32,
+            experts_per_token=4,
+            vocab_size=vocab_size,
+            hidden_size=2880,
+            intermediate_size=2880,
+            swiglu_limit=7.0,
+            head_dim=64,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            sliding_window=128,
+            initial_context_length=4096,
+            rope_theta=150000.0,
+            rope_scaling_factor=32.0,
+            rope_ntk_alpha=1.0,
+            rope_ntk_beta=32.0,
+        )
         
         # Enable cross-attention with BERT encoder (1024 hidden size)
         encoder_hidden_size = encoder_config.hidden_size  # 1024 for BERT-large
-        decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device, encoder_hidden_size)
+        decoder = load_decoder(decoder_config, device, encoder_hidden_size)
         
-        # Train only cross-attention and MoE layers in decoder
+        # Train cross-attention, embeddings, and LM head for better adaptation
         for name, param in decoder.named_parameters():
-            if 'cross_attn' in name or 'moe' in name:
+            if 'cross_attn' in name or 'embed' in name or 'lm_head' in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
@@ -529,7 +487,7 @@ def main():
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total")
-        print(f"  Training: Only cross-attention and MoE layers\n")
+        print(f"  Training: Cross-attention, embeddings, and LM head\n")
     
     # ========================================
     # Training setup
