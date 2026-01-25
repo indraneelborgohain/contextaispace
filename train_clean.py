@@ -522,14 +522,17 @@ def main():
         encoder_hidden_size = encoder_config.hidden_size  # 1024 for BERT-large
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device, encoder_hidden_size)
         
-        # Make all decoder parameters trainable
+        # Train only cross-attention and MoE layers in decoder
         for name, param in decoder.named_parameters():
-            param.requires_grad = True
+            if 'cross_attn' in name or 'moe' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
         
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total")
-        print(f"  Training: ALL decoder layers\n")
+        print(f"  Training: Only cross-attention and MoE layers\n")
     
     # ========================================
     # Training setup
