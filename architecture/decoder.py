@@ -11,8 +11,8 @@ import torch.distributed as dist
 
 @dataclass
 class ModelConfig:
-    num_hidden_layers: int = 12
-    num_experts: int = 32
+    num_hidden_layers: int = 12#24
+    num_experts: int = 16#32
     experts_per_token: int = 4
     vocab_size: int = 201088
     hidden_size: int = 2880
