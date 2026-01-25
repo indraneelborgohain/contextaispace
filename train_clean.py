@@ -352,20 +352,21 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     generated.append(current_token)
                     
                     # Generate next token
-                    token_input = torch.tensor([current_token], dtype=torch.long, device=device)
-                    
-                    logits = decoder(
-                        token_input,
-                        encoder_k=encoder_kv,[current_token]], dtype=torch.long, device=device)
+                    token_input = torch.tensor([[current_token]], dtype=torch.long, device=device)
                     
                     # Add batch dimension to encoder output if needed
                     enc_out = encoder_kv.unsqueeze(0) if encoder_kv.dim() == 2 else encoder_kv
                     logits, aux = decoder(token_input, encoder_output=enc_out)
                     
                     # Use greedy decoding (argmax) for deterministic validation
-                    current_token = torch.argmax(logits[0, -1, :
-            print(f"Generated tokens: {len(generated)}")
-            print(f"Generated text: {generated_text}")
+                    current_token = torch.argmax(logits[0, -1, :]).item()
+                
+                # Decode generated tokens to text
+                generated_text = tokenizer.decode(generated)
+                
+                if val_idx == 0:
+                    print(f"Generated tokens: {len(generated)}")
+                    print(f"Generated text: {generated_text}")
             print(f"{'='*60}\n")
         
         samples.append({
