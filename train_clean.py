@@ -15,33 +15,10 @@ import torch.nn.functional as F
 from datasets import load_dataset
 
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
-from architecture.decoder import Transformer, ModelConfig as DecoderConfig
+from architecture.decoder import Transformer, load_decoder
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
 from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
-
-
-def load_decoder(decoder_config, device, encoder_hidden_size=None):
-    """
-    Create decoder with optional cross-attention to encoder.
-    
-    Args:
-        decoder_config: ModelConfig for decoder
-        device: torch device
-        encoder_hidden_size: If provided, enables cross-attention to encoder (e.g., 1024 for BERT-large)
-    """
-    print(f"\n{'='*60}")
-    print("Creating Decoder")
-    print(f"{'='*60}")
-    if encoder_hidden_size:
-        print(f"Cross-attention enabled (encoder hidden size: {encoder_hidden_size})")
-    
-    print(f"\nCreating decoder...")
-    decoder = Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size, device=device)
-    
-    print(f"Decoder parameters: {sum(p.numel() for p in decoder.parameters())/1e6:.1f}M\n")
-    
-    return decoder
 
 
 def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
@@ -402,29 +379,13 @@ def main():
         print("STEP 3: Creating decoder")
         print("="*60)
         
-        # Create decoder config
-        decoder_config = DecoderConfig(
-            num_hidden_layers=6,
-            num_experts=32,
-            experts_per_token=4,
-            vocab_size=vocab_size,
-            hidden_size=2880,
-            intermediate_size=11520,  # 4x hidden_size for MLP (2880 * 4 = 11520)
-            swiglu_limit=7.0,
-            head_dim=64,
-            num_attention_heads=64,
-            num_key_value_heads=8,
-            sliding_window=128,
-            initial_context_length=4096,
-            rope_theta=150000.0,
-            rope_scaling_factor=32.0,
-            rope_ntk_alpha=1.0,
-            rope_ntk_beta=32.0,
-        )
-        
         # Enable cross-attention with BERT encoder (1024 hidden size)
         encoder_hidden_size = encoder_config.hidden_size  # 1024 for BERT-large
-        decoder = load_decoder(decoder_config, device, encoder_hidden_size)
+        decoder = load_decoder(
+            vocab_size=vocab_size,
+            device=device,
+            encoder_hidden_size=encoder_hidden_size,
+        )
         
         # Train entire decoder from scratch
         for name, param in decoder.named_parameters():
