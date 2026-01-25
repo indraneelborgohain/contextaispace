@@ -19,9 +19,15 @@ from architecture.gptossdecoder import Transformer, ModelConfig as DecoderConfig
 from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
 
 
-def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
+def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device, encoder_hidden_size=None):
     """
     STEP 3: Load GPT-OSS weights into decoder.
+    
+    Args:
+        decoder_config: ModelConfig for GPT-OSS
+        gptoss_weights_dir: Directory containing .safetensors files
+        device: torch device
+        encoder_hidden_size: If provided, enables cross-attention to encoder (e.g., 1024 for BERT-large)
     """
     import glob
     
@@ -29,6 +35,8 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
     print("Loading GPT-OSS weights")
     print(f"{'='*60}")
     print(f"Weights directory: {gptoss_weights_dir}")
+    if encoder_hidden_size:
+        print(f"Cross-attention enabled (encoder hidden size: {encoder_hidden_size})")
     
     # Find safetensors files
     safetensor_files = glob.glob(os.path.join(gptoss_weights_dir, "*.safetensors"))
@@ -36,7 +44,7 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
     if not safetensor_files:
         print("⚠️  No .safetensors files found")
         print("Creating decoder with random weights...")
-        return Transformer(decoder_config)
+        return Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size)
     
     # Load GPT-OSS state
     try:
@@ -49,11 +57,11 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
     except ImportError:
         print("⚠️  safetensors not installed")
         print("Install with: pip install safetensors")
-        return Transformer(decoder_config)
+        return Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size)
     
     # Create decoder
     print(f"\nCreating decoder...")
-    decoder = Transformer(decoder_config)
+    decoder = Transformer(decoder_config, encoder_hidden_size=encoder_hidden_size)
     decoder = decoder.to(device)
     
     # Load weights directly (GPT-OSS model uses same structure)
@@ -517,12 +525,17 @@ def main():
         decoder_config = gpt_oss_20b_config()
         # Using full 24-layer model
         
-        decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
+        # Enable cross-attention with BERT encoder (1024 hidden size)
+        encoder_hidden_size = encoder_config.hidden_size  # 1024 for BERT-large
+        decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device, encoder_hidden_size)
         
-        # Strategy: Freeze ALL GPT-OSS weights (model works out of the box)
-        # We'll use it for text generation only - no training initially
+        # Strategy: Freeze GPT-OSS self-attention and MoE, train only cross-attention
         for name, param in decoder.named_parameters():
-            param.requires_grad = False
+            if 'cross_attn' in name:
+                param.requires_grad = True
+                print(f"  ✓ Decoder trainable: {name}")
+            else:
+                param.requires_grad = False
         
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())

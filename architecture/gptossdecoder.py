@@ -396,11 +396,140 @@ class MoE(nn.Module):
         return out, {"router_aux_loss": aux_loss}
 
 
+class CrossAttentionLayer(nn.Module):
+    """
+    Cross-attention layer for decoder to attend to encoder outputs.
+    Q: from decoder hidden states
+    K, V: from encoder outputs
+    """
+    def __init__(self, cfg: ModelConfig, encoder_hidden_size: int = 1024):
+        super().__init__()
+        H = cfg.hidden_size
+        self.n_head = int(cfg.num_attention_heads)
+        self.n_kv = int(cfg.num_key_value_heads)
+        self.dh = int(cfg.head_dim)
+        self.group_size = int(cfg.group_size)
+        self.scale = 1.0 / math.sqrt(self.dh)
+        
+        self.norm = RMSNorm(H, eps=cfg.rms_norm_eps)
+        
+        # Q projection (from decoder)
+        self.q = nn.Linear(H, self.n_head * self.dh, bias=cfg.attention_bias)
+        
+        # K, V projections (from encoder)
+        self.k = nn.Linear(encoder_hidden_size, self.n_kv * self.dh, bias=cfg.attention_bias)
+        self.v = nn.Linear(encoder_hidden_size, self.n_kv * self.dh, bias=cfg.attention_bias)
+        
+        # Output projection
+        self.o = nn.Linear(self.n_head * self.dh, H, bias=True)
+        
+        # Gated residual: gradually integrate cross-attention
+        # Initially (angle=0.1): ~10% contribution
+        self.angle = nn.Parameter(torch.tensor(0.1))
+        
+        # store init std
+        self.init_std = float(cfg.initializer_range)
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        init_std = getattr(self, "init_std", 0.02)
+        with torch.no_grad():
+            for m in (self.q, self.k, self.v, self.o):
+                nn.init.normal_(m.weight, mean=0.0, std=init_std)
+                if getattr(m, "bias", None) is not None:
+                    m.bias.zero_()
+            if hasattr(self, "angle"):
+                self.angle.fill_(0.1)
+    
+    def _kv_expand(self, kv: torch.Tensor) -> torch.Tensor:
+        """Expand KV heads to match query heads (GQA)."""
+        # Input: (B, T_enc, n_kv*Dh) or (T_enc, n_kv*Dh)
+        if kv.dim() == 2:
+            # Unbatched: (T_enc, n_kv*Dh)
+            T_enc = kv.shape[0]
+            kv = kv.view(T_enc, self.n_kv, self.dh)
+            kv = kv.unsqueeze(2).expand(T_enc, self.n_kv, self.group_size, self.dh)
+            kv = kv.reshape(T_enc, self.n_head, self.dh)
+            return kv
+        else:
+            # Batched: (B, T_enc, n_kv*Dh)
+            B, T_enc, _ = kv.shape
+            kv = kv.view(B, T_enc, self.n_kv, self.dh)
+            kv = kv.unsqueeze(3).expand(B, T_enc, self.n_kv, self.group_size, self.dh)
+            kv = kv.reshape(B, T_enc, self.n_head, self.dh)
+            return kv
+    
+    def forward(self, x: torch.Tensor, encoder_output: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Decoder hidden states (B, T_dec, H) or (T_dec, H)
+            encoder_output: Encoder outputs (B, T_enc, H_enc) or (T_enc, H_enc)
+        Returns:
+            Output with same shape as x
+        """
+        residual = x
+        x_norm = self.norm(x)
+        
+        # Project Q from decoder
+        q_proj = self.q(x_norm)  # (B, T_dec, n_head*Dh) or (T_dec, n_head*Dh)
+        
+        # Project K, V from encoder
+        k_proj = self.k(encoder_output)  # (B, T_enc, n_kv*Dh) or (T_enc, n_kv*Dh)
+        v_proj = self.v(encoder_output)
+        
+        # Handle both batched and unbatched cases
+        if q_proj.dim() == 2:
+            # Unbatched: (T_dec, n_head*Dh)
+            T_dec = q_proj.shape[0]
+            T_enc = k_proj.shape[0]
+            
+            q = q_proj.view(T_dec, self.n_head, self.dh)  # (T_dec, H, Dh)
+            k = self._kv_expand(k_proj)  # (T_enc, H, Dh)
+            v = self._kv_expand(v_proj)  # (T_enc, H, Dh)
+            
+            # Attention scores: (H, T_dec, T_enc)
+            attn_scores = torch.einsum('qhd,khd->hqk', q, k) * self.scale
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            
+            # Apply attention to values: (H, T_dec, T_enc) x (T_enc, H, Dh) -> (T_dec, H, Dh)
+            attn_output = torch.einsum('hqk,khd->qhd', attn_weights, v)
+            attn_output = attn_output.reshape(T_dec, self.n_head * self.dh)
+        else:
+            # Batched: (B, T_dec, n_head*Dh)
+            B, T_dec, _ = q_proj.shape
+            T_enc = k_proj.shape[1]
+            
+            q = q_proj.view(B, T_dec, self.n_head, self.dh)  # (B, T_dec, H, Dh)
+            k = self._kv_expand(k_proj)  # (B, T_enc, H, Dh)
+            v = self._kv_expand(v_proj)  # (B, T_enc, H, Dh)
+            
+            # Attention scores: (B, H, T_dec, T_enc)
+            attn_scores = torch.einsum('bqhd,bkhd->bhqk', q, k) * self.scale
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            
+            # Apply attention: (B, H, T_dec, T_enc) x (B, T_enc, H, Dh) -> (B, T_dec, H, Dh)
+            attn_output = torch.einsum('bhqk,bkhd->bqhd', attn_weights, v)
+            attn_output = attn_output.reshape(B, T_dec, self.n_head * self.dh)
+        
+        # Output projection
+        output = self.o(attn_output)
+        
+        # Gated residual connection
+        gate = torch.tanh(self.angle)
+        return residual + gate * output
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, encoder_hidden_size: int = None):
         super().__init__()
         self.norm1 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.attn = MultiheadSelfAttention(cfg)
+        
+        # Optional cross-attention
+        self.cross_attn = None
+        if encoder_hidden_size is not None:
+            self.cross_attn = CrossAttentionLayer(cfg, encoder_hidden_size)
+        
         self.norm2 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.moe = MoE(cfg)
 
@@ -408,6 +537,8 @@ class TransformerBlock(nn.Module):
         # Submodules handle their own init; keep for FSDP completeness
         if hasattr(self.norm1, "reset_parameters"): self.norm1.reset_parameters()
         if hasattr(self.attn,  "reset_parameters"): self.attn.reset_parameters()
+        if hasattr(self.cross_attn, "reset_parameters") and self.cross_attn is not None:
+            self.cross_attn.reset_parameters()
         if hasattr(self.norm2, "reset_parameters"): self.norm2.reset_parameters()
         if hasattr(self.moe,   "reset_parameters"): self.moe.reset_parameters()
 
@@ -418,22 +549,33 @@ class TransformerBlock(nn.Module):
         causal_mask: torch.Tensor,
         is_sliding_layer: bool,
         sliding_window: int,
+        encoder_output: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        # Self-attention
         a = self.attn(self.norm1(x), positions, causal_mask, is_sliding_layer, sliding_window)
         x = x + a
+        
+        # Cross-attention (if encoder output provided)
+        if self.cross_attn is not None and encoder_output is not None:
+            x = self.cross_attn(x, encoder_output)
+        
+        # MoE
         m, aux = self.moe(self.norm2(x))
         x = x + m
         return x, aux
 
 
 class Transformer(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, encoder_hidden_size: int = None):
         super().__init__()
         self.config = cfg
         H = cfg.hidden_size
         self.embed = nn.Embedding(cfg.vocab_size, H)
         self.drop = nn.Dropout(cfg.dropout)
-        self.layers = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_hidden_layers)])
+        self.layers = nn.ModuleList([
+            TransformerBlock(cfg, encoder_hidden_size) 
+            for _ in range(cfg.num_hidden_layers)
+        ])
         self.norm_f = RMSNorm(H, eps=cfg.rms_norm_eps)
         self.lm_head = nn.Linear(H, cfg.vocab_size, bias=False)
 
@@ -470,6 +612,7 @@ class Transformer(nn.Module):
         self,
         input_ids: torch.Tensor,                  # (B,T)
         labels: Optional[torch.Tensor] = None,
+        encoder_output: Optional[torch.Tensor] = None,  # (B, T_enc, H_enc) or (T_enc, H_enc)
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, T = input_ids.shape
         device = input_ids.device
@@ -481,7 +624,7 @@ class Transformer(nn.Module):
         aux_losses: List[torch.Tensor] = []
         for i, layer in enumerate(self.layers):
             is_sliding = (self.config.layer_types[i] == "sliding_attention")
-            x, aux = layer(x, positions, causal_mask, is_sliding, self.config.sliding_window)
+            x, aux = layer(x, positions, causal_mask, is_sliding, self.config.sliding_window, encoder_output)
             if aux and "router_aux_loss" in aux:
                 aux_losses.append(aux["router_aux_loss"])
 
