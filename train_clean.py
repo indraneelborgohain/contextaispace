@@ -515,24 +515,8 @@ def main():
         print("="*60)
         
         decoder_config = gpt_oss_20b_config()
-        # Override to use smaller model for GPU constraints
-        decoder_config.num_hidden_layers = 12  # Use 12 layers instead of 24
+        # Using full 24-layer model
         
-        print(f"Decoder config (GPT-OSS):")
-        print(f"  Vocab size: {decoder_config.vocab_size}")
-        print(f"  Hidden size: {decoder_config.hidden_size}")
-        print(f"  Layers: {decoder_config.num_hidden_layers}")
-        print(f"  Attention heads: {decoder_config.num_attention_heads}")
-        print(f"  KV heads (GQA): {decoder_config.num_key_value_heads}")
-        print(f"  MoE experts: {decoder_config.num_experts}")
-        print(f"  Experts per token: {decoder_config.experts_per_token}")
-        print(f"  Sliding window: {decoder_config.sliding_window}\n")
-        
-        print(f"Decoder config:")
-        print(f"  Vocab size: {decoder_config.vocab_size}")
-        print(f"  Hidden size: {decoder_config.hidden_size}")
-        print(f"  Layers: {decoder_config.num_hidden_layers}")
-         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
         
         # Strategy: Freeze ALL GPT-OSS weights (model works out of the box)

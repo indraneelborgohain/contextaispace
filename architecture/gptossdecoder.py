@@ -1,505 +1,544 @@
-import json
+# model.py — GPT-OSS-20B-style Transformer with MoE, GQA, RoPE(+stretch), sink-bias,
+# optional FlashAttention, and FSDP-friendly reset_parameters() on all modules.
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple, List, Literal
+
 import math
-import os
-from dataclasses import dataclass
-
 import torch
-import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ---- Optional Flash-Attention-2 / 3 -----------------------------------------
+_flash_available = False
+try:
+    # flash_attn >= 2.x API
+    from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
+    _flash_available = True
+except Exception:
+    _flash_attn_func = None
+    _flash_available = False
 
 
+# ------------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------------
+
+@dataclass
+class RopeScalingConfig:
+    # Simple scalar stretch for YaRN-like extension (pragmatic approximation)
+    factor: float = 32.0
 
 
 @dataclass
 class ModelConfig:
-    num_hidden_layers: int = 24
-    num_experts: int = 32
-    experts_per_token: int = 4
-    vocab_size: int = 201088
+    # Core dims
+    vocab_size: int = 201_088
     hidden_size: int = 2880
-    intermediate_size: int = 2880
-    swiglu_limit: float = 7.0
+    num_hidden_layers: int = 24
     head_dim: int = 64
-    num_attention_heads: int = 45  # 2880 / 64 = 45 heads
-    num_key_value_heads: int = 5   # Keep GQA ratio similar (45/5 = 9 vs 64/8 = 8)
+
+    # Attention (GQA)
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 8
+    attention_bias: bool = True
+    attention_dropout: float = 0.0
+    dropout: float = 0.0
+
+    # Patterns / positions
+    max_position_embeddings: int = 131_072
     sliding_window: int = 128
-    initial_context_length: int = 4096
-    rope_theta: float = 150000.0
-    rope_scaling_factor: float = 32.0
-    rope_ntk_alpha: float = 1.0
-    rope_ntk_beta: float = 32.0
+    layer_types: Optional[List[Literal["sliding_attention", "full_attention"]]] = None
+
+    # MoE
+    num_local_experts: int = 32
+    experts_per_token: int = 4
+    router_aux_loss_coef: float = 0.02  # conservative; 0.01–0.1 common
+
+    # MLP inside each expert (SwiGLU uses 2*FF)
+    intermediate_size: int = 2880
+    swiglu_clip: float = 7.0
+
+    # RoPE / YaRN
+    rope_theta: float = 150_000.0
+    rope_scaling: RopeScalingConfig = field(default_factory=RopeScalingConfig)
+
+    # Sink (null-attention bias)
+    enable_sink_logit: bool = True
+    sink_logit_init: float = 4.0  # positive → allows "attend to nothing"
+
+    # Norms / init / tying
+    rms_norm_eps: float = 1e-5
+    initializer_range: float = 0.02
+    tie_word_embeddings: bool = False
+    eos_token_id: Optional[int] = None
+
+    def __post_init__(self):
+        if self.layer_types is None:
+            # Default: alternate full <-> sliding attention
+            self.layer_types = [
+                "full_attention" if i % 2 == 0 else "sliding_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        assert len(self.layer_types) == self.num_hidden_layers
+        assert self.num_attention_heads % self.num_key_value_heads == 0
+        assert self.head_dim > 0
+
+    @property
+    def group_size(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
 
 
-def gpt_oss_20b_config() -> ModelConfig:
-    """Return default GPT-OSS 20B configuration."""
-    return ModelConfig(
-        num_hidden_layers=24,
-        num_experts=32,
-        experts_per_token=4,
-        vocab_size=201088,
-        hidden_size=2880,
-        intermediate_size=2880,
-        swiglu_limit=7.0,
-        head_dim=64,
-        num_attention_heads=45,  # 2880 / 64 = 45 heads
-        num_key_value_heads=5,   # Keep GQA ratio similar
-        sliding_window=128,
-        initial_context_length=4096,
-        rope_theta=150000.0,
-        rope_scaling_factor=32.0,
-        rope_ntk_alpha=1.0,
-        rope_ntk_beta=32.0,
-    )
+# ------------------------------------------------------------------------------------
+# Layers
+# ------------------------------------------------------------------------------------
 
-
-class RMSNorm(torch.nn.Module):
-    def __init__(
-        self, num_features: int, eps: float = 1e-05, device: torch.device | None = None
-    ):
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.num_features = num_features
         self.eps = eps
-        self.scale = torch.nn.Parameter(
-            torch.ones(num_features, device=device, dtype=torch.float32)
-        )
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.shape[-1] == self.num_features
-        t, dtype = x.float(), x.dtype
-        t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
-        return (t * self.scale).to(dtype)
+        var = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps)
+        return self.weight * x
+
+    # FSDP meta materialization support
+    def reset_parameters(self):
+        with torch.no_grad():
+            self.weight.fill_(1.0)
 
 
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    return torch.cat((o1, o2), dim=-1)
+def swiglu(x: torch.Tensor, clip: Optional[float] = None) -> torch.Tensor:
+    up, gate = x.chunk(2, dim=-1)
+    if clip is not None:
+        up = up.clamp(-clip, clip)
+        gate = gate.clamp(-clip, clip)
+    return F.silu(gate) * up
 
 
-class RotaryEmbedding(torch.nn.Module):
-    def __init__(
-        self,
-        head_dim: int,
-        base: int,
-        dtype: torch.dtype,
-        initial_context_length: int = 4096,
-        scaling_factor: float = 1.0,
-        ntk_alpha: float = 1.0,
-        ntk_beta: float = 32.0,
-        device: torch.device | None = None,
-    ) -> None:
+class RotaryEmbedding(nn.Module):
+    """
+    Standard RoPE with a simple YaRN-style stretch: positions/factor.
+    Buffers must be (re)materialized on nonzero ranks during FSDP meta build.
+    """
+    def __init__(self, head_dim: int, rope_theta: float, scale_cfg: RopeScalingConfig):
         super().__init__()
-        self.head_dim = head_dim
-        self.base = base
-        self.dtype = dtype
-        self.initial_context_length = initial_context_length
-        self.scaling_factor = scaling_factor
-        self.ntk_alpha = ntk_alpha
-        self.ntk_beta = ntk_beta
-        self.device = device
+        self.head_dim = int(head_dim)
+        self.theta = float(rope_theta)
+        self.factor = float(scale_cfg.factor)
 
-    def _compute_concentration_and_inv_freq(self) -> torch.Tensor:
-        """See YaRN paper: https://arxiv.org/abs/2309.00071"""
-        freq = self.base ** (
-            torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device)
-            / self.head_dim
+        # Placeholders; real buffers (CPU) in reset_parameters()
+        self.register_buffer("inv_freq_base", torch.empty(0), persistent=False)
+        self._seq_len_cached = 0
+        self.register_buffer("cos_cached", torch.empty(0), persistent=False)
+        self.register_buffer("sin_cached", torch.empty(0), persistent=False)
+
+        # Immediately build once so rank0 (non-meta) has valid buffers
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Build base frequencies on CPU; FSDP will move as needed.
+        device = torch.device("cpu")
+        inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device) / self.head_dim)
         )
-        if self.scaling_factor > 1.0:
-            concentration = (
-                0.1 * math.log(self.scaling_factor) + 1.0
-            )  # YaRN concentration
+        self.register_buffer("inv_freq_base", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self.register_buffer("cos_cached", torch.empty(0, dtype=torch.float32, device=device), persistent=False)
+        self.register_buffer("sin_cached", torch.empty(0, dtype=torch.float32, device=device), persistent=False)
 
-            d_half = self.head_dim / 2
-            # NTK by parts
-            low = (
-                d_half
-                * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi))
-                / math.log(self.base)
-            )
-            high = (
-                d_half
-                * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi))
-                / math.log(self.base)
-            )
-            assert 0 < low < high < d_half - 1
+    def _update_cache(self, seqlen: int, device, dtype):
+        if (seqlen <= self._seq_len_cached and
+            self.cos_cached.device == device and
+            self.cos_cached.dtype == dtype):
+            return
+        pos = torch.arange(seqlen, device=device, dtype=torch.float32) / self.factor
+        freqs = torch.einsum("s,f->sf", pos, self.inv_freq_base.to(device=device))
+        cos = torch.cos(freqs).to(dtype)
+        sin = torch.sin(freqs).to(dtype)
+        # interleave
+        cos = torch.stack([cos, cos], dim=-1).reshape(seqlen, -1)
+        sin = torch.stack([sin, sin], dim=-1).reshape(seqlen, -1)
+        self.cos_cached = cos
+        self.sin_cached = sin
+        self._seq_len_cached = seqlen
 
-            interpolation = 1.0 / (self.scaling_factor * freq)
-            extrapolation = 1.0 / freq
+    def apply(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        # x: (B*H, T, Dh)
+        BxH, T, Dh = x.shape
+        self._update_cache(int(positions.max().item()) + 1, x.device, x.dtype)
+        cos = self.cos_cached[positions]  # (B*H, T, Dh)
+        sin = self.sin_cached[positions]
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        xr1 = x1 * cos[..., ::2] - x2 * sin[..., ::2]
+        xr2 = x1 * sin[..., ::2] + x2 * cos[..., ::2]
+        out = torch.empty_like(x)
+        out[..., ::2], out[..., 1::2] = xr1, xr2
+        return out
 
-            ramp = (
-                torch.arange(d_half, dtype=torch.float32, device=freq.device) - low
-            ) / (high - low)
-            mask = 1 - ramp.clamp(0, 1)
 
-            inv_freq = interpolation * (1 - mask) + extrapolation * mask
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        H = cfg.hidden_size
+        self.n_head = int(cfg.num_attention_heads)
+        self.n_kv = int(cfg.num_key_value_heads)
+        self.dh = int(cfg.head_dim)
+        self.group_size = int(cfg.group_size)
+        self.scale = 1.0 / math.sqrt(self.dh)
+        self.drop_attn = nn.Dropout(cfg.attention_dropout)
+        self.drop_resid = nn.Dropout(cfg.dropout)
+        self.rope = RotaryEmbedding(self.dh, cfg.rope_theta, cfg.rope_scaling)
+
+        self.q = nn.Linear(H, self.n_head * self.dh, bias=cfg.attention_bias)
+        self.k = nn.Linear(H, self.n_kv * self.dh, bias=cfg.attention_bias)
+        self.v = nn.Linear(H, self.n_kv * self.dh, bias=cfg.attention_bias)
+        self.o = nn.Linear(self.n_head * self.dh, H, bias=True)
+
+        # Learned "null" attention logit per head (attention sink column)
+        self.use_sink = bool(cfg.enable_sink_logit)
+        if self.use_sink:
+            self.sink_logit = nn.Parameter(torch.full((self.n_head,), float(cfg.sink_logit_init)))
         else:
-            concentration = 1.0
-            inv_freq = 1.0 / freq
+            # create a dummy buffer so reset_parameters() can always reference it safely
+            self.register_buffer("sink_logit", torch.empty(0), persistent=False)
 
-        return concentration, inv_freq
+        # store init settings for reset_parameters()
+        self.init_std = float(cfg.initializer_range)
+        self.sink_init = float(cfg.sink_logit_init)
 
-    def _compute_cos_sin(self, num_tokens: int):
-        concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cos = freqs.cos() * concentration
-        sin = freqs.sin() * concentration
-        return cos, sin
+        # init once for rank0
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Robust to attributes missing during meta materialization
+        init_std = getattr(self, "init_std", 0.02)
+        with torch.no_grad():
+            for m in (self.q, self.k, self.v, self.o):
+                nn.init.normal_(m.weight, mean=0.0, std=init_std)
+                if getattr(m, "bias", None) is not None:
+                    m.bias.zero_()
+            if getattr(self, "use_sink", False) and hasattr(self, "sink_logit") and self.sink_logit.numel() > 0:
+                self.sink_logit.fill_(getattr(self, "sink_init", 4.0))
+        # also reset RoPE buffers so nonzero ranks get real tensors
+        if hasattr(self, "rope") and hasattr(self.rope, "reset_parameters"):
+            self.rope.reset_parameters()
+
+    def _kv_expand(self, kv: torch.Tensor) -> torch.Tensor:
+        # (B, T, n_kv*Dh) -> (B, H, T, Dh)
+        B, T, _ = kv.shape
+        kv = kv.view(B, T, self.n_kv, self.dh)
+        kv = kv.unsqueeze(3).expand(B, T, self.n_kv, self.group_size, self.dh)
+        kv = kv.reshape(B, T, self.n_head, self.dh).transpose(1, 2).contiguous()
+        return kv
+
+    @staticmethod
+    def _build_local_mask(T: int, device, win: int) -> torch.Tensor:
+        # (T,T) True=keep
+        i = torch.arange(T, device=device)
+        j = torch.arange(T, device=device)
+        dist = i[:, None] - j[None, :]
+        return (dist >= 0) & (dist < win)
 
     def forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        x: torch.Tensor,               # (B,T,H)
+        positions: torch.Tensor,       # (B,T)
+        causal_mask: torch.Tensor,     # (T,T) bool True=keep
+        is_sliding_layer: bool,
+        sliding_window: int,
+    ) -> torch.Tensor:
+        B, T, H = x.shape
 
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_dim)
-        query = _apply_rotary_emb(query, cos, sin)
-        query = query.reshape(query_shape)
+        q = self.q(x).view(B, T, self.n_head, self.dh).transpose(1, 2).contiguous()  # (B,H,T,Dh)
+        k = self._kv_expand(self.k(x))  # (B,H,T,Dh)
+        v = self._kv_expand(self.v(x))  # (B,H,T,Dh)
 
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_dim)
-        key = _apply_rotary_emb(key, cos, sin)
-        key = key.reshape(key_shape)
-        return query, key
+        # RoPE on q,k
+        pos_rep = positions.repeat_interleave(self.n_head, 0)  # (B*H,T)
+        q = self.rope.apply(q.view(B * self.n_head, T, self.dh), pos_rep).view(B, self.n_head, T, self.dh)
+        k = self.rope.apply(k.view(B * self.n_head, T, self.dh), pos_rep).view(B, self.n_head, T, self.dh)
+
+        # Fast path: use FlashAttention only for pure causal full-attn w/o sink column
+        use_flash = _flash_available and (not is_sliding_layer) and (not getattr(self, "use_sink", False))
+        if use_flash:
+            # Flash-Attn expects (B,T,H,D)
+            qf = q.transpose(1, 2)  # (B,T,H,D)
+            kf = k.transpose(1, 2)
+            vf = v.transpose(1, 2)
+            out = _flash_attn_func(qf, kf, vf, causal=True)  # (B,T,H,D)
+            out = out.transpose(1, 2).contiguous().view(B, T, self.n_head * self.dh)
+            out = self.o(out)
+            return self.drop_resid(out)
+
+        # Manual path (supports sliding + sink)
+        att = torch.einsum("bhtd,bhsd->bhts", q, k) * self.scale  # (B,H,T,S=T)
+
+        # Base causal
+        mask = causal_mask  # (T,T) True=keep
+        # Sliding window (only limit the source side)
+        if is_sliding_layer:
+            local = self._build_local_mask(T, x.device, sliding_window)
+            mask = mask & local  # (T,T)
+
+        # Apply mask
+        att = att.masked_fill(~mask.view(1, 1, T, T), float("-inf"))
+
+        # Append sink column (null attention) if enabled
+        if getattr(self, "use_sink", False) and hasattr(self, "sink_logit") and self.sink_logit.numel() > 0:
+            sink_col = self.sink_logit.view(1, self.n_head, 1, 1).expand(B, -1, T, 1)
+            att = torch.cat([att, sink_col], dim=-1)  # (B,H,T,T+1)
+
+        p = F.softmax(att, dim=-1)
+        if getattr(self, "use_sink", False) and hasattr(self, "sink_logit") and self.sink_logit.numel() > 0:
+            p = p[..., :-1]  # drop sink prob (mass = "attend to nothing")
+        p = self.drop_attn(p)
+
+        y = torch.einsum("bhts,bhsd->bhtd", p, v).contiguous()
+        y = y.transpose(1, 2).reshape(B, T, self.n_head * self.dh)
+        y = self.o(y)
+        return self.drop_resid(y)
 
 
-def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
-    # sliding_window == 0 means no sliding window
-    n_tokens, n_heads, q_mult, d_head = Q.shape
-    assert K.shape == (n_tokens, n_heads, d_head)
-    assert V.shape == (n_tokens, n_heads, d_head)
-    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
-    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
-    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
-    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
-    if sliding_window > 0:
-        mask += torch.tril(
-            mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
-        )
-    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
-    QK *= sm_scale
-    QK += mask[None, None, :, :]
-    QK = torch.cat([QK, S], dim=-1)
-    W = torch.softmax(QK, dim=-1)
-    W = W[..., :-1]
-    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
-    return attn.reshape(n_tokens, -1)
-
-
-class AttentionBlock(torch.nn.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        layer_idx: int = 0,
-        device: torch.device | None = None,
-    ):
+class MoE(nn.Module):
+    """
+    A fast, vectorized MoE layer using einsum.
+    """
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.head_dim = config.head_dim
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        # Only apply sliding window to every other layer
-        self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
-        self.sinks = torch.nn.Parameter(
-            torch.empty(
-                config.num_key_value_heads,
-                config.num_attention_heads // config.num_key_value_heads,
-                device=device,
-                dtype=torch.bfloat16
-            )
-        )
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        qkv_dim = config.head_dim * (
-            config.num_attention_heads + 2 * config.num_key_value_heads
-        )
-        self.qkv = torch.nn.Linear(
-            config.hidden_size, qkv_dim, device=device, dtype=torch.bfloat16
-        )
-        self.out = torch.nn.Linear(
-            config.head_dim * config.num_attention_heads,
-            config.hidden_size,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        self.sm_scale = 1 / math.sqrt(config.head_dim)
-        self.rope = RotaryEmbedding(
-            config.head_dim,
-            config.rope_theta,
-            torch.float32,
-            initial_context_length=config.initial_context_length,
-            scaling_factor=config.rope_scaling_factor,
-            ntk_alpha=config.rope_ntk_alpha,
-            ntk_beta=config.rope_ntk_beta,
-            device=device,
-        )
+        H = cfg.hidden_size
+        E = cfg.num_local_experts
+        FF = cfg.intermediate_size
+        self.E = int(E)
+        self.K = int(cfg.experts_per_token)
+        self.clip = float(cfg.swiglu_clip)
+        self.router_aux_loss_coef = float(cfg.router_aux_loss_coef)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        t = self.norm(x)
-        qkv = self.qkv(t)
-        q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
-        k = qkv[
-            :,
-            self.num_attention_heads
-            * self.head_dim : (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
-        v = qkv[
-            :,
-            (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
+        # Expert parameters: W_in (H -> 2*FF), W_out (FF -> H)
+        self.W_in = nn.Parameter(torch.empty(E, H, 2 * FF))
+        self.b_in = nn.Parameter(torch.zeros(E, 2 * FF))
+        self.W_out = nn.Parameter(torch.empty(E, FF, H))
+        self.b_out = nn.Parameter(torch.zeros(E, H))
 
-        q = q.view(
-            -1,
-            self.num_key_value_heads,
-            self.num_attention_heads // self.num_key_value_heads,
-            self.head_dim,
-        )
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
-        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
-        t = self.out(t)
-        t = x + t
-        return t
+        # Router
+        self.router = nn.Linear(H, E, bias=True)
+
+        # store init std for reset
+        self.init_std = float(cfg.initializer_range)
+
+        # init once for rank0
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init_std = getattr(self, "init_std", 0.02)
+        with torch.no_grad():
+            nn.init.normal_(self.W_in,  mean=0.0, std=init_std)
+            nn.init.normal_(self.W_out, mean=0.0, std=init_std)
+            self.b_in.zero_(); self.b_out.zero_()
+            nn.init.normal_(self.router.weight, mean=0.0, std=init_std)
+            if self.router.bias is not None:
+                self.router.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        # x: (B,T,H) -> (S,H) where S=B*T
+        B, T, H = x.shape
+        S = B * T
+        x_flat = x.view(S, H)
+
+        # Route tokens to experts
+        logits = self.router(x_flat)  # (S, E)
+
+        # Top-K routing
+        topk_weights, topk_indices = torch.topk(logits, self.K, dim=-1)  # (S, K), (S, K)
+        topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(x.dtype)
+
+        # Aux (Switch-style) loss for load balancing
+        probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+        importance = probs.mean(dim=0)          # (E,)
+        load = F.one_hot(topk_indices.argmax(dim=-1), num_classes=self.E).float().mean(dim=0)
+        aux_loss = self.router_aux_loss_coef * self.E * (importance * load).sum()
+
+        # Create a one-hot mask for selected experts for each token and top-k choice
+        # (S, K) -> (S, K, E)
+        expert_mask = F.one_hot(topk_indices, num_classes=self.E)
+
+        # Combine the mask with the weights
+        # (S, K, E) * (S, K, 1) -> (S, K, E)
+        gating_weights = expert_mask * topk_weights.unsqueeze(-1)
+
+        # Sum weights over K choices to get the final weight for each expert for each token
+        # (S, K, E) -> (S, E)
+        final_expert_weights = gating_weights.sum(dim=1)
+
+        # --- Vectorized Expert Computation ---
+        # 1. Apply all experts' W_in to all tokens
+        #    'sh,ehd->sed': (S,H) @ (E,H,2FF) -> (S,E,2FF)
+        expert_inputs = torch.einsum('sh,ehd->sed', x_flat, self.W_in) + self.b_in
+        
+        # 2. Apply SwiGLU activation
+        #    swiglu halves the last dimension
+        expert_outputs = swiglu(expert_inputs, clip=self.clip) # (S,E,FF)
+
+        # 3. Apply all experts' W_out
+        #    'sef,efh->seh': (S,E,FF) @ (E,FF,H) -> (S,E,H)
+        expert_outputs = torch.einsum('sef,efh->seh', expert_outputs, self.W_out) + self.b_out
+
+        # 4. Weight the expert outputs by the router weights and sum
+        #    'seh,se->sh': (S,E,H) * (S,E) -> (S,H)
+        weighted_output = torch.einsum('seh,se->sh', expert_outputs, final_expert_weights)
+
+        # Reshape back to (B, T, H)
+        out = weighted_output.view(B, T, H)
+
+        return out, {"router_aux_loss": aux_loss}
 
 
-def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
-    x_glu, x_linear = x[..., ::2], x[..., 1::2]
-    # Clamp the input values
-    x_glu = x_glu.clamp(min=None, max=limit)
-    x_linear = x_linear.clamp(min=-limit, max=limit)
-    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
-    # Note we add an extra bias of 1 to the linear layer
-    return out_glu * (x_linear + 1)
-
-class MLPBlock(torch.nn.Module):
-
-    def __init__(
-        self,
-        config: ModelConfig,
-        device: torch.device | None = None,
-    ):
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.num_experts = config.num_experts
-        self.experts_per_token = config.experts_per_token
-        self.swiglu_limit = config.swiglu_limit
-        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        self.gate = torch.nn.Linear(
-            config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16
-        )
-        assert config.intermediate_size % self.world_size == 0
-        
-        # Store experts as a list of separate modules to avoid indexing issues
-        self.experts = torch.nn.ModuleList([
-            torch.nn.Sequential(
-                torch.nn.Linear(
-                    config.hidden_size, 
-                    config.intermediate_size * 2 // self.world_size, 
-                    device=device, 
-                    dtype=torch.bfloat16
-                ),
-                torch.nn.Linear(
-                    config.intermediate_size // self.world_size, 
-                    config.hidden_size, 
-                    device=device, 
-                    dtype=torch.bfloat16
-                )
-            ) for _ in range(config.num_experts)
-        ])
+        self.norm1 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.attn = MultiheadSelfAttention(cfg)
+        self.norm2 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.moe = MoE(cfg)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len, hidden_size = x.shape
-        t = self.norm(x)
-        g = self.gate(t)
-        
-        # Get top-k experts
-        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-        expert_weights = torch.nn.functional.softmax(experts.values, dim=-1)
-        expert_indices = experts.indices
-        
-        # Flatten for processing
-        t_flat = t.view(-1, hidden_size)
-        expert_indices_flat = expert_indices.view(-1, self.experts_per_token)
-        expert_weights_flat = expert_weights.view(-1, self.experts_per_token)
-        
-        output = torch.zeros_like(t_flat)
-        
-        # Process each expert
-        for expert_idx in range(self.num_experts):
-            mask = (expert_indices_flat == expert_idx).any(dim=-1)
-            if not mask.any():
-                continue
-                
-            token_indices = torch.where(mask)[0]
-            expert_pos = (expert_indices_flat[token_indices] == expert_idx).nonzero(as_tuple=True)[1]
-            
-            expert_input = t_flat[token_indices]
-            weights = expert_weights_flat[token_indices, expert_pos]
-            
-            # Forward through this expert
-            expert_out = expert_input
-            expert_out = self.experts[expert_idx][0](expert_out)  # First linear + activation
-            expert_out = swiglu(expert_out, limit=self.swiglu_limit)
-            expert_out = self.experts[expert_idx][1](expert_out)  # Second linear
-            
-            output[token_indices] += expert_out * weights.unsqueeze(-1)
-        
-        if self.world_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
-        
-        output = output.view(seq_len, hidden_size)
-        return x + output
+    def reset_parameters(self):
+        # Submodules handle their own init; keep for FSDP completeness
+        if hasattr(self.norm1, "reset_parameters"): self.norm1.reset_parameters()
+        if hasattr(self.attn,  "reset_parameters"): self.attn.reset_parameters()
+        if hasattr(self.norm2, "reset_parameters"): self.norm2.reset_parameters()
+        if hasattr(self.moe,   "reset_parameters"): self.moe.reset_parameters()
 
-
-
-
-class TransformerBlock(torch.nn.Module):
-    def __init__(
+    def forward(
         self,
-        config: ModelConfig,
-        layer_idx: int,
-        device: torch.device | None = None,
-    ):
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        causal_mask: torch.Tensor,
+        is_sliding_layer: bool,
+        sliding_window: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        a = self.attn(self.norm1(x), positions, causal_mask, is_sliding_layer, sliding_window)
+        x = x + a
+        m, aux = self.moe(self.norm2(x))
+        x = x + m
+        return x, aux
+
+
+class Transformer(nn.Module):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.attn = AttentionBlock(config, layer_idx, device)
-        self.mlp = MLPBlock(config, device)
+        self.config = cfg
+        H = cfg.hidden_size
+        self.embed = nn.Embedding(cfg.vocab_size, H)
+        self.drop = nn.Dropout(cfg.dropout)
+        self.layers = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_hidden_layers)])
+        self.norm_f = RMSNorm(H, eps=cfg.rms_norm_eps)
+        self.lm_head = nn.Linear(H, cfg.vocab_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x)
-        x = self.mlp(x)
-        return x
+        # store init std for reset
+        self.init_std = float(cfg.initializer_range)
 
+        # optional tying
+        if cfg.tie_word_embeddings:
+            self.lm_head.weight = self.embed.weight
 
-class Transformer(torch.nn.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        device: torch.device | None = None,
-    ):
-        super().__init__()
-        self.embedding = torch.nn.Embedding(
-            config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
-        )
-        self.block = torch.nn.ModuleList(
-            [
-                TransformerBlock(config, layer_idx, device)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        self.unembedding = torch.nn.Linear(
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
-        for block in self.block:
-            x = block(x)
-        x = self.norm(x)
-        x = self.unembedding(x)
-        return x
+        # init once for rank0
+        self.reset_parameters()
 
     @staticmethod
-    def from_checkpoint(
-        path: str, device: str | torch.device = "cuda"
-    ) -> "Transformer":
-        if not isinstance(device, torch.device):
-            device = torch.device(device)
+    def build_causal_mask(T: int, device, dtype=torch.bool) -> torch.Tensor:
+        i = torch.arange(T, device=device)
+        j = torch.arange(T, device=device)
+        return (j[None, :] <= i[:, None]).to(dtype)
 
-        config_path = os.path.join(path, "config.json")
-        with open(config_path, "r") as f:
-            json_config = json.load(f)
-            config = ModelConfig(**json_config)
+    def reset_parameters(self):
+        init_std = getattr(self, "init_std", 0.02)
+        with torch.no_grad():
+            nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
+            if self.lm_head.weight is not self.embed.weight:
+                nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        # Cascade to blocks + final norm
+        for blk in getattr(self, "layers", []):
+            if hasattr(blk, "reset_parameters"):
+                blk.reset_parameters()
+        if hasattr(self.norm_f, "reset_parameters"):
+            self.norm_f.reset_parameters()
 
-        model = Transformer(
-            config=config,
-            device=device,
-        )
-        model.eval()
+    def forward(
+        self,
+        input_ids: torch.Tensor,                  # (B,T)
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        B, T = input_ids.shape
+        device = input_ids.device
+        x = self.embed(input_ids)
+        x = self.drop(x)
+        positions = torch.arange(T, device=device).view(1, T).expand(B, T)
+        causal_mask = self.build_causal_mask(T, device)  # (T,T) bool
 
-        # # Load weights
-        # my_rank = dist.get_rank() if dist.is_initialized() else 0
-        # world_size = dist.get_world_size() if dist.is_initialized() else 1
-        # per_rank_intermediate_size = config.intermediate_size // world_size
+        aux_losses: List[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
+            is_sliding = (self.config.layer_types[i] == "sliding_attention")
+            x, aux = layer(x, positions, causal_mask, is_sliding, self.config.sliding_window)
+            if aux and "router_aux_loss" in aux:
+                aux_losses.append(aux["router_aux_loss"])
 
-        # checkpoint = Checkpoint(path, device)
+        x = self.norm_f(x)
+        logits = self.lm_head(x)
 
-        # for name, param in model.named_parameters():
-        #     loaded_tensor = checkpoint.get(name)
-
-        #     # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-        #     # but for simplicity we do it after.
-        #     if "mlp1" in name:  # both weight and bias
-        #         loaded_tensor = loaded_tensor[
-        #             :,
-        #             my_rank * 2
-        #             * per_rank_intermediate_size : (my_rank + 1) * 2
-        #             * per_rank_intermediate_size,
-        #             ...,
-        #         ]
-        #     elif "mlp2_weight" in name:  # only weight
-        #         loaded_tensor = loaded_tensor[
-        #             ...,
-        #             my_rank
-        #             * per_rank_intermediate_size : (my_rank + 1)
-        #             * per_rank_intermediate_size,
-        #         ]
-        #     try:
-        #         param.data.copy_(loaded_tensor)
-        #     except:
-        #         print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-        #         raise
-
-        return model
+        loss = None
+        aux_out: Dict[str, torch.Tensor] = {}
+        if labels is not None:
+            # next-token loss
+            logits_flat = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+            targets = labels[:, 1:].contiguous().view(-1)
+            nll = F.cross_entropy(logits_flat, targets, ignore_index=-100)
+            if aux_losses:
+                aux_total = torch.stack(aux_losses).mean()
+                nll = nll + self.config.router_aux_loss_coef * aux_total
+                aux_out["router_aux_loss"] = aux_total.detach()
+            loss = nll
+        return logits, {"loss": loss, **aux_out}
 
 
-class TokenGenerator:
-    @torch.inference_mode()
-    def __init__(self, checkpoint: str, device: torch.device):
-        self.device = device
-        self.model = Transformer.from_checkpoint("./", device=self.device)
+# ------------------------------------------------------------------------------------
+# Quick param sanity check for the 20B config
+# ------------------------------------------------------------------------------------
 
-    @torch.inference_mode()
-    def generate(self,
-                 prompt_tokens: list[int],
-                 stop_tokens: list[int],
-                 temperature: float = 1.0,
-                 max_tokens: int = 0,
-                 return_logprobs: bool = False):
-        tokens = list(prompt_tokens)
-        num_generated_tokens = 0
-        while max_tokens == 0 or num_generated_tokens < max_tokens:
-            logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
-            if temperature == 0.0:
-                predicted_token = torch.argmax(logits, dim=-1).item()
-            else:
-                probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-                predicted_token = torch.multinomial(probs, num_samples=1).item()
-            tokens.append(predicted_token)
-            num_generated_tokens += 1
+def gpt_oss_20b_config() -> ModelConfig:
+    return ModelConfig(
+        vocab_size=201_088,
+        hidden_size=2880,
+        num_hidden_layers=24,
+        head_dim=64,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        attention_bias=True,
+        attention_dropout=0.0,
+        dropout=0.0,
+        max_position_embeddings=131_072,
+        sliding_window=128,
+        num_local_experts=32,
+        experts_per_token=4,
+        router_aux_loss_coef=0.02,
+        intermediate_size=2880,
+        swiglu_clip=7.0,
+        rope_theta=150_000.0,
+        enable_sink_logit=True,   # sink-bias enabled (flash kept on full-attn layers)
+        sink_logit_init=4.0,
+        rms_norm_eps=1e-5,
+        initializer_range=0.02,
+        tie_word_embeddings=False,
+        eos_token_id=None,
+    )
 
-            if return_logprobs:
-                logprobs = torch.log_softmax(logits, dim=-1)
-                selected_logprobs = logprobs[predicted_token].item()
-                yield predicted_token, selected_logprobs
-            else:
-                yield predicted_token
 
-            if predicted_token in stop_tokens:
-                break
+if __name__ == "__main__":
+    cfg = gpt_oss_20b_config()
+    model = Transformer(cfg)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {n_params/1e9:.3f} B")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable:        {trainable/1e9:.3f} B")
