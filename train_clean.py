@@ -165,7 +165,7 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
 
 
 def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, num_samples=10):
-    """Generate answer samples for validation examples."""
+    """Generate answer samples for validation examples (works for both MS MARCO and TinyStories)."""
     encoder.eval()
     decoder.eval()
     
@@ -180,20 +180,25 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
         example = val_examples[val_idx]
         
         # Prepare question (strip all leading non-alphabetic characters)
+        # For TinyStories, question is empty
         question = example['question']
         while question and not question[0].isalpha():
             question = question[1:]
         
+        # Determine dataset type for debugging
+        is_story = len(question) == 0
+        dataset_type = "TinyStories" if is_story else "MS MARCO"
+        
         # Debug first sample
         if val_idx == 0:
-            print(f"Question: {question[:100]}")
+            print(f"Dataset type: {dataset_type}")
+            print(f"Question: {question[:100] if question else '(empty - story continuation)'}")
             print(f"Context: {example['context'][:150]}...")
         
         # Tokenize context and question with GPT tokenizer
         context_tokens = tokenizer.encode(example['context'])
-        question_tokens = tokenizer.encode(question)
+        question_tokens = tokenizer.encode(question) if question else []
         context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
-        question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
         
         if val_idx == 0:
             print(f"Context tokens: {len(context_tokens)}")
@@ -213,7 +218,7 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                 # Initialize generated tokens list
                 generated = []
                 
-                # Feed ALL question tokens at once to set context
+                # Feed ALL question tokens at once to set context (if any)
                 if len(question_tokens) > 0:
                     question_input_tensor = torch.tensor([question_tokens], dtype=torch.long, device=device)
                     # Add batch dimension to encoder output if needed
@@ -223,9 +228,19 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     current_token = torch.argmax(logits[0, -1, :], dim=-1).item()
                     
                     if val_idx == 0:
-                        print(f"After question, predicting first answer token: {tokenizer.decode([current_token])}")
+                        print(f"After question, predicting first token: {tokenizer.decode([current_token])}")
                 else:
-                    current_token = end_token_id
+                    # For stories, start generation from a special start token or first predicted token
+                    # Use encoder output to predict first token
+                    enc_out = encoder_kv.unsqueeze(0) if encoder_kv.dim() == 2 else encoder_kv
+                    # Feed encoder output with empty decoder input to get first token
+                    # Use a dummy start token (could be BOS if available, or generate from nothing)
+                    start_input = torch.tensor([[end_token_id]], dtype=torch.long, device=device)
+                    logits, aux = decoder(start_input, encoder_output=enc_out)
+                    current_token = torch.argmax(logits[0, -1, :]).item()
+                    
+                    if val_idx == 0:
+                        print(f"Story continuation, predicting first token: {tokenizer.decode([current_token])}")
                 
                 max_gen_len = 64
                 
@@ -257,9 +272,10 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
         
         samples.append({
             'context': example['context'][:150],
-            'question': question[:100],
+            'question': question[:100] if question else '(story)',
             'ground_truth': example['answer'],
-            'generated': generated_text
+            'generated': generated_text,
+            'type': dataset_type
         })
     
     encoder.train()
@@ -393,7 +409,7 @@ def main():
             experts_per_token=4,
             vocab_size=vocab_size,
             hidden_size=2880,
-            intermediate_size=2880,
+            intermediate_size=11520,  # 4x hidden_size for MLP (2880 * 4 = 11520)
             swiglu_limit=7.0,
             head_dim=64,
             num_attention_heads=64,
@@ -692,11 +708,11 @@ def main():
             print(f"{'='*60}")
             
             for idx, sample in enumerate(samples):
-                print(f"\n--- Example {idx + 1}/{len(samples)} ---")
+                print(f"\n--- Example {idx + 1}/{len(samples)} [{sample['type']}] ---")
                 print(f"Context: {sample['context']}...")
                 print(f"Question: {sample['question']}")
-                print(f"Ground Truth: {sample['ground_truth']}")
-                print(f"Generated Answer: {sample['generated']}")
+                print(f"Ground Truth: {sample['ground_truth'][:100]}...")
+                print(f"Generated: {sample['generated']}")
             
             print(f"{'='*60}\n")
             
