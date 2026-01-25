@@ -58,16 +58,29 @@ def load_gptoss_decoder(decoder_config, gptoss_weights_dir, device):
     loaded_count = 0
     
     # 1. Load embedding
+    embedding_loaded = False
     for emb_key in ['wte.weight', 'transformer.wte.weight', 'embedding.weight']:
         if emb_key in gptoss_state:
             gpt_emb = gptoss_state[emb_key]
             dec_emb = decoder.embedding.weight
+            print(f"  GPT-OSS embedding shape: {gpt_emb.shape}")
+            print(f"  Decoder embedding shape: {dec_emb.shape}")
             min_vocab = min(gpt_emb.size(0), dec_emb.size(0))
             if gpt_emb.size(1) == dec_emb.size(1):
                 decoder.embedding.weight.data[:min_vocab] = gpt_emb[:min_vocab].to(device)
                 loaded_count += 1
-                print(f"✓ Loaded embeddings ({min_vocab} tokens)")
+                embedding_loaded = True
+                print(f"✓ Loaded embeddings ({min_vocab} / {dec_emb.size(0)} tokens)")
+                if min_vocab < dec_emb.size(0) * 0.5:
+                    print(f"⚠️  WARNING: Only loaded {min_vocab}/{dec_emb.size(0)} embeddings ({min_vocab/dec_emb.size(0)*100:.1f}%)")
+                    print(f"⚠️  Most tokens will have RANDOM embeddings!")
                 break
+            else:
+                print(f"⚠️  Hidden size mismatch: GPT-OSS {gpt_emb.size(1)} vs Decoder {dec_emb.size(1)}")
+    
+    if not embedding_loaded:
+        print("⚠️  WARNING: No embeddings loaded from GPT-OSS!")
+        print("⚠️  Decoder will use RANDOM embeddings!")
     
     # 2. Load transformer layers
     num_layers = decoder_config.num_hidden_layers
@@ -618,7 +631,7 @@ def main():
     print("="*60)
     print("SANITY CHECK: Testing decoder fluency (should be coherent English)")
     print("="*60)
-    
+     
     decoder.eval()
     with torch.no_grad():
         # Test pure decoder generation (no encoder, no training)
