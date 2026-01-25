@@ -486,29 +486,14 @@ def main():
             print("Creating encoder with random weights...")
             encoder = BidirectionalEncoder(encoder_config, device=device)
         
-        # Make encoder embeddings and top 3 layers trainable for semantic learning
-        num_layers = encoder_config.num_hidden_layers
-        trainable_layers = 3  # Train top 3 layers
-        
+        # Make all encoder parameters trainable
         for name, param in encoder.named_parameters():
-            # Always train embeddings (adapting to new tokenizer)
-            if 'embedding' in name:
-                param.requires_grad = True
-                print(f"  ✓ Encoder trainable: {name}")
-            # Train top N layers (semantic adaptation)
-            elif any(f'layer.{i}.' in name for i in range(num_layers - trainable_layers, num_layers)):
-                param.requires_grad = True
-                if 'layer' in name and any(f'layer.{i}.' in name for i in range(num_layers - trainable_layers, num_layers)):
-                    layer_num = int(name.split('layer.')[1].split('.')[0])
-                    if layer_num >= num_layers - trainable_layers:
-                        print(f"  ✓ Encoder trainable: {name}")
-            else:
-                param.requires_grad = False
+            param.requires_grad = True
         
         encoder_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
         encoder_total = sum(p.numel() for p in encoder.parameters())
         print(f"\n✓ Encoder ready: {encoder_trainable/1e6:.1f}M trainable / {encoder_total/1e6:.1f}M total")
-        print(f"  Training: embeddings + top {trainable_layers} layers (semantic adaptation)\n")
+        print(f"  Training: ALL encoder layers\n")
         
         # ========================================
         # STEP 3: Create decoder from GPT-OSS
@@ -526,18 +511,14 @@ def main():
         encoder_hidden_size = encoder_config.hidden_size  # 1024 for BERT-large
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device, encoder_hidden_size)
         
-        # Strategy: Freeze GPT-OSS self-attention and MoE, train only cross-attention
+        # Make all decoder parameters trainable
         for name, param in decoder.named_parameters():
-            if 'cross_attn' in name:
-                param.requires_grad = True
-                print(f"  ✓ Decoder trainable: {name}")
-            else:
-                param.requires_grad = False
+            param.requires_grad = True
         
         trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in decoder.parameters())
         print(f"\nDecoder: {trainable_params/1e6:.1f}M trainable / {total_params/1e6:.1f}M total")
-        print(f"  ALL parameters frozen (using GPT-OSS for generation only)\n")
+        print(f"  Training: ALL decoder layers\n")
     
     # ========================================
     # Training setup
