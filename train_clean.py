@@ -158,6 +158,218 @@ def load_saved_model(model_dir, device):
         return None, None
 
 
+def load_and_prepare_data(dataset, tokenizer):
+    """Load MS MARCO dataset and prepare training/validation examples."""
+    print("Loading MS MARCO dataset...")
+    
+    # Prepare training examples
+    train_examples = []
+    for example in dataset['train']:
+        if not example.get('passages') or not example['passages'].get('passage_text'):
+            continue
+        if not example.get('query'):
+            continue
+        if not example.get('answers') or len(example['answers']) == 0:
+            continue
+        
+        answer = example['answers'][0]
+        
+        # Skip unanswerable questions (MS MARCO has many "No Answer Present." examples)
+        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
+            continue
+        if len(answer.strip()) == 0:
+            continue
+        
+        # Concatenate all context passages (not just the first one)
+        context = ' '.join(example['passages']['passage_text'])
+        question = example['query']
+        
+        train_examples.append({
+            'context': context,
+            'question': question,
+            'answer': answer
+        })
+    
+    print(f"✓ Loaded {len(train_examples)} training examples\n")
+    
+    # Prepare validation examples
+    val_examples = []
+    for example in dataset['validation']:
+        if not example.get('passages') or not example['passages'].get('passage_text'):
+            continue
+        if not example.get('query'):
+            continue
+        if not example.get('answers') or len(example['answers']) == 0:
+            continue
+        
+        answer = example['answers'][0]
+        
+        # Skip unanswerable questions (MS MARCO has many "No Answer Present." examples)
+        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
+            continue
+        if len(answer.strip()) == 0:
+            continue
+        
+        # Concatenate all context passages (not just the first one)
+        context = ' '.join(example['passages']['passage_text'])
+        question = example['query']
+        
+        val_examples.append({
+            'context': context,
+            'question': question,
+            'answer': answer
+        })
+    
+    print(f"✓ Loaded {len(val_examples)} validation examples\n")
+    
+    return train_examples, val_examples
+
+
+def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max_dec_length, vocab_size, num_val=10):
+    """Run validation and return loss."""
+    encoder.eval()
+    decoder.eval()
+    
+    val_loss = 0.0
+    num_val = min(num_val, len(val_examples))
+    
+    with torch.no_grad():
+        for val_idx in range(num_val):
+            # CRITICAL: Reset context for each validation example
+            decoder.reset_context()
+            
+            example = val_examples[val_idx]
+            
+            context = example['context']
+            question = example['question']
+            answer = example['answer']
+            
+            # Clean question: strip all leading non-alphabetic characters
+            while question and not question[0].isalpha():
+                question = question[1:]
+            
+            # Clean answer: strip all leading non-alphabetic characters
+            while answer and not answer[0].isalpha():
+                answer = answer[1:]
+            
+            # Tokenize context and question with GPT tokenizer
+            context_tokens = tokenizer.encode(context)
+            question_tokens = tokenizer.encode(question)
+            
+            # Tokenize answer with GPT tokenizer
+            answer_tokens = tokenizer.encode(answer)
+            
+            # Concatenate question + answer (natural GPT-OSS format)
+            end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+            sequence_tokens = question_tokens + answer_tokens + [end_token_id]
+            
+            # Create separate tensors
+            context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
+            question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
+            decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
+            decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
+            
+            with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                # Encode only context (question is in decoder)
+                encoder_kv = encoder(context_input, return_hidden_states=True)
+                logits = decoder(decoder_input, encoder_k=encoder_kv, encoder_v=encoder_kv, max_dec_length=max_dec_length)
+                loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
+            
+            val_loss += loss.item()
+    
+    val_loss /= num_val
+    
+    encoder.train()
+    decoder.train()
+    
+    return val_loss
+
+
+def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, num_samples=10):
+    """Generate answer samples for validation examples."""
+    encoder.eval()
+    decoder.eval()
+    
+    num_samples = min(num_samples, len(val_examples))
+    samples = []
+    
+    for val_idx in range(num_samples):
+        example = val_examples[val_idx]
+        
+        # Prepare question (strip all leading non-alphabetic characters)
+        question = example['question']
+        while question and not question[0].isalpha():
+            question = question[1:]
+        
+        # Tokenize context and question with GPT tokenizer
+        context_tokens = tokenizer.encode(example['context'])
+        question_tokens = tokenizer.encode(question)
+        context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
+        question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
+        
+        with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                # Encode only context (question is in decoder)
+                encoder_kv = encoder(context_input, return_hidden_states=True)
+                
+                # CRITICAL: Reset decoder context before generation
+                decoder.reset_context()
+                
+                # Generate token by token using GPT tokenizer
+                end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                
+                # Feed ALL question tokens at once to set context
+                if len(question_tokens) > 0:
+                    question_input_tensor = torch.tensor(question_tokens, dtype=torch.long, device=device)
+                    logits = decoder(
+                        question_input_tensor,
+                        encoder_k=encoder_kv,
+                        encoder_v=encoder_kv,
+                        update_context=True,
+                        max_dec_length=len(question_tokens)
+                    )
+                    # Start generating from last question token's prediction
+                    current_token = torch.argmax(logits[-1], dim=-1).item()
+                else:
+                    current_token = end_token_id
+                
+                max_gen_len = 64
+                
+                for step in range(max_gen_len):
+                    if current_token == end_token_id:
+                        break
+                    
+                    generated.append(current_token)
+                    
+                    # Generate next token
+                    token_input = torch.tensor([current_token], dtype=torch.long, device=device)
+                    
+                    logits = decoder(
+                        token_input,
+                        encoder_k=encoder_kv,
+                        encoder_v=encoder_kv,
+                        update_context=True,
+                        max_dec_length=1
+                    )
+                    
+                    # Use greedy decoding (argmax) for deterministic validation
+                    current_token = torch.argmax(logits[-1], dim=-1).item()
+        
+        generated_text = tokenizer.decode(generated) if generated else "[empty]"
+        
+        samples.append({
+            'context': example['context'][:150],
+            'question': question[:100],
+            'ground_truth': example['answer'],
+            'generated': generated_text
+        })
+    
+    encoder.train()
+    decoder.train()
+    
+    return samples
+
+
 def main():
     parser = argparse.ArgumentParser(description="Clean training script")
     parser.add_argument("--out_dir", type=str, default="model_clean", help="Output directory")
@@ -368,73 +580,9 @@ def main():
     print(f"    - Decoder cross-attn + context layers: {sum(p.numel() for p in decoder.parameters() if p.requires_grad)/1e6:.1f}M\n")
     
     # Load dataset
-    print("Loading MS MARCO dataset...")
     dataset = load_dataset("ms_marco", "v2.1")
+    train_examples, val_examples = load_and_prepare_data(dataset, tokenizer)
     
-    # Prepare training examples
-    train_examples = []
-    for example in dataset['train']:
-        if not example.get('passages') or not example['passages'].get('passage_text'):
-            continue
-        if not example.get('query'):
-            continue
-        if not example.get('answers') or len(example['answers']) == 0:
-            continue
-        
-        answer = example['answers'][0]
-        
-        # Skip unanswerable questions (MS MARCO has many "No Answer Present." examples)
-        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
-            continue
-        if len(answer.strip()) == 0:
-            continue
-        
-        # Concatenate all context passages (not just the first one)
-        context = ' '.join(example['passages']['passage_text'])
-        question = example['query']
-        
-        train_examples.append({
-            'context': context,
-            'question': question,
-            'answer': answer
-        })
-    
-    print(f"✓ Loaded {len(train_examples)} training examples\n")
-    
-    # Prepare validation examples
-    val_examples = []
-    for example in dataset['validation']:
-        if not example.get('passages') or not example['passages'].get('passage_text'):
-            continue
-        if not example.get('query'):
-            continue
-        if not example.get('answers') or len(example['answers']) == 0:
-            continue
-        
-        answer = example['answers'][0]
-        
-        # Skip unanswerable questions (MS MARCO has many "No Answer Present." examples)
-        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
-            continue
-        if len(answer.strip()) == 0:
-            continue
-        
-        # Concatenate all context passages (not just the first one)
-        context = ' '.join(example['passages']['passage_text'])
-        question = example['query']
-        
-        val_examples.append({
-            'context': context,
-            'question': question,
-            'answer': answer
-        })
-    
-    print(f"✓ Loaded {len(val_examples)} validation examples\n")
-    
-    # Training loop
-    print("="*60)
-    print("STARTING TRAINING")
-    print("="*60 + "\n")
     
     encoder.train()
     decoder.train()
@@ -535,205 +683,34 @@ def main():
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         
-        # Logging with quick prediction
-        if it % log_interval == 0:
-            # Add context state diagnostic
-            context_norm = decoder.context_state.norm().item() if hasattr(decoder, 'context_state') else 0.0
-            print(f"Iter {it:5d} | Loss: {total_loss:.4f} | LR: {cross_lr:.2e} | Ctx: {context_norm:.4f}")
-            
-            # Quick prediction sample (cycle through validation examples)
-            if len(val_examples) > 0:
-                encoder.eval()
-                decoder.eval()
-                
-                # Use different example each time
-                sample_idx = (it // log_interval) % len(val_examples)
-                example = val_examples[sample_idx]
-                question = example['question']
-                while question and not question[0].isalpha():
-                    question = question[1:]
-                
-                # Tokenize
-                context_tokens = tokenizer.encode(example['context'][:200])  # Truncate long context
-                question_tokens = tokenizer.encode(question)
-                context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
-                question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
-                
-                with torch.no_grad():
-                    with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        # Encode only context (question is in decoder)
-                        encoder_kv = encoder(context_input, return_hidden_states=True)
-                        
-                        # Reset and generate (start from question tokens)
-                        decoder.reset_context()
-                        generated = []
-                        end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                        
-                        # Feed question tokens first, then generate answer
-                        current_tokens = question_tokens.copy()
-                        for qt in current_tokens:
-                            token_input = torch.tensor([qt], dtype=torch.long, device=device)
-                            _ = decoder(token_input, encoder_k=encoder_kv, encoder_v=encoder_kv, 
-                                      update_context=True, max_dec_length=1)
-                        
-                        # Now generate answer tokens
-                        if len(current_tokens) > 0:
-                            current_token = current_tokens[-1]
-                        else:
-                            current_token = end_token_id
-                        
-                        for step in range(20):  # Short generation for quick check
-                            token_input = torch.tensor([current_token], dtype=torch.long, device=device)
-                            logits = decoder(token_input, encoder_k=encoder_kv, encoder_v=encoder_kv, 
-                                           update_context=True, max_dec_length=1)
-                            next_token = torch.argmax(logits[-1], dim=-1).item()
-                            if next_token == end_token_id:
-                                break
-                            generated.append(next_token)
-                            current_token = next_token
-                
-                gen_text = tokenizer.decode(generated) if generated else "[empty]"
-                print(f"  → Sample {sample_idx} Answer: {gen_text}")
-                
-                encoder.train()
-                decoder.train()
-        
         # Validation
         if it > 0 and it % eval_interval == 0:
-            encoder.eval()
-            decoder.eval()
-            
-            val_loss = 0.0
-            num_val = min(10, len(val_examples))
-            
-            with torch.no_grad():
-                for val_idx in range(num_val):
-                    # CRITICAL: Reset context for each validation example
-                    decoder.reset_context()
-                    
-                    example = val_examples[val_idx]
-                    
-                    context = example['context']
-                    question = example['question']
-                    answer = example['answer']
-                    
-                    # Clean question: strip all leading non-alphabetic characters
-                    while question and not question[0].isalpha():
-                        question = question[1:]
-                    
-                    # Clean answer: strip all leading non-alphabetic characters
-                    while answer and not answer[0].isalpha():
-                        answer = answer[1:]
-                    
-                    # Tokenize context and question with GPT tokenizer
-                    context_tokens = tokenizer.encode(context)
-                    question_tokens = tokenizer.encode(question)
-                    
-                    # Tokenize answer with GPT tokenizer
-                    answer_tokens = tokenizer.encode(answer)
-                    
-                    # Concatenate question + answer (natural GPT-OSS format)
-                    end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                    sequence_tokens = question_tokens + answer_tokens + [end_token_id]
-                    
-                    # Create separate tensors
-                    context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
-                    question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
-                    decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
-                    decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
-                    
-                    with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        # Encode only context (question is in decoder)
-                        encoder_kv = encoder(context_input, return_hidden_states=True)
-                        logits = decoder(decoder_input, encoder_k=encoder_kv, encoder_v=encoder_kv, max_dec_length=max_dec_length)
-                        loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
-                    
-                    val_loss += loss.item()
-            
-            val_loss /= num_val
+            # Run validation
+            val_loss = validate_model(
+                encoder, decoder, val_examples, tokenizer, 
+                device, dtype, max_dec_length, vocab_size, num_val=10
+            )
             
             print(f"\n{'='*60}")
             print(f"VALIDATION @ Iter {it}")
             print(f"{'='*60}")
             print(f"Val Loss: {val_loss:.4f}")
             
-            # Generate samples for ALL validation examples
-            print(f"\nSample Generations ({num_val} examples):")
+            # Generate samples
+            samples = generate_samples(
+                encoder, decoder, val_examples, tokenizer, 
+                device, dtype, num_samples=10
+            )
+            
+            print(f"\nSample Generations ({len(samples)} examples):")
             print(f"{'='*60}")
             
-            for val_idx in range(num_val):
-                example = val_examples[val_idx]
-                
-                # Prepare question (strip all leading non-alphabetic characters)
-                question = example['question']
-                while question and not question[0].isalpha():
-                    question = question[1:]
-                
-                print(f"\n--- Example {val_idx + 1}/{num_val} ---")
-                print(f"Context: {example['context'][:150]}...")
-                print(f"Question: {question[:100]}")
-                print(f"Ground Truth: {example['answer']}")
-                
-                # Tokenize context and question with GPT tokenizer
-                context_tokens = tokenizer.encode(example['context'])
-                question_tokens = tokenizer.encode(question)
-                context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
-                question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
-                
-                with torch.no_grad():
-                    with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                        # Encode only context (question is in decoder)
-                        encoder_kv = encoder(context_input, return_hidden_states=True)
-                        
-                        # CRITICAL: Reset decoder context before generation
-                        decoder.reset_context()
-                        
-                        # Generate token by token using GPT tokenizer
-                        end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-                        
-                        # Feed question tokens first to set context
-                        for qt in question_tokens:
-                            token_input = torch.tensor([qt], dtype=torch.long, device=device)
-                            logits = decoder(
-                                token_input,
-                                encoder_k=encoder_kv,
-                                encoder_v=encoder_kv,
-                                update_context=True,
-                                max_dec_length=1
-                            )
-                        
-                        # Now generate answer tokens
-                        generated = []
-                        if len(question_tokens) > 0:
-                            # Start from last question token's prediction
-                            current_token = torch.argmax(logits[-1], dim=-1).item()
-                        else:
-                            current_token = end_token_id
-                        
-                        max_gen_len = 64
-                        
-                        for step in range(max_gen_len):
-                            if current_token == end_token_id:
-                                break
-                            
-                            generated.append(current_token)
-                            
-                            # Generate next token
-                            token_input = torch.tensor([current_token], dtype=torch.long, device=device)
-                            
-                            logits = decoder(
-                                token_input,
-                                encoder_k=encoder_kv,
-                                encoder_v=encoder_kv,
-                                update_context=True,
-                                max_dec_length=1
-                            )
-                            
-                            # Use greedy decoding (argmax) for deterministic validation
-                            current_token = torch.argmax(logits[-1], dim=-1).item()
-                
-                generated_text = tokenizer.decode(generated) if generated else "[empty]"
-                print(f"Generated Answer: {generated_text}")
+            for idx, sample in enumerate(samples):
+                print(f"\n--- Example {idx + 1}/{len(samples)} ---")
+                print(f"Context: {sample['context']}...")
+                print(f"Question: {sample['question']}")
+                print(f"Ground Truth: {sample['ground_truth']}")
+                print(f"Generated Answer: {sample['generated']}")
             
             print(f"{'='*60}\n")
             
