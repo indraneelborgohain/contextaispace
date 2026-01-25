@@ -249,6 +249,13 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
             end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
             sequence_tokens = question_tokens + answer_tokens + [end_token_id]
             
+            # Handle decoder overflow: move excess tokens to encoder context
+            if len(sequence_tokens) > max_dec_length:
+                overflow_tokens = sequence_tokens[:len(sequence_tokens) - max_dec_length]
+                sequence_tokens = sequence_tokens[-max_dec_length:]
+                # Append overflow to context
+                context_tokens = context_tokens + overflow_tokens
+            
             # Create separate tensors
             context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
             question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
@@ -398,6 +405,7 @@ def main():
     gradient_accumulation_steps = 4
     max_qa_len = 128
     max_dec_length = 128  # Decoder chunk size: matches encoder max length for efficient processing
+    max_decoder_tokens = 2048  # Max tokens for decoder input; overflow goes to encoder context
     max_iters = 50000
     eval_interval = 100
     save_every = 500
@@ -486,14 +494,17 @@ def main():
             print("Creating encoder with random weights...")
             encoder = BidirectionalEncoder(encoder_config, device=device)
         
-        # Make all encoder parameters trainable
+        # Make only encoder embeddings trainable
         for name, param in encoder.named_parameters():
-            param.requires_grad = True
+            if 'embedding' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
         
         encoder_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
         encoder_total = sum(p.numel() for p in encoder.parameters())
         print(f"\n✓ Encoder ready: {encoder_trainable/1e6:.1f}M trainable / {encoder_total/1e6:.1f}M total")
-        print(f"  Training: ALL encoder layers\n")
+        print(f"  Training: Only embeddings (adapting to new tokenizer)\n")
         
         # ========================================
         # STEP 3: Create decoder from GPT-OSS
@@ -660,6 +671,13 @@ def main():
             # Format: [question tokens] [answer tokens] [<|endoftext|>]
             end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
             sequence_tokens = question_tokens + answer_tokens + [end_token_id]
+            
+            # Handle decoder overflow: move excess tokens to encoder context
+            if len(sequence_tokens) > max_decoder_tokens:
+                overflow_tokens = sequence_tokens[:len(sequence_tokens) - max_decoder_tokens]
+                sequence_tokens = sequence_tokens[-max_decoder_tokens:]
+                # Append overflow to context
+                context_tokens = context_tokens + overflow_tokens
             
             # Create separate tensors for context and question (for encoder)
             context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
