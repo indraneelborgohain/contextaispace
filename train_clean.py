@@ -257,8 +257,12 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
             
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
                 # Encode only context (question is in decoder)
-                encoder_kv = encoder(context_input, return_hidden_states=True)
-                logits = decoder(decoder_input, encoder_k=encoder_kv, encoder_v=encoder_kv, max_dec_length=max_dec_length)
+                encoder_output = encoder(context_input, return_hidden_states=True)
+                # Add batch dimension if needed
+                if encoder_output.dim() == 2:
+                    encoder_output = encoder_output.unsqueeze(0)
+                logits, aux = decoder(decoder_input.unsqueeze(0), encoder_output=encoder_output)
+                logits = logits.squeeze(0)
                 loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
             
             val_loss += loss.item()
@@ -325,16 +329,12 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                 
                 # Feed ALL question tokens at once to set context
                 if len(question_tokens) > 0:
-                    question_input_tensor = torch.tensor(question_tokens, dtype=torch.long, device=device)
-                    logits = decoder(
-                        question_input_tensor,
-                        encoder_k=encoder_kv,
-                        encoder_v=encoder_kv,
-                        update_context=True,
-                        max_dec_length=len(question_tokens)
-                    )
+                    question_input_tensor = torch.tensor([question_tokens], dtype=torch.long, device=device)
+                    # Add batch dimension to encoder output if needed
+                    enc_out = encoder_kv.unsqueeze(0) if encoder_kv.dim() == 2 else encoder_kv
+                    logits, aux = decoder(question_input_tensor, encoder_output=enc_out)
                     # Start generating from last question token's prediction
-                    current_token = torch.argmax(logits[-1], dim=-1).item()
+                    current_token = torch.argmax(logits[0, -1, :], dim=-1).item()
                     
                     if val_idx == 0:
                         print(f"After question, predicting first answer token: {tokenizer.decode([current_token])}")
@@ -356,18 +356,14 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     
                     logits = decoder(
                         token_input,
-                        encoder_k=encoder_kv,
-                        encoder_v=encoder_kv,
-                        update_context=True,
-                        max_dec_length=1
-                    )
+                        encoder_k=encoder_kv,[current_token]], dtype=torch.long, device=device)
+                    
+                    # Add batch dimension to encoder output if needed
+                    enc_out = encoder_kv.unsqueeze(0) if encoder_kv.dim() == 2 else encoder_kv
+                    logits, aux = decoder(token_input, encoder_output=enc_out)
                     
                     # Use greedy decoding (argmax) for deterministic validation
-                    current_token = torch.argmax(logits[-1], dim=-1).item()
-        
-        generated_text = tokenizer.decode(generated) if generated else "[empty]"
-        
-        if val_idx == 0:
+                    current_token = torch.argmax(logits[0, -1, :
             print(f"Generated tokens: {len(generated)}")
             print(f"Generated text: {generated_text}")
             print(f"{'='*60}\n")
@@ -700,21 +696,19 @@ def main():
                     encoder_k = encoder_kv
                     encoder_v = encoder_kv
                 else:
-                    encoder_k = None
-                    encoder_v = None
+                    encoder_output = encoder(context_input, return_hidden_states=True)
+                    # Add batch dimension if needed
+                    if encoder_output.dim() == 2:
+                        encoder_output = encoder_output.unsqueeze(0)
+                else:
+                    encoder_output = None
                 
                 # STEP 4: Decode
-                logits = decoder(
-                    decoder_input,
-                    encoder_k=encoder_k,
-                    encoder_v=encoder_v,
-                    update_context=True,  # Allow context updates during training
-                    max_dec_length=max_dec_length
+                logits, aux = decoder(
+                    decoder_input.unsqueeze(0),
+                    encoder_output=encoder_output
                 )
-                
-                # Debug: Print predicted text every 100 iterations
-                if it % 100 == 0 and micro_step == 0:
-                    with torch.no_grad():
+                logits = logits.squeeze(0    with torch.no_grad():
                         predicted_tokens = torch.argmax(logits, dim=-1).cpu().tolist()
                         predicted_text = tokenizer.decode(predicted_tokens)
                         target_text = tokenizer.decode(decoder_target.cpu().tolist())
