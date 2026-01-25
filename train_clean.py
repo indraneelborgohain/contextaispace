@@ -293,6 +293,10 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
     num_samples = min(num_samples, len(val_examples))
     samples = []
     
+    print(f"\n{'='*60}")
+    print(f"GENERATION DEBUG (first sample)")
+    print(f"{'='*60}")
+    
     for val_idx in range(num_samples):
         example = val_examples[val_idx]
         
@@ -301,22 +305,37 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
         while question and not question[0].isalpha():
             question = question[1:]
         
+        # Debug first sample
+        if val_idx == 0:
+            print(f"Question: {question[:100]}")
+            print(f"Context: {example['context'][:150]}...")
+        
         # Tokenize context and question with GPT tokenizer
         context_tokens = tokenizer.encode(example['context'])
         question_tokens = tokenizer.encode(question)
         context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
         question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
         
+        if val_idx == 0:
+            print(f"Context tokens: {len(context_tokens)}")
+            print(f"Question tokens: {len(question_tokens)}")
+        
         with torch.no_grad():
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
                 # Encode only context (question is in decoder)
                 encoder_kv = encoder(context_input, return_hidden_states=True)
+                
+                if val_idx == 0:
+                    print(f"Encoder output shape: {encoder_kv.shape}")
                 
                 # CRITICAL: Reset decoder context before generation
                 decoder.reset_context()
                 
                 # Generate token by token using GPT tokenizer
                 end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                
+                # Initialize generated tokens list
+                generated = []
                 
                 # Feed ALL question tokens at once to set context
                 if len(question_tokens) > 0:
@@ -330,6 +349,9 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     )
                     # Start generating from last question token's prediction
                     current_token = torch.argmax(logits[-1], dim=-1).item()
+                    
+                    if val_idx == 0:
+                        print(f"After question, predicting first answer token: {tokenizer.decode([current_token])}")
                 else:
                     current_token = end_token_id
                 
@@ -337,6 +359,8 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                 
                 for step in range(max_gen_len):
                     if current_token == end_token_id:
+                        if val_idx == 0:
+                            print(f"Hit EOS at step {step}")
                         break
                     
                     generated.append(current_token)
@@ -356,6 +380,11 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     current_token = torch.argmax(logits[-1], dim=-1).item()
         
         generated_text = tokenizer.decode(generated) if generated else "[empty]"
+        
+        if val_idx == 0:
+            print(f"Generated tokens: {len(generated)}")
+            print(f"Generated text: {generated_text}")
+            print(f"{'='*60}\n")
         
         samples.append({
             'context': example['context'][:150],
@@ -583,6 +612,49 @@ def main():
     dataset = load_dataset("ms_marco", "v2.1")
     train_examples, val_examples = load_and_prepare_data(dataset, tokenizer)
     
+    # ========================================
+    # SANITY CHECK: Test decoder fluency before training
+    # ========================================
+    print("="*60)
+    print("SANITY CHECK: Testing decoder fluency (should be coherent English)")
+    print("="*60)
+    
+    decoder.eval()
+    with torch.no_grad():
+        # Test pure decoder generation (no encoder, no training)
+        test_prompt = "The capital of France is"
+        test_tokens = tokenizer.encode(test_prompt)
+        print(f"Test prompt: '{test_prompt}'")
+        print(f"Tokens: {test_tokens}")
+        
+        decoder.reset_context()
+        prompt_tensor = torch.tensor(test_tokens, dtype=torch.long, device=device)
+        
+        with torch.amp.autocast(device_type='cuda', dtype=dtype):
+            # Feed prompt
+            logits = decoder(prompt_tensor, encoder_k=None, encoder_v=None, update_context=True, max_dec_length=len(test_tokens))
+            next_token = torch.argmax(logits[-1], dim=-1).item()
+            
+            # Generate 20 tokens
+            generated = [next_token]
+            for _ in range(19):
+                token_tensor = torch.tensor([generated[-1]], dtype=torch.long, device=device)
+                logits = decoder(token_tensor, encoder_k=None, encoder_v=None, update_context=True, max_dec_length=1)
+                next_token = torch.argmax(logits[-1], dim=-1).item()
+                generated.append(next_token)
+            
+            full_text = test_prompt + tokenizer.decode(generated)
+            print(f"Generated: '{full_text}'")
+            
+            # Check if output is reasonable
+            if len(full_text) < len(test_prompt) + 5:
+                print("⚠️  WARNING: Decoder is generating very short text!")
+            if not any(c.isalpha() for c in tokenizer.decode(generated)):
+                print("⚠️  WARNING: Decoder is not generating alphabetic characters!")
+            else:
+                print("✓ Decoder appears to be working")
+    
+    print("="*60 + "\n")
     
     encoder.train()
     decoder.train()
