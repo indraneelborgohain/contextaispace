@@ -532,11 +532,7 @@ def main():
         print(f"  Vocab size: {decoder_config.vocab_size}")
         print(f"  Hidden size: {decoder_config.hidden_size}")
         print(f"  Layers: {decoder_config.num_hidden_layers}")
-        print(f"  Cross-attention: {decoder_config.use_encoder_decoder_cross_attention}")
-        print(f"  Encoder hidden size: {decoder_config.encoder_hidden_size}")
-        print(f"  Sliding window: {decoder_config.sliding_window}")
-        print(f"  Initial context length: {decoder_config.initial_context_length}")
-        
+         
         decoder = load_gptoss_decoder(decoder_config, gptoss_weights_dir, device)
         
         # Strategy: Freeze ALL GPT-OSS weights (model works out of the box)
