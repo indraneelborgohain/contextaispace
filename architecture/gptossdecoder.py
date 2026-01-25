@@ -209,7 +209,12 @@ class AttentionBlock(torch.nn.Module):
         # Only apply sliding window to every other layer
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
         self.sinks = torch.nn.Parameter(
-            torch.empty(config.num_attention_heads, device=device, dtype=torch.bfloat16)
+            torch.empty(
+                config.num_key_value_heads,
+                config.num_attention_heads // config.num_key_value_heads,
+                device=device,
+                dtype=torch.bfloat16
+            )
         )
         self.norm = RMSNorm(config.hidden_size, device=device)
         qkv_dim = config.head_dim * (
