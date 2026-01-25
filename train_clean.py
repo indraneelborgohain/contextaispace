@@ -314,13 +314,13 @@ def main():
     print(f"Effective batch: {batch_size * gradient_accumulation_steps}")
     print("="*60 + "\n")
     
-    # Get tokenizer - using BERT tokenizer for BOTH encoder and decoder
-    tokenizer = get_encoder_tokenizer()  # BERT tokenizer
+    # Get tokenizer - using GPT BPE tokenizer for BOTH encoder and decoder
+    tokenizer = get_decoder_tokenizer()  # GPT/Tiktoken tokenizer
     
-    vocab_size = tokenizer.vocab_size  # BERT vocab: ~30K
+    vocab_size = tokenizer.n_vocab  # Tiktoken vocab: ~200K
     
-    print(f"Vocab size (BERT): {vocab_size}")
-    print("Using BERT tokenizer for both encoder and decoder\n")
+    print(f"Vocab size (GPT BPE): {vocab_size}")
+    print("Using GPT BPE tokenizer for both encoder and decoder\n")
     
     # Check if loading from saved model
     if args.model_dir and os.path.exists(args.model_dir):
@@ -350,8 +350,9 @@ def main():
         
         encoder_config = create_encoder_config_from_bert(bert_model_name)
     
-        # Vocab size matches BERT tokenizer (no override needed)
-        print(f"  Vocab size: {encoder_config.vocab_size}")
+        # Override encoder vocab to match GPT tokenizer
+        encoder_config.vocab_size = vocab_size
+        print(f"  Vocab size (overridden to GPT): {encoder_config.vocab_size}")
         print(f"  Hidden size: {encoder_config.hidden_size}")
         print(f"  Layers: {encoder_config.num_hidden_layers}")
         print(f"  Attention heads: {encoder_config.num_attention_heads}")
@@ -359,27 +360,24 @@ def main():
         print(f"  Max position: {encoder_config.max_position_embeddings}\n")
         
         # ========================================
-        # STEP 2: Load BERT weights into encoder
+        # STEP 2: Create encoder from scratch
         # ========================================
         print("="*60)
-        print("STEP 2: Loading BERT weights into encoder")
+        print("STEP 2: Creating encoder from scratch")
         print("="*60)
         
-        encoder = load_bert_encoder(encoder_config, bert_model_name, device)
+        # Create encoder with random weights (training from scratch)
+        encoder = BidirectionalEncoder(encoder_config, device=device)
+        print("✓ Created encoder with random initialization")
         
-        if encoder is None:
-            print("⚠️  Failed to load BERT weights")
-            print("Creating encoder with random weights...")
-            encoder = BidirectionalEncoder(encoder_config, device=device)
-        
-        # Freeze all encoder parameters (using pretrained BERT with BERT tokenizer)
+        # Train all encoder parameters
         for name, param in encoder.named_parameters():
-            param.requires_grad = False
+            param.requires_grad = True
         
         encoder_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
         encoder_total = sum(p.numel() for p in encoder.parameters())
         print(f"\n✓ Encoder ready: {encoder_trainable/1e6:.1f}M trainable / {encoder_total/1e6:.1f}M total")
-        print(f"  Training: Encoder FROZEN (using pretrained BERT)\n")
+        print(f"  Training: ALL encoder layers (from scratch)\n")
         
         # ========================================
         # STEP 3: Create decoder
