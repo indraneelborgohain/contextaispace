@@ -17,7 +17,7 @@ from datasets import load_dataset
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
 from architecture.decoder import Transformer
 from architecture.model_loader import load_decoder
-from architecture.tokenizer import get_encoder_tokenizer, get_decoder_tokenizer
+from architecture.tokenizer import get_tokenizer
 from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
 from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
 
@@ -309,7 +309,7 @@ def main():
     print("="*60 + "\n")
     
     # Get tokenizer - using GPT BPE tokenizer for BOTH encoder and decoder
-    tokenizer = get_decoder_tokenizer()  # GPT/Tiktoken tokenizer
+    tokenizer = get_tokenizer()  # GPT/Tiktoken tokenizer
     
     vocab_size = tokenizer.n_vocab  # Tiktoken vocab: ~200K
     
@@ -702,7 +702,7 @@ def main():
                 # Save tokenizer (unified GPT tokenizer)
                 # For tiktoken, just save a marker file since it's reconstructed by code
                 with open(os.path.join(args.out_dir, 'tokenizer.txt'), 'w') as f:
-                    f.write('Use get_decoder_tokenizer() to load this GPT tokenizer')
+                    f.write('Use get_tokenizer() to load this GPT tokenizer')
                 
                 print(f"✓ Saved best model (val_loss: {val_loss:.4f})\n")
             
