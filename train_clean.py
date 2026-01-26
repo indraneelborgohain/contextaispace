@@ -21,7 +21,7 @@ from architecture.tokenizer import get_tokenizer
 from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
 from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
 from trainer import calcc, clear_gpu_memory,generate_samples, get_lr, text_to_token_ids, token_ids_to_text, validate_model
-from trainer import compute_loss_encoder_decoder
+from trainer import compute_loss_encoder_decoder,generate_next_token
 
 
 
