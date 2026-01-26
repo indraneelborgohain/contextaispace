@@ -7,23 +7,34 @@ from architecture.model_loader import (
 )
 import torch
 from inference import generate_text
-
+from architecture.gptoss import Transformer, ModelConfig
 device = "cuda:0"
 context = "Once upon a day"
 
 # Configuration for the model
-config = ModelConfig()
+config = ModelConfig(
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            num_experts=4,
+            experts_per_token=1,
+            num_hidden_layers=12,
+            hidden_size=1024,
+            intermediate_size=1024
+        )
+    
 
 # List available checkpoints
 list_available_checkpoints(models_dir="models")
 
 # Load pretrained model (or initialize with random weights if no checkpoint exists)
-model = load_pretrained_gptoss(
-    checkpoint_path="models/gptoss_best.safetensors",
-    config=config,
-    device=device,
-    strict=False  # Set to True if you want exact state_dict matching
-)
+#model = load_pretrained_gptoss(
+ #   checkpoint_path="models/gptoss_best.safetensors",
+  #  config=config,
+   
+   # device=device,
+    #strict=False  # Set to True if you want exact state_dict matching
+#)
+model = Transformer(config, device=device)
 
 # Display model information
 get_model_info(model)
