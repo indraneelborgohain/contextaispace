@@ -21,6 +21,13 @@ from architecture.tokenizer import get_tokenizer
 from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
 from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
 
+def text_to_token_ids(text, tokenizer):
+    encoded = tokenizer.encode(text)
+    encoded_tensor = torch.tensor(encoded)
+    return encoded_tensor
+
+def token_ids_to_text(token_ids, tokenizer):
+    return tokenizer.decode(token_ids.tolist())
 
 def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     """Learning rate schedule with warmup and cosine decay."""
@@ -99,14 +106,14 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
                 answer = answer[1:]
             
             # Tokenize context and question with GPT tokenizer
-            context_tokens = tokenizer.encode(context)
-            question_tokens = tokenizer.encode(question)
+            context_tokens = text_to_token_ids(context, tokenizer).tolist()
+            question_tokens = text_to_token_ids(question, tokenizer).tolist()
             
             # Tokenize answer with GPT tokenizer
-            answer_tokens = tokenizer.encode(answer)
+            answer_tokens = text_to_token_ids(answer, tokenizer).tolist()
             
             # Concatenate question + answer (natural GPT-OSS format)
-            end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+            end_token_id = text_to_token_ids("<|endoftext|>", tokenizer).tolist()[0]
             sequence_tokens = question_tokens + answer_tokens + [end_token_id]
             
             # Handle decoder overflow: move excess tokens to encoder context
@@ -125,11 +132,8 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
             with torch.amp.autocast(device_type='cuda', dtype=dtype):
                 # Encode only context (question is in decoder)
                 encoder_output = encoder(context_input, return_hidden_states=True)
-                # Add batch dimension if needed
-                if encoder_output.dim() == 2:
-                    encoder_output = encoder_output.unsqueeze(0)
-                logits, aux = decoder(decoder_input.unsqueeze(0), encoder_output=encoder_output)
-                logits = logits.squeeze(0)
+                # Decoder expects unbatched encoder output
+                logits, aux = decoder(decoder_input, encoder_output=encoder_output, return_dict=True)
                 loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
             
             val_loss += loss.item()
@@ -174,8 +178,8 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
             print(f"Context: {example['context'][:150]}...")
         
         # Tokenize context and question with GPT tokenizer
-        context_tokens = tokenizer.encode(example['context'])
-        question_tokens = tokenizer.encode(question) if question else []
+        context_tokens = text_to_token_ids(example['context'], tokenizer).tolist()
+        question_tokens = text_to_token_ids(question, tokenizer).tolist() if question else []
         context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
         
         if val_idx == 0:
@@ -191,34 +195,31 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     print(f"Encoder output shape: {encoder_kv.shape}")
                 
                 # Generate token by token using GPT tokenizer
-                end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                end_token_id = text_to_token_ids("<|endoftext|>", tokenizer).tolist()[0]
                 
                 # Initialize generated tokens list
                 generated = []
                 
                 # Feed ALL question tokens at once to set context (if any)
                 if len(question_tokens) > 0:
-                    question_input_tensor = torch.tensor([question_tokens], dtype=torch.long, device=device)
-                    # Add batch dimension to encoder output if needed
-                    enc_out = encoder_kv.unsqueeze(0) if encoder_kv.dim() == 2 else encoder_kv
-                    logits, aux = decoder(question_input_tensor, encoder_output=enc_out)
+                    question_input_tensor = torch.tensor(question_tokens, dtype=torch.long, device=device)
+                    logits, aux = decoder(question_input_tensor, encoder_output=encoder_kv, return_dict=True)
                     # Start generating from last question token's prediction
-                    current_token = torch.argmax(logits[0, -1, :], dim=-1).item()
+                    current_token = torch.argmax(logits[-1, :], dim=-1).item()
                     
                     if val_idx == 0:
-                        print(f"After question, predicting first token: {tokenizer.decode([current_token])}")
+                        print(f"After question, predicting first token: {token_ids_to_text(torch.tensor([current_token]), tokenizer)}")
                 else:
                     # For stories, start generation from a special start token or first predicted token
                     # Use encoder output to predict first token
-                    enc_out = encoder_kv.unsqueeze(0) if encoder_kv.dim() == 2 else encoder_kv
                     # Feed encoder output with empty decoder input to get first token
                     # Use a dummy start token (could be BOS if available, or generate from nothing)
-                    start_input = torch.tensor([[end_token_id]], dtype=torch.long, device=device)
-                    logits, aux = decoder(start_input, encoder_output=enc_out)
-                    current_token = torch.argmax(logits[0, -1, :]).item()
+                    start_input = torch.tensor([end_token_id], dtype=torch.long, device=device)
+                    logits, aux = decoder(start_input, encoder_output=encoder_kv, return_dict=True)
+                    current_token = torch.argmax(logits[-1, :]).item()
                     
                     if val_idx == 0:
-                        print(f"Story continuation, predicting first token: {tokenizer.decode([current_token])}")
+                        print(f"Story continuation, predicting first token: {token_ids_to_text(torch.tensor([current_token]), tokenizer)}")
                 
                 max_gen_len = 64
                 
@@ -231,17 +232,15 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     generated.append(current_token)
                     
                     # Generate next token
-                    token_input = torch.tensor([[current_token]], dtype=torch.long, device=device)
+                    token_input = torch.tensor([current_token], dtype=torch.long, device=device)
                     
-                    # Add batch dimension to encoder output if needed
-                    enc_out = encoder_kv.unsqueeze(0) if encoder_kv.dim() == 2 else encoder_kv
-                    logits, aux = decoder(token_input, encoder_output=enc_out)
+                    logits, aux = decoder(token_input, encoder_output=encoder_kv, return_dict=True)
                     
                     # Use greedy decoding (argmax) for deterministic validation
-                    current_token = torch.argmax(logits[0, -1, :]).item()
+                    current_token = torch.argmax(logits[-1, :]).item()
                 
                 # Decode generated tokens to text
-                generated_text = tokenizer.decode(generated)
+                generated_text = token_ids_to_text(torch.tensor(generated), tokenizer)
                 
                 if val_idx == 0:
                     print(f"Generated tokens: {len(generated)}")
@@ -439,7 +438,7 @@ def main():
     with torch.no_grad():
         # Test pure decoder generation (GPT-OSS native forward)
         test_prompt = "The capital of France is"
-        test_tokens = tokenizer.encode(test_prompt)
+        test_tokens = text_to_token_ids(test_prompt, tokenizer).tolist()
         print(f"Test prompt: '{test_prompt}'")
         print(f"Tokens: {test_tokens[:10]}...")
         
@@ -459,7 +458,7 @@ def main():
                 next_token = torch.argmax(logits[-1, :]).item()
                 
                 # Check for EOS
-                end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+                end_token_id = text_to_token_ids("<|endoftext|>", tokenizer).tolist()[0]
                 if next_token == end_token_id:
                     break
                 
@@ -471,7 +470,7 @@ def main():
                     torch.tensor([next_token], dtype=torch.long, device=device)
                 ], dim=0)
             
-            full_text = tokenizer.decode(generated_tokens)
+            full_text = token_ids_to_text(torch.tensor(generated_tokens), tokenizer)
             print(f"Generated: '{full_text}'")
             
             # Check if output is reasonable
@@ -506,15 +505,15 @@ def main():
     for story_ex in tinystories_train:
         story = story_ex['text']
         # Split story roughly in half: first half = context, second half = answer
-        story_tokens = tokenizer.encode(story)
+        story_tokens = text_to_token_ids(story, tokenizer).tolist()
         mid_point = len(story_tokens) // 2
         
         context_tokens = story_tokens[:mid_point]
         answer_tokens = story_tokens[mid_point:]
         
         # Decode back to text
-        context = tokenizer.decode(context_tokens)
-        answer = tokenizer.decode(answer_tokens)
+        context = token_ids_to_text(torch.tensor(context_tokens), tokenizer)
+        answer = token_ids_to_text(torch.tensor(answer_tokens), tokenizer)
         
         processed_tinystories_train.append({
             'context': context,
@@ -525,14 +524,14 @@ def main():
     processed_tinystories_val = []
     for story_ex in tinystories_val:
         story = story_ex['text']
-        story_tokens = tokenizer.encode(story)
+        story_tokens = text_to_token_ids(story, tokenizer).tolist()
         mid_point = len(story_tokens) // 2
         
         context_tokens = story_tokens[:mid_point]
         answer_tokens = story_tokens[mid_point:]
         
-        context = tokenizer.decode(context_tokens)
-        answer = tokenizer.decode(answer_tokens)
+        context = token_ids_to_text(torch.tensor(context_tokens), tokenizer)
+        answer = token_ids_to_text(torch.tensor(answer_tokens), tokenizer)
         
         processed_tinystories_val.append({
             'context': context,
@@ -582,15 +581,15 @@ def main():
                 answer = answer[1:]
             
             # Tokenize context and question with GPT tokenizer
-            context_tokens = tokenizer.encode(context)
-            question_tokens = tokenizer.encode(question)
+            context_tokens = text_to_token_ids(context, tokenizer).tolist()
+            question_tokens = text_to_token_ids(question, tokenizer).tolist()
             
             # Skip this example if question is empty after cleaning/tokenization
             if len(question_tokens) == 0:
                 continue
             
             # Tokenize answer with GPT tokenizer
-            answer_tokens = tokenizer.encode(answer)
+            answer_tokens = text_to_token_ids(answer, tokenizer).tolist()
             
             # Skip if answer is empty
             if len(answer_tokens) == 0:
@@ -598,7 +597,7 @@ def main():
             
             # Concatenate question + answer (natural GPT-OSS format)
             # Format: [question tokens] [answer tokens] [<|endoftext|>]
-            end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+            end_token_id = text_to_token_ids("<|endoftext|>", tokenizer).tolist()[0]
             sequence_tokens = question_tokens + answer_tokens + [end_token_id]
             
             # Handle decoder overflow: move excess tokens to encoder context
@@ -622,18 +621,15 @@ def main():
                 # Encode only the context (question is already in decoder input)
                 if context_input.numel() > 0:
                     encoder_output = encoder(context_input, return_hidden_states=True)
-                    # Add batch dimension if needed
-                    if encoder_output.dim() == 2:
-                        encoder_output = encoder_output.unsqueeze(0)
                 else:
                     encoder_output = None
                 
                 # STEP 4: Decode
                 logits, aux = decoder(
-                    decoder_input.unsqueeze(0),
-                    encoder_output=encoder_output
+                    decoder_input,
+                    encoder_output=encoder_output,
+                    return_dict=True
                 )
-                logits = logits.squeeze(0)
                 # Loss
                 loss = F.cross_entropy(
                     logits.view(-1, vocab_size),
