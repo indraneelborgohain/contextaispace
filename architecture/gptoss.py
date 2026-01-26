@@ -493,6 +493,8 @@ class Transformer(torch.nn.Module):
         )
         
         # Process chunks (if seq_len <= chunk_size, loop executes once)
+        outputs = []
+        
         for i in range(0, seq_len, chunk_size):
             chunk = x[i:i + chunk_size]
             chunk_embeddings = self.embedding(chunk)
@@ -507,11 +509,14 @@ class Transformer(torch.nn.Module):
             
             # Store context vector from last token for next chunk
             context_vector = chunk_hidden[-1].clone()
+            
+            # Normalize and unembed
+            chunk_output = self.norm(chunk_hidden)
+            chunk_output = self.unembedding(chunk_output)
+            outputs.append(chunk_output)
         
-        # Return output from final chunk only
-        chunk_output = self.norm(chunk_hidden)
-        chunk_output = self.unembedding(chunk_output)
-        return chunk_output
+        # Concatenate all chunk outputs
+        return torch.cat(outputs, dim=0)
 
     @staticmethod
     def from_checkpoint(

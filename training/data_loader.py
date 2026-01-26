@@ -8,23 +8,21 @@ batch_size=5
 context_len=4000
 
 dataset = load_dataset("roneneldan/TinyStories")
-train_text = " ".join([ex["text"] for ex in dataset['train']])
-val_text = " ".join([ex["text"] for ex in dataset['validation']])
 
 tokenizer = get_tokenizer()
 print("tokenizing...")
-train_tokens = tokenizer.encode(train_text)
-val_tokens = tokenizer.encode(val_text)
-print("tokenized")
-class TextDataset(Dataset):
-    def __init__(self, tokens, stride=8192):
+
+class StoryDataset(Dataset):
+    def __init__(self, stories):
         self.input_ids = []
         self.target_ids = []
-        for i in tqdm(range(0, len(tokens) - stride, stride)):
-            input_chunk = tokens[i:i + stride]
-            target_chunk = tokens[i + 1:i + stride + 1]
-            self.input_ids.append(torch.tensor(input_chunk))
-            self.target_ids.append(torch.tensor(target_chunk))
+        for story in tqdm(stories):
+            tokens = tokenizer.encode(story["text"])
+            if len(tokens) > 1:  # Need at least 2 tokens for input/target
+                input_tokens = tokens[:-1]
+                target_tokens = tokens[1:]
+                self.input_ids.append(torch.tensor(input_tokens, dtype=torch.long))
+                self.target_ids.append(torch.tensor(target_tokens, dtype=torch.long))
 
     def __len__(self):
         return len(self.input_ids)
@@ -32,11 +30,12 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         return self.input_ids[idx], self.target_ids[idx]
 
-train_dataset = TextDataset(train_tokens, stride=context_len)
-val_dataset = TextDataset(val_tokens, stride=context_len)
+train_dataset = StoryDataset(dataset['train'])
+val_dataset = StoryDataset(dataset['validation'])
+print("tokenized")
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
-del dataset, train_text, val_text
+del dataset
 gc.collect()
