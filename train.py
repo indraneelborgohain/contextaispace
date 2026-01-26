@@ -27,7 +27,7 @@ list_available_checkpoints(models_dir="models")
 
 # Load pretrained model (or initialize with random weights if no checkpoint exists)
 model = load_pretrained_gptoss(
-    checkpoint_path="models/gptoss_best.pt",
+    checkpoint_path="models/model.safetensors",
     config=config,
     device=device,
     strict=False  # Set to True if you want exact state_dict matching
