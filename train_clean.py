@@ -443,8 +443,8 @@ def main():
         print(f"Test prompt: '{test_prompt}'")
         print(f"Tokens: {test_tokens[:10]}...")
         
-        # Use batched input [batch, seq_len]
-        input_ids = torch.tensor([test_tokens], dtype=torch.long, device=device)
+        # Use unbatched input [seq_len]
+        input_ids = torch.tensor(test_tokens, dtype=torch.long, device=device)
         
         with torch.amp.autocast(device_type='cuda', dtype=dtype):
             # Generate tokens
@@ -453,10 +453,10 @@ def main():
             
             for _ in range(max_new_tokens):
                 # GPT-OSS forward: returns (logits, aux_dict)
-                logits, aux_dict = decoder(input_ids)
+                logits, aux_dict = decoder(input_ids, return_dict=True)
                 
-                # Get next token (greedy) - batched, so logits is [batch, seq_len, vocab_size]
-                next_token = torch.argmax(logits[0, -1, :]).item()
+                # Get next token (greedy) - unbatched, so logits is [seq_len, vocab_size]
+                next_token = torch.argmax(logits[-1, :]).item()
                 
                 # Check for EOS
                 end_token_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
@@ -465,11 +465,11 @@ def main():
                 
                 generated_tokens.append(next_token)
                 
-                # Update input - append to batched sequence
+                # Update input - append to unbatched sequence
                 input_ids = torch.cat([
                     input_ids,
-                    torch.tensor([[next_token]], dtype=torch.long, device=device)
-                ], dim=1)
+                    torch.tensor([next_token], dtype=torch.long, device=device)
+                ], dim=0)
             
             full_text = tokenizer.decode(generated_tokens)
             print(f"Generated: '{full_text}'")
@@ -730,7 +730,7 @@ def main():
             
             # Save tokenizer (unified GPT tokenizer)
             with open(os.path.join(checkpoint_dir, 'tokenizer.txt'), 'w') as f:
-                f.write('Use get_decoder_tokenizer() to load this GPT tokenizer')
+                f.write('Use get_tokenizer() to load this GPT tokenizer')
             
             print(f"✓ Saved checkpoint at iter {it}\n")
         
