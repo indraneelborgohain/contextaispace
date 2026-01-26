@@ -20,9 +20,10 @@ from architecture.model_loader import load_decoder
 from architecture.tokenizer import get_tokenizer
 from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
 from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
+from trainer import calcc, clear_gpu_memory
 
-def text_to_token_ids(text, tokenizer):
-    encoded = tokenizer.encode(text)
+def text_to_token_ids(text, tokenizer, allowed_special='all'):
+    encoded = tokenizer.encode(text, allowed_special=allowed_special)
     encoded_tensor = torch.tensor(encoded)
     return encoded_tensor
 
@@ -62,6 +63,47 @@ def generate_next_token(model, idx, temperature=0.8, top_k=50, encoder_output=No
     next_token = torch.multinomial(probs, num_samples=1).item()
     
     return next_token
+
+def compute_loss_encoder_decoder(encoder, decoder, input_batch, target_batch, device, dtype, vocab_size):
+    """Compute loss for encoder-decoder model using calcc pattern.
+    
+    Args:
+        encoder: The encoder model
+        decoder: The decoder model  
+        input_batch: List of (context_input, decoder_input) tuples
+        target_batch: List of decoder_target tensors
+        device: Device to use
+        dtype: Data type for autocast
+        vocab_size: Vocabulary size
+    
+    Returns:
+        Average loss over the batch
+    """
+    total_loss = 0
+    for i in range(len(input_batch)):
+        context_input, decoder_input = input_batch[i]
+        context_input = context_input.to(device, non_blocking=True)
+        decoder_input = decoder_input.to(device, non_blocking=True)
+        target = target_batch[i].to(device, non_blocking=True)
+        
+        with torch.amp.autocast(device_type='cuda', dtype=dtype):
+            # Encode context
+            if context_input.numel() > 0:
+                encoder_output = encoder(context_input, return_hidden_states=True)
+            else:
+                encoder_output = None
+            
+            # Decode
+            logits, _ = decoder(decoder_input, encoder_output=encoder_output, return_dict=True)
+            
+            # Compute loss
+            loss = F.cross_entropy(logits.view(-1, vocab_size), target.view(-1))
+        
+        total_loss += loss
+        del context_input, decoder_input, target, logits, loss
+    
+    clear_gpu_memory()
+    return total_loss / len(input_batch)
 
 def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     """Learning rate schedule with warmup and cosine decay."""
@@ -118,13 +160,14 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
     encoder.eval()
     decoder.eval()
     
-    val_loss = 0.0
     num_val = min(num_val, len(val_examples))
+    
+    # Prepare batches for calcc-style computation
+    input_batch = []
+    target_batch = []
     
     with torch.no_grad():
         for val_idx in range(num_val):
-            # CRITICAL: Reset context for each validation example
-            
             example = val_examples[val_idx]
             
             context = example['context']
@@ -158,21 +201,18 @@ def validate_model(encoder, decoder, val_examples, tokenizer, device, dtype, max
                 context_tokens = context_tokens + overflow_tokens
             
             # Create separate tensors
-            context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
-            question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
-            decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
-            decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
+            context_input = torch.tensor(context_tokens, dtype=torch.long)
+            decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long)
+            decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long)
             
-            with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                # Encode only context (question is in decoder)
-                encoder_output = encoder(context_input, return_hidden_states=True)
-                # Decoder expects unbatched encoder output
-                logits, aux = decoder(decoder_input, encoder_output=encoder_output, return_dict=True)
-                loss = F.cross_entropy(logits.view(-1, vocab_size), decoder_target.view(-1))
-            
-            val_loss += loss.item()
-    
-    val_loss /= num_val
+            # Add to batch
+            input_batch.append((context_input, decoder_input))
+            target_batch.append(decoder_target)
+        
+        # Compute loss using compute_loss_encoder_decoder
+        val_loss = compute_loss_encoder_decoder(
+            encoder, decoder, input_batch, target_batch, device, dtype, vocab_size
+        ).item()
     
     encoder.train()
     decoder.train()
@@ -599,11 +639,11 @@ def main():
         
         optimizer.param_groups[0]['lr'] = cross_lr
         
-        # Gradient accumulation
-        total_loss = 0.0
+        # Gradient accumulation - collect batch
+        input_batch = []
+        target_batch = []
+        
         for micro_step in range(gradient_accumulation_steps):
-            # CRITICAL: Reset context before each example to prevent bleeding
-            
             # Get batch
             example = train_examples[train_idx % len(train_examples)]
             train_idx += 1
@@ -647,38 +687,26 @@ def main():
                 # Append overflow to context
                 context_tokens = context_tokens + overflow_tokens
             
-            # Create separate tensors for context and question (for encoder)
-            context_input = torch.tensor(context_tokens, dtype=torch.long, device=device)
-            question_input = torch.tensor(question_tokens, dtype=torch.long, device=device)
+            # Create separate tensors (without device, will be moved in compute_loss_encoder_decoder)
+            context_input = torch.tensor(context_tokens, dtype=torch.long)
+            decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long)
+            decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long)
             
-            # Create decoder input/target from concatenated sequence
-            # Input: question + answer[:-1]  Target: question[1:] + answer + EOS
-            decoder_input = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
-            decoder_target = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
-            
-            # Forward pass
-            with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                # Encode only the context (question is already in decoder input)
-                if context_input.numel() > 0:
-                    encoder_output = encoder(context_input, return_hidden_states=True)
-                else:
-                    encoder_output = None
-                
-                # STEP 4: Decode
-                logits, aux = decoder(
-                    decoder_input,
-                    encoder_output=encoder_output,
-                    return_dict=True
-                )
-                # Loss
-                loss = F.cross_entropy(
-                    logits.view(-1, vocab_size),
-                    decoder_target.view(-1)
-                )
-                loss = loss / gradient_accumulation_steps
+            # Add to batch
+            input_batch.append((context_input, decoder_input))
+            target_batch.append(decoder_target)
+        
+        # Compute loss for entire batch using compute_loss_encoder_decoder
+        if len(input_batch) > 0:
+            loss = compute_loss_encoder_decoder(
+                encoder, decoder, input_batch, target_batch, device, dtype, vocab_size
+            )
             # Backward
             loss.backward()
-            total_loss += loss.item()
+            total_loss = loss.item()
+        else:
+            total_loss = 0.0
+            
         # Optimizer step
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
@@ -772,7 +800,7 @@ def main():
         
         # Clear cache periodically
         if it % 100 == 0:
-            torch.cuda.empty_cache()
+            clear_gpu_memory()
     
     print("\n" + "="*60)
     print("TRAINING COMPLETE")
