@@ -1,4 +1,4 @@
-from training.data_loader import train_loader, val_loader
+
 from architecture.gptoss import ModelConfig
 from architecture.model_loader import (
     load_pretrained_gptoss, 
@@ -19,7 +19,7 @@ list_available_checkpoints(models_dir="models")
 
 # Load pretrained model (or initialize with random weights if no checkpoint exists)
 model = load_pretrained_gptoss(
-    checkpoint_path="models/gptoss_best.pt",
+    checkpoint_path="models/gptoss_best.safetensors",
     config=config,
     device=device,
     strict=False  # Set to True if you want exact state_dict matching
@@ -30,4 +30,5 @@ get_model_info(model)
 
 # Start training
 from training.trainer import trainer
+from training.data_loader import train_loader, val_loader
 tl, vl, ts = trainer(model, train_loader, val_loader, device)
