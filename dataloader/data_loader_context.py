@@ -1,5 +1,5 @@
 """
-data_loader_context.py - Data loader that preserves document boundaries for context-aware training
+data_loader_context.py - Data loader for encoder-decoder training with TinyStories and MS MARCO
 """
 
 import torch
@@ -15,122 +15,227 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from architecture.tokenizer import get_tokenizer
 
-class DocumentDataset(Dataset):
+
+class EncoderDecoderDataset(Dataset):
     """
-    Dataset that keeps document boundaries intact.
-    Each sample is a full document (story) from TinyStories.
+    Dataset for encoder-decoder training.
+    Each sample contains context, question, and answer.
+    For TinyStories: context=first half, answer=second half, question=empty
+    For MS MARCO: context=passages, question=query, answer=answer
     """
-    def __init__(self, documents, tokenizer, max_length=None):
+    def __init__(self, examples, tokenizer):
         """
         Args:
-            documents: List of text documents
+            examples: List of dicts with 'context', 'question', 'answer' keys
             tokenizer: Tokenizer instance
-            max_length: Deprecated - kept for compatibility but not used.
-                        Model handles chunking via sliding_window in forward pass.
         """
         self.tokenizer = tokenizer
-        self.samples = []
+        self.examples = examples
         
-        print(f"Tokenizing {len(documents)} documents...")
-        for doc in tqdm(documents):
-            # Tokenize each document - keep entire document intact
-            tokens = tokenizer.encode(doc)
-            
-            # Only skip documents that are too short
-            if len(tokens) > 1:  # Need at least 2 tokens (input + target)
-                self.samples.append(torch.tensor(tokens, dtype=torch.long))
-        
-        print(f"Created {len(self.samples)} documents (model will handle chunking)")
+        print(f"Created dataset with {len(self.examples)} examples")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.examples)
 
     def __getitem__(self, idx):
         """
         Returns:
-            input_ids: Token sequence (all but last token)
-            target_ids: Target sequence (all but first token)
-            is_doc_start: Boolean indicating if this is the start of a new document
+            example: Dict with 'context', 'question', 'answer'
         """
-        tokens = self.samples[idx]
-        # For context models, we always treat each sample as document start
-        # This ensures context is reset between documents
-        return tokens[:-1], tokens[1:], True
+        return self.examples[idx]
 
 
-def collate_fn_with_padding(batch):
+def collate_fn_encoder_decoder(batch):
     """
-    Custom collate function that pads sequences to the same length within a batch.
+    Custom collate function for encoder-decoder training.
+    Returns raw examples without batching - train_clean.py handles batching.
     
     Args:
-        batch: List of (input_ids, target_ids, is_doc_start) tuples
+        batch: List of example dicts
     
     Returns:
-        input_ids: Padded tensor (batch_size, max_seq_len)
-        target_ids: Padded tensor (batch_size, max_seq_len)
-        is_doc_start: Boolean tensor (batch_size,)
-        lengths: Original lengths before padding (batch_size,)
+        batch: List of example dicts (unchanged)
     """
-    inputs, targets, doc_starts = zip(*batch)
-    
-    # Get lengths
-    lengths = torch.tensor([len(inp) for inp in inputs])
-    max_len = lengths.max().item()
-    
-    # Pad sequences (use -100 as padding for targets to ignore in loss)
-    padded_inputs = torch.stack([
-        torch.nn.functional.pad(inp, (0, max_len - len(inp)), value=0)
-        for inp in inputs
-    ])
-    
-    padded_targets = torch.stack([
-        torch.nn.functional.pad(tgt, (0, max_len - len(tgt)), value=-100)
-        for tgt in targets
-    ])
-    
-    doc_starts_tensor = torch.tensor(doc_starts, dtype=torch.bool)
-    
-    return padded_inputs, padded_targets, doc_starts_tensor, lengths
+    return batch
 
 
 def create_context_dataloaders(
-    batch_size=5,
-    max_length=None,
-    num_workers=4,
-    shuffle_train=True
+    batch_size=1,
+    num_workers=0,
+    shuffle_train=True,
+    max_tinystories=10000,
+    max_msmarco=5000
 ):
     """
-    Create dataloaders that preserve document boundaries for context-aware training.
-    
-    Note: Documents are kept intact. The model's forward() method handles chunking
-    based on its sliding_window parameter.
+    Create dataloaders for encoder-decoder training with TinyStories and MS MARCO.
     
     Args:
-        batch_size: Batch size
-        max_length: Deprecated - kept for compatibility but not used
+        batch_size: Batch size (recommend 1 for encoder-decoder with gradient accumulation)
         num_workers: Number of workers for data loading
         shuffle_train: Whether to shuffle training data
+        max_tinystories: Maximum number of TinyStories examples to load (None for all)
+        max_msmarco: Maximum number of MS MARCO examples to load (None for all)
     
     Returns:
-        train_loader: Training DataLoader
-        val_loader: Validation DataLoader
+        train_loader: PyTorch DataLoader for training
+        val_loader: PyTorch DataLoader for validation
     """
-    # Load TinyStories dataset
-    print("Loading TinyStories dataset...")
-    dataset = load_dataset("roneneldan/TinyStories")
-    
-    # Extract documents (each story is a separate document)
-    train_docs = [ex["text"] for ex in dataset['train']]
-    val_docs = [ex["text"] for ex in dataset['validation']]
-    
-    print(f"Loaded {len(train_docs)} training documents, {len(val_docs)} validation documents")
-    
     # Get tokenizer
     tokenizer = get_tokenizer()
     
-    # Create datasets - no max_length, model handles chunking
-    train_dataset = DocumentDataset(train_docs, tokenizer)
-    val_dataset = DocumentDataset(val_docs, tokenizer)
+    # Load MS MARCO
+    print("\n" + "="*60)
+    print("Loading MS MARCO dataset...")
+    print("="*60)
+    msmarco_dataset = load_dataset("ms_marco", "v2.1")
+    
+    # Process MS MARCO
+    msmarco_train = []
+    for idx, example in enumerate(msmarco_dataset['train']):
+        if max_msmarco and idx >= max_msmarco:
+            break
+        
+        if not example.get('passages') or not example['passages'].get('passage_text'):
+            continue
+        if not example.get('query'):
+            continue
+        if not example.get('answers') or len(example['answers']) == 0:
+            continue
+        
+        answer = example['answers'][0]
+        
+        # Skip unanswerable questions
+        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
+            continue
+        if len(answer.strip()) == 0:
+            continue
+        
+        # Concatenate all context passages
+        context = ' '.join(example['passages']['passage_text'])
+        question = example['query']
+        
+        msmarco_train.append({
+            'context': context,
+            'question': question,
+            'answer': answer
+        })
+    
+    msmarco_val = []
+    for idx, example in enumerate(msmarco_dataset['validation']):
+        if max_msmarco and idx >= max_msmarco // 10:  # 10% of max for validation
+            break
+        
+        if not example.get('passages') or not example['passages'].get('passage_text'):
+            continue
+        if not example.get('query'):
+            continue
+        if not example.get('answers') or len(example['answers']) == 0:
+            continue
+        
+        answer = example['answers'][0]
+        
+        if answer.strip().lower() in ['no answer present.', 'no answer present', 'no answer']:
+            continue
+        if len(answer.strip()) == 0:
+            continue
+        
+        context = ' '.join(example['passages']['passage_text'])
+        question = example['query']
+        
+        msmarco_val.append({
+            'context': context,
+            'question': question,
+            'answer': answer
+        })
+    
+    print(f"✓ Loaded {len(msmarco_train)} MS MARCO training examples")
+    print(f"✓ Loaded {len(msmarco_val)} MS MARCO validation examples")
+    
+    # Load TinyStories
+    print("\n" + "="*60)
+    print("Loading TinyStories dataset...")
+    print("="*60)
+    tinystories_dataset = load_dataset("roneneldan/TinyStories")
+    
+    # Process TinyStories - split each story in half
+    tinystories_train = []
+    for idx, example in enumerate(tinystories_dataset['train']):
+        if max_tinystories and idx >= max_tinystories:
+            break
+        
+        if not example.get('text'):
+            continue
+        
+        story = example['text'].strip()
+        
+        if len(story) < 50:  # Skip very short stories
+            continue
+        
+        # Split story roughly in half: first half = context, second half = answer
+        story_tokens = tokenizer.encode(story, allowed_special='all')
+        mid_point = len(story_tokens) // 2
+        
+        context_tokens = story_tokens[:mid_point]
+        answer_tokens = story_tokens[mid_point:]
+        
+        # Decode back to text
+        context = tokenizer.decode(context_tokens)
+        answer = tokenizer.decode(answer_tokens)
+        
+        tinystories_train.append({
+            'context': context,
+            'question': '',  # No question for stories
+            'answer': answer
+        })
+    
+    tinystories_val = []
+    for idx, example in enumerate(tinystories_dataset['validation']):
+        if max_tinystories and idx >= max_tinystories // 10:  # 10% of max for validation
+            break
+        
+        if not example.get('text'):
+            continue
+        
+        story = example['text'].strip()
+        
+        if len(story) < 50:
+            continue
+        
+        story_tokens = tokenizer.encode(story, allowed_special='all')
+        mid_point = len(story_tokens) // 2
+        
+        context_tokens = story_tokens[:mid_point]
+        answer_tokens = story_tokens[mid_point:]
+        
+        context = tokenizer.decode(context_tokens)
+        answer = tokenizer.decode(answer_tokens)
+        
+        tinystories_val.append({
+            'context': context,
+            'question': '',
+            'answer': answer
+        })
+    
+    print(f"✓ Loaded {len(tinystories_train)} TinyStories training examples")
+    print(f"✓ Loaded {len(tinystories_val)} TinyStories validation examples")
+    
+    # Combine datasets
+    train_examples = msmarco_train + tinystories_train
+    val_examples = msmarco_val + tinystories_val
+    
+    print("\n" + "="*60)
+    print(f"TOTAL: {len(train_examples)} training examples, {len(val_examples)} validation examples")
+    print(f"  - MS MARCO train: {len(msmarco_train)}, val: {len(msmarco_val)}")
+    print(f"  - TinyStories train: {len(tinystories_train)}, val: {len(tinystories_val)}")
+    print("="*60 + "\n")
+    
+    # Cleanup
+    del msmarco_dataset, tinystories_dataset
+    gc.collect()
+    
+    # Create datasets
+    train_dataset = EncoderDecoderDataset(train_examples, tokenizer)
+    val_dataset = EncoderDecoderDataset(val_examples, tokenizer)
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -138,8 +243,8 @@ def create_context_dataloaders(
         batch_size=batch_size,
         shuffle=shuffle_train,
         num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn_with_padding
+        collate_fn=collate_fn_encoder_decoder,
+        pin_memory=True
     )
     
     val_loader = DataLoader(
@@ -147,99 +252,38 @@ def create_context_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn_with_padding
+        collate_fn=collate_fn_encoder_decoder,
+        pin_memory=True
     )
-    
-    # Cleanup
-    del dataset, train_docs, val_docs
-    gc.collect()
     
     return train_loader, val_loader
 
 
 # If run as script, create and test the dataloaders
 if __name__ == "__main__":
-    print("Creating context-aware dataloaders...")
-    print("Note: Documents are kept intact. Model will handle chunking via sliding_window.\n")
+    print("Creating encoder-decoder dataloaders...")
     train_loader, val_loader = create_context_dataloaders(
-        batch_size=2,
-        num_workers=0  # Use 0 for testing
+        max_tinystories=100,
+        max_msmarco=50,
+        batch_size=2
     )
     
-    # Get tokenizer for decoding
-    tokenizer = get_tokenizer()
+    print(f"\nTrain loader: {len(train_loader)} batches")
+    print(f"Val loader: {len(val_loader)} batches")
     
-    print("\nTesting train_loader with detailed debug output...")
-    print("=" * 80)
+    print(f"\nSample training batch:")
+    print("="*60)
     
-    for batch_idx, (inputs, targets, doc_starts, lengths) in enumerate(train_loader):
-        print(f"\n{'='*80}")
-        print(f"BATCH {batch_idx}")
-        print(f"{'='*80}")
-        print(f"Batch input shape: {inputs.shape}")
-        print(f"Batch target shape: {targets.shape}")
-        print(f"Document starts: {doc_starts.tolist()}")
-        print(f"Sequence lengths: {lengths.tolist()}")
-        
-        # Examine each sequence in the batch
-        for seq_idx in range(inputs.shape[0]):
-            print(f"\n{'-'*80}")
-            print(f"Sequence {seq_idx} in batch:")
-            print(f"  Is document start: {doc_starts[seq_idx].item()}")
-            print(f"  Length: {lengths[seq_idx].item()}")
-            
-            seq_input = inputs[seq_idx]
-            seq_target = targets[seq_idx]
-            seq_len = lengths[seq_idx].item()
-            
-            # Get actual tokens (without padding)
-            actual_input = seq_input[:seq_len]
-            actual_target = seq_target[:seq_len]
-            
-            print(f"\n  Input tokens (first 30): {actual_input[:30].tolist()}")
-            print(f"  Target tokens (first 30): {actual_target[:30].tolist()}")
-            
-            # Verify input[i+1] == target[i]
-            print(f"\n  Verification: input[1:] should match target[:-1]")
-            if seq_len > 1:
-                matches = (actual_input[1:] == actual_target[:-1]).all()
-                print(f"  Match: {matches.item()}")
-                if not matches.item():
-                    print("  WARNING: Input/target mismatch detected!")
-            
-            # Decode text
-            print(f"\n  Decoded input text (first 200 chars):")
-            input_text = tokenizer.decode(actual_input.tolist())
-            print(f"  {repr(input_text[:200])}")
-            
-            print(f"\n  Decoded target text (first 200 chars):")
-            target_valid = actual_target[actual_target != -100]
-            if len(target_valid) > 0:
-                target_text = tokenizer.decode(target_valid.tolist())
-                print(f"  {repr(target_text[:200])}")
-            
-            # Show the offset
-            print(f"\n  Token offset demonstration (first 10 positions):")
-            print(f"  Position | Input Token ID | Input Token Text         | Target Token ID | Target Token Text")
-            print(f"  {'-'*100}")
-            for pos in range(min(10, seq_len)):
-                inp_tok = actual_input[pos].item()
-                tgt_tok = actual_target[pos].item()
-                
-                # Decode individual tokens
-                inp_text = tokenizer.decode([inp_tok])
-                tgt_text = tokenizer.decode([tgt_tok]) if tgt_tok != -100 else "<PAD>"
-                
-                # Truncate text if too long
-                inp_text = inp_text[:20] if len(inp_text) <= 20 else inp_text[:17] + "..."
-                tgt_text = tgt_text[:20] if len(tgt_text) <= 20 else tgt_text[:17] + "..."
-                
-                print(f"  {pos:8d} | {inp_tok:14d} | {repr(inp_text):24s} | {tgt_tok:15d} | {repr(tgt_text):20s}")
-        
-        print(f"\n{'='*80}")
-        
-        if batch_idx >= 2:  # Show first 3 batches
-            break
+    # Get first batch
+    batch = next(iter(train_loader))
     
-    print("\nDataloader test complete!")
+    for i, ex in enumerate(batch):
+        print(f"\nExample {i+1}:")
+        dataset_type = "MS MARCO" if ex['question'] else "TinyStories"
+        print(f"Type: {dataset_type}")
+        print(f"Context: {ex['context'][:150]}...")
+        print(f"Question: {ex['question'] if ex['question'] else '(empty - story continuation)'}")
+        print(f"Answer: {ex['answer'][:100]}...")
+    
+    print("\n" + "="*60)
+    print("Dataloader test complete!")

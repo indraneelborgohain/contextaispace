@@ -12,18 +12,19 @@ import os
 import time
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
 
 from architecture.encoder import BidirectionalEncoder, create_encoder_config_from_bert, load_bert_encoder
 from architecture.decoder import Transformer
 from architecture.model_loader import load_decoder
 from architecture.tokenizer import get_tokenizer
-from dataloader.msmarco_loader import load_and_prepare_data as load_msmarco
-from dataloader.tinystories_loader import load_and_prepare_data as load_tinystories
+from dataloader.data_loader_context import create_context_dataloaders
 from trainer import calcc, clear_gpu_memory,generate_samples, get_lr, text_to_token_ids, token_ids_to_text, validate_model
 from trainer import compute_loss_encoder_decoder,generate_next_token
 
 
+
+def startTrainning():
+    
 
 def main():
     parser = argparse.ArgumentParser(description="Clean training script")
@@ -251,74 +252,35 @@ def main():
                 print("⚠️  Decoder generated very little text")
     decoder.train()
     
-    # Load datasets
+    # Load datasets using unified dataloader
     print("="*60)
     print("LOADING DATASETS")
     print("="*60)
     
-    # Load MS MARCO
-    print("\nLoading MS MARCO...")
-    msmarco_dataset = load_dataset("ms_marco", "v2.1")
-    msmarco_train, msmarco_val = load_msmarco(msmarco_dataset, tokenizer)
+    train_loader, val_loader = create_context_dataloaders(
+        batch_size=1,  # We handle batching via gradient accumulation
+        num_workers=0,
+        shuffle_train=True,
+        max_tinystories=10000,
+        max_msmarco=5000
+    )
     
-    # Load TinyStories
-    print("\nLoading TinyStories...")
-    tinystories_dataset = load_dataset("roneneldan/TinyStories")
-    tinystories_train, tinystories_val = load_tinystories(tinystories_dataset, tokenizer, max_length=2048)
-    
-    # Process TinyStories to split into context/target for encoder-decoder training
-    print("\nProcessing TinyStories for encoder-decoder training...")
-    processed_tinystories_train = []
-    for story_ex in tinystories_train:
-        story = story_ex['text']
-        # Split story roughly in half: first half = context, second half = answer
-        story_tokens = text_to_token_ids(story, tokenizer).tolist()
-        mid_point = len(story_tokens) // 2
-        
-        context_tokens = story_tokens[:mid_point]
-        answer_tokens = story_tokens[mid_point:]
-        
-        # Decode back to text
-        context = token_ids_to_text(torch.tensor(context_tokens), tokenizer)
-        answer = token_ids_to_text(torch.tensor(answer_tokens), tokenizer)
-        
-        processed_tinystories_train.append({
-            'context': context,
-            'question': '',  # No question for stories
-            'answer': answer
-        })
-    
-    processed_tinystories_val = []
-    for story_ex in tinystories_val:
-        story = story_ex['text']
-        story_tokens = text_to_token_ids(story, tokenizer).tolist()
-        mid_point = len(story_tokens) // 2
-        
-        context_tokens = story_tokens[:mid_point]
-        answer_tokens = story_tokens[mid_point:]
-        
-        context = token_ids_to_text(torch.tensor(context_tokens), tokenizer)
-        answer = token_ids_to_text(torch.tensor(answer_tokens), tokenizer)
-        
-        processed_tinystories_val.append({
-            'context': context,
-            'question': '',
-            'answer': answer
-        })
-    
-    # Combine datasets
-    train_examples = msmarco_train + processed_tinystories_train
-    val_examples = msmarco_val + processed_tinystories_val
-    
-    print(f"\n✓ Total training examples: {len(train_examples)}")
-    print(f"  - MS MARCO: {len(msmarco_train)}")
-    print(f"  - TinyStories: {len(processed_tinystories_train)}")
-    print(f"\n✓ Total validation examples: {len(val_examples)}")
-    print(f"  - MS MARCO: {len(msmarco_val)}")
-    print(f"  - TinyStories: {len(processed_tinystories_val)}\n")
+    print(f"\n✓ Created training dataloader with {len(train_loader)} batches")
+    print(f"✓ Created validation dataloader with {len(val_loader)} batches\n")
     
     best_val_loss = float('inf')
-    train_idx = 0
+    
+    # Create iterator for infinite training loop
+    train_iter = iter(train_loader)
+    def get_batch():
+        """Get next batch from train_loader, resetting iterator if needed."""
+        nonlocal train_iter
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+        return batch[0]  # Return first example (batch_size=1)
     
     for it in range(max_iters):
         # Get learning rate for cross-attention (only trainable params)
@@ -331,9 +293,8 @@ def main():
         target_batch = []
         
         for micro_step in range(gradient_accumulation_steps):
-            # Get batch
-            example = train_examples[train_idx % len(train_examples)]
-            train_idx += 1
+            # Get batch from dataloader
+            example = get_batch()
             
             context = example['context']
             question = example['question']
