@@ -28,6 +28,7 @@ model = load_pretrained_gptoss(
 # Display model information
 get_model_info(model)
 
+generate_text(model, context)
 # Start training
 from training.trainer import trainer
 from training.data_loader import train_loader, val_loader
