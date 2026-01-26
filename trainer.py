@@ -5,7 +5,7 @@ import wandb
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 
 from tqdm.notebook import tqdm
-
+import torch.nn.functional as F
 
 def text_to_token_ids(text, tokenizer, allowed_special='all'):
     encoded = tokenizer.encode(text, allowed_special=allowed_special)
