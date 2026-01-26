@@ -35,7 +35,7 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
     for _ in range(max_tokens):
         idx_cond = idx[-context_len:]
         with torch.inference_mode():
-            logits= model(idx_cond)
+            logits = model(idx_cond, return_dict=False)
         logits = logits[-1, :] / temperature
 
         if top_k is not None:

@@ -452,13 +452,6 @@ class Transformer(torch.nn.Module):
             aux_dict['loss'] = loss
         
         return logits, aux_dict
-                    labels.view(-1)
-                )
-            else:  # unbatched
-                loss = F.cross_entropy(logits, labels)
-            aux_dict['loss'] = loss
-        
-        return logits, aux_dict
 
     @staticmethod
     def from_checkpoint(
