@@ -337,6 +337,95 @@ class MLPBlock(torch.nn.Module):
 
 
 
+class CrossAttention(torch.nn.Module):
+    """Cross-attention layer for attending to previous chunk context."""
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.head_dim = config.head_dim
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        self.context_norm = RMSNorm(config.hidden_size, device=device)
+        
+        # Query from current chunk
+        self.q_proj = torch.nn.Linear(
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        
+        # Key and Value from context vector
+        self.k_proj = torch.nn.Linear(
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        self.v_proj = torch.nn.Linear(
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        
+        self.out = torch.nn.Linear(
+            config.head_dim * config.num_attention_heads,
+            config.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        self.sm_scale = 1 / math.sqrt(config.head_dim)
+    
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """
+        Cross-attention between current chunk and previous context.
+        
+        Args:
+            x: Current chunk hidden states (seq_len, hidden_size)
+            context: Context vector from previous chunk (hidden_size,)
+        
+        Returns:
+            Output with cross-attention applied (seq_len, hidden_size)
+        """
+        # Normalize inputs
+        x_norm = self.norm(x)
+        context_norm = self.context_norm(context.unsqueeze(0))  # (1, hidden_size)
+        
+        # Compute Q from current chunk, K and V from context
+        q = self.q_proj(x_norm)  # (seq_len, num_heads * head_dim)
+        k = self.k_proj(context_norm)  # (1, num_kv_heads * head_dim)
+        v = self.v_proj(context_norm)  # (1, num_kv_heads * head_dim)
+        
+        # Reshape for multi-head attention
+        seq_len = x.shape[0]
+        q = q.view(seq_len, self.num_attention_heads, self.head_dim)
+        k = k.view(1, self.num_key_value_heads, self.head_dim)
+        v = v.view(1, self.num_key_value_heads, self.head_dim)
+        
+        # Expand K and V for grouped-query attention
+        num_groups = self.num_attention_heads // self.num_key_value_heads
+        k = k.repeat_interleave(num_groups, dim=1)  # (1, num_heads, head_dim)
+        v = v.repeat_interleave(num_groups, dim=1)  # (1, num_heads, head_dim)
+        
+        # Compute attention: Q @ K^T
+        attn_weights = torch.einsum('qhd,khd->qhk', q, k) * self.sm_scale  # (seq_len, num_heads, 1)
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        
+        # Apply attention to values
+        attn_output = torch.einsum('qhk,khd->qhd', attn_weights, v)  # (seq_len, num_heads, head_dim)
+        attn_output = attn_output.reshape(seq_len, -1)  # (seq_len, num_heads * head_dim)
+        
+        # Output projection and residual
+        output = self.out(attn_output)
+        return x + output
+
+
 class TransformerBlock(torch.nn.Module):
     def __init__(
         self,
@@ -362,6 +451,7 @@ class Transformer(torch.nn.Module):
         device: torch.device | None = None,
     ):
         super().__init__()
+        self.config = config
         self.embedding = torch.nn.Embedding(
             config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
         )
@@ -371,6 +461,8 @@ class Transformer(torch.nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # Cross-attention layer for chunk-to-chunk context
+        self.cross_attn = CrossAttention(config, device=device)
         self.norm = RMSNorm(config.hidden_size, device=device)
         self.unembedding = torch.nn.Linear(
             config.hidden_size,
@@ -381,12 +473,45 @@ class Transformer(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
-        for block in self.block:
-            x = block(x)
-        x = self.norm(x)
-        x = self.unembedding(x)
-        return x
+        """
+        Forward pass with chunking support and cross-attention between chunks.
+        
+        Args:
+            x: Input token tensor of shape (seq_len,)
+        
+        Returns:
+            Output logits tensor
+        """
+        seq_len = x.shape[0]
+        chunk_size = self.config.sliding_window
+        
+        # Initialize context vector to zeros for first chunk
+        context_vector = torch.zeros(
+            self.config.hidden_size, 
+            device=x.device, 
+            dtype=torch.bfloat16
+        )
+        
+        # Process chunks (if seq_len <= chunk_size, loop executes once)
+        for i in range(0, seq_len, chunk_size):
+            chunk = x[i:i + chunk_size]
+            chunk_embeddings = self.embedding(chunk)
+            
+            # Forward through transformer blocks
+            chunk_hidden = chunk_embeddings
+            for block in self.block:
+                chunk_hidden = block(chunk_hidden)
+            
+            # Apply cross-attention: Query from current chunk, K/V from previous context
+            chunk_hidden = self.cross_attn(chunk_hidden, context_vector)
+            
+            # Store context vector from last token for next chunk
+            context_vector = chunk_hidden[-1].clone()
+        
+        # Return output from final chunk only
+        chunk_output = self.norm(chunk_hidden)
+        chunk_output = self.unembedding(chunk_output)
+        return chunk_output
 
     @staticmethod
     def from_checkpoint(

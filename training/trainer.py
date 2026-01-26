@@ -135,7 +135,6 @@ def trainer(model,train_loader,val_loader,device):
     eval_iters = 5
     eval_freq=150          
     
-    
     torch.manual_seed(123)
     
     print(f"Using {device}")

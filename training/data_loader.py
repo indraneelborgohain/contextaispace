@@ -17,12 +17,12 @@ train_tokens = tokenizer.encode(train_text)
 val_tokens = tokenizer.encode(val_text)
 print("tokenized")
 class TextDataset(Dataset):
-    def __init__(self, tokens, max_length=8192, stride=8192):
+    def __init__(self, tokens, stride=8192):
         self.input_ids = []
         self.target_ids = []
-        for i in tqdm(range(0, len(tokens) - max_length, stride)):
-            input_chunk = tokens[i:i + max_length]
-            target_chunk = tokens[i + 1:i + max_length + 1]
+        for i in tqdm(range(0, len(tokens) - stride, stride)):
+            input_chunk = tokens[i:i + stride]
+            target_chunk = tokens[i + 1:i + stride + 1]
             self.input_ids.append(torch.tensor(input_chunk))
             self.target_ids.append(torch.tensor(target_chunk))
 
@@ -32,8 +32,8 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         return self.input_ids[idx], self.target_ids[idx]
 
-train_dataset = TextDataset(train_tokens, max_length=context_len, stride=context_len)
-val_dataset = TextDataset(val_tokens, max_length=context_len, stride=context_len)
+train_dataset = TextDataset(train_tokens, stride=context_len)
+val_dataset = TextDataset(val_tokens, stride=context_len)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
