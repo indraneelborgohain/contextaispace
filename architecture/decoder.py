@@ -413,23 +413,30 @@ class Transformer(torch.nn.Module):
         self, 
         x: torch.Tensor, 
         encoder_output: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, dict]:
+        labels: torch.Tensor | None = None,
+        return_dict: bool = True
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
         """
         Args:
             x: input token ids [seq_len] or [batch, seq_len]
             encoder_output: encoder hidden states [ctx_len, enc_hidden] or [batch, ctx_len, enc_hidden]
             labels: target token ids for loss calculation (optional)
+            return_dict: if True, return (logits, aux_dict); if False, return just logits
             
         Returns:
-            logits: [seq_len, vocab_size] or [batch, seq_len, vocab_size]
-            aux_dict: dict with optional 'loss' key
+            If return_dict=True: (logits, aux_dict) tuple
+            If return_dict=False: just logits tensor
+            logits shape: [seq_len, vocab_size] or [batch, seq_len, vocab_size]
         """
         x = self.embedding(x)
         for block in self.block:
             x = block(x, encoder_output)
         x = self.norm(x)
         logits = self.unembedding(x)
+        
+        if not return_dict:
+            # Backward compatibility: return just logits for inference
+            return logits
         
         aux_dict = {}
         if labels is not None:
@@ -438,6 +445,13 @@ class Transformer(torch.nn.Module):
             if logits.dim() == 3:  # batched
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
+                    labels.view(-1)
+                )
+            else:  # unbatched
+                loss = F.cross_entropy(logits, labels)
+            aux_dict['loss'] = loss
+        
+        return logits, aux_dict
                     labels.view(-1)
                 )
             else:  # unbatched
