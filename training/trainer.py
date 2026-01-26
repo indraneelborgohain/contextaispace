@@ -4,7 +4,7 @@ import time,os,gc
 import wandb
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 
 def clear_gpu_memory():
     if torch.cuda.is_available():
@@ -140,8 +140,8 @@ def trainer(model,train_loader,val_loader,device):
     
     print(f"Using {device}")
    
-    if os.path.exists('model/gptoss.pt'):
-        model.load_state_dict(torch.load('model/gptoss.pt'))
+    # Model loading is now handled in train.py via model_loader
+    # This keeps training logic separate from model initialization
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.1)
     scheduler_warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)

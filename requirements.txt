@@ -1,9 +1,6 @@
-torch
-numpy
 datasets
 tiktoken
+datasets
 tqdm
+wandb
 ipywidgets
-safetensors
-huggingface_hub
-tensorboard
