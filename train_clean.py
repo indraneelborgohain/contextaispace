@@ -29,6 +29,40 @@ def text_to_token_ids(text, tokenizer):
 def token_ids_to_text(token_ids, tokenizer):
     return tokenizer.decode(token_ids.tolist())
 
+def generate_next_token(model, idx, temperature=0.8, top_k=50, encoder_output=None, return_dict=False):
+    """Generate next token using temperature and top-k sampling.
+    
+    Args:
+        model: The decoder model
+        idx: Current sequence of token ids (tensor)
+        temperature: Sampling temperature (higher = more random)
+        top_k: Top-k filtering (None = no filtering)
+        encoder_output: Optional encoder output for cross-attention
+        return_dict: Whether model returns (logits, aux_dict) or just logits
+    
+    Returns:
+        next_token: The sampled next token id (int)
+    """
+    with torch.inference_mode():
+        if return_dict:
+            logits, _ = model(idx, encoder_output=encoder_output, return_dict=True)
+        else:
+            logits = model(idx, encoder_output=encoder_output, return_dict=False)
+    
+    # Get logits for last token
+    logits = logits[-1, :] / temperature
+    
+    # Apply top-k filtering
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[[-1]]] = -float('Inf')
+    
+    # Sample from distribution
+    probs = F.softmax(logits, dim=-1)
+    next_token = torch.multinomial(probs, num_samples=1).item()
+    
+    return next_token
+
 def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     """Learning rate schedule with warmup and cosine decay."""
     if it < warmup_iters:
@@ -231,13 +265,16 @@ def generate_samples(encoder, decoder, val_examples, tokenizer, device, dtype, n
                     
                     generated.append(current_token)
                     
-                    # Generate next token
+                    # Generate next token using temperature sampling
                     token_input = torch.tensor([current_token], dtype=torch.long, device=device)
-                    
-                    logits, aux = decoder(token_input, encoder_output=encoder_kv, return_dict=True)
-                    
-                    # Use greedy decoding (argmax) for deterministic validation
-                    current_token = torch.argmax(logits[-1, :]).item()
+                    current_token = generate_next_token(
+                        decoder,
+                        token_input,
+                        temperature=0.0,  # Greedy (deterministic)
+                        top_k=1,
+                        encoder_output=encoder_kv,
+                        return_dict=True
+                    )
                 
                 # Decode generated tokens to text
                 generated_text = token_ids_to_text(torch.tensor(generated), tokenizer)
@@ -449,16 +486,19 @@ def main():
             # Generate tokens
             max_new_tokens = 30
             generated_tokens = test_tokens.copy()
+            end_token_id = text_to_token_ids("<|endoftext|>", tokenizer).tolist()[0]
             
             for _ in range(max_new_tokens):
-                # GPT-OSS forward: returns (logits, aux_dict)
-                logits, aux_dict = decoder(input_ids, return_dict=True)
-                
-                # Get next token (greedy) - unbatched, so logits is [seq_len, vocab_size]
-                next_token = torch.argmax(logits[-1, :]).item()
+                # Generate next token with temperature sampling
+                next_token = generate_next_token(
+                    decoder, 
+                    input_ids, 
+                    temperature=0.8, 
+                    top_k=50,
+                    return_dict=True
+                )
                 
                 # Check for EOS
-                end_token_id = text_to_token_ids("<|endoftext|>", tokenizer).tolist()[0]
                 if next_token == end_token_id:
                     break
                 
