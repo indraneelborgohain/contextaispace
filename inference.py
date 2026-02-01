@@ -2,9 +2,7 @@ import torch
 from torch.nn import functional as F
 
 from architecture.tokenizer import get_tokenizer
-
-
-
+from hf_gptoss_loader import load_gptoss_from_hf
 
 context_len=8192
 tokenizer= get_tokenizer()
@@ -16,8 +14,6 @@ def text_to_token_ids(text, tokenizer):
 
 def token_ids_to_text(token_ids, tokenizer):
     return tokenizer.decode(token_ids.tolist())
-
-
 
 def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
     """Generate text from a prompt using trained model."""
@@ -42,12 +38,29 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
         probs = F.softmax(logits, dim=-1)
         idx_next = torch.multinomial(probs, num_samples=1)
         idx = torch.cat((idx, idx_next), dim=0)
-
-    
-    
-       
-    
     # Decode and return
     result = token_ids_to_text(idx,tokenizer)
     return result
+
+
+def main():
+    """Download GPT-OSS 20B weights if missing, load model, and generate text."""
+    repo_id = "ORG/REPO_NAME"  # TODO: replace with the actual Hugging Face repo id
+    local_dir = "models/gptoss-20b"
+
+    # Load model (downloads if not present)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model = load_gptoss_from_hf(
+        repo_id=repo_id,
+        local_dir=local_dir,
+        device=device,
+    )
+
+    prompt = "Once upon a time"
+    output = generate_text(model, prompt, max_tokens=80, temperature=0.8, top_k=50)
+    print(output)
+
+
+if __name__ == "__main__":
+    main()
 

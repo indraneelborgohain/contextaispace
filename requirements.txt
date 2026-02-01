@@ -4,3 +4,5 @@ datasets
 tqdm
 wandb
 ipywidgets
+huggingface_hub
+safetensors
