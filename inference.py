@@ -4,7 +4,7 @@ from torch.nn import functional as F
 from architecture.tokenizer import get_tokenizer
 from hf_gptoss_loader import load_gptoss_from_hf
 
-context_len=8192
+context_len=4096
 tokenizer= get_tokenizer()
 
 def text_to_token_ids(text, tokenizer):

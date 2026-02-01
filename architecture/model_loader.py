@@ -1,297 +1,184 @@
-"""
-Model loader utility for loading pretrained GPT models.
-Supports loading from local checkpoints with configurable paths.
-Supports both PyTorch (.pt) and SafeTensors (.safetensors) formats.
-"""
-
-import os
+import json
 import torch
 from pathlib import Path
-from typing import Optional, Union
-from architecture.gptoss import Transformer, ModelConfig
-from architecture.gpt2 import GPTModel, GPT_CONFIG
-
-try:
-    from safetensors.torch import load_file as load_safetensors
-    SAFETENSORS_AVAILABLE = True
-except ImportError:
-    SAFETENSORS_AVAILABLE = False
-    print("⚠️  safetensors not available. Install with: pip install safetensors")
+from safetensors import safe_open
+from typing import Dict, Tuple
 
 
-def load_state_dict_from_file(file_path: str, device: str = "cuda:0") -> dict:
+def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """
-    Load state dict from either .pt or .safetensors format.
-    
-    Args:
-        file_path: Path to checkpoint file
-        device: Device to load tensors on
-        
-    Returns:
-        State dictionary
+    Dequantize MXFP4 expert weights.
+    blocks: [num_experts, out_features, num_blocks, 16] uint8
+    scales: [num_experts, out_features, num_blocks] uint8
+    returns: [num_experts, out_features, num_blocks * 16] bfloat16
     """
-    if file_path.endswith('.safetensors'):
-        if not SAFETENSORS_AVAILABLE:
-            raise ImportError(
-                "safetensors is required to load .safetensors files. "
-                "Install with: pip install safetensors"
-            )
-        print(f"📦 Loading from SafeTensors format")
-        state_dict = load_safetensors(file_path, device=device)
-    else:
-        print(f"📦 Loading from PyTorch format")
-        state_dict = torch.load(file_path, map_location=device)
-    
+    weights = blocks.to(torch.bfloat16)
+    scales_bf16 = scales.to(torch.bfloat16).unsqueeze(-1)  # [E, O, B, 1]
+    weights = weights * scales_bf16
+    E, O, B, _ = weights.shape
+    weights = weights.reshape(E, O, B * 16)  # [E, O, 1440]
+    return weights
+
+
+def load_sharded_state_dict(model_path: str, device: str = "cuda:0") -> Dict[str, torch.Tensor]:
+    """Load from sharded safetensors using the index file."""
+    model_path = Path(model_path)
+    index_file = model_path / "model.safetensors.index.json"
+
+    if not index_file.exists():
+        raise FileNotFoundError(f"No index file at {index_file}")
+
+    with open(index_file, 'r') as f:
+        index = json.load(f)
+
+    shard_files = sorted(set(index["weight_map"].values()))
+
+    state_dict = {}
+    for shard in shard_files:
+        shard_path = model_path / shard
+        print(f"  Loading shard: {shard}")
+        with safe_open(str(shard_path), framework="pt", device=device) as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+
     return state_dict
 
 
-def load_pretrained_gptoss(
-    checkpoint_path: str = "models/gptoss_best.pt",
-    config: ModelConfig = None,
-    device: str = "cuda:0",
-    strict: bool = False
-) -> Transformer:
+def remap_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
-    Load a pretrained GPT-OSS model from checkpoint.
-    
-    Args:
-        checkpoint_path: Path to the .pt checkpoint file
-        config: ModelConfig object. If None, uses default config
-        device: Device to load model on
-        strict: Whether to strictly enforce state_dict keys match
-        
-    Returns:
-        Loaded Transformer model
+    Remap checkpoint keys to match your Transformer model's naming,
+    fuse Q/K/V, dequantize MXFP4 experts, and split batched experts.
     """
-    if config is None:
-        # Default configuration matching training setup
-        config = ModelConfig(
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            num_experts=4,
-            experts_per_token=1,
-            num_hidden_layers=12,
-            hidden_size=1024,
-            intermediate_size=1024
+    new_state_dict = {}
+
+    # Find all layer indices
+    layer_indices = set()
+    for key in state_dict:
+        if key.startswith("model.layers."):
+            parts = key.split(".")
+            layer_indices.add(int(parts[2]))
+
+    for layer_idx in sorted(layer_indices):
+        prefix = f"model.layers.{layer_idx}"
+        new_prefix = f"block.{layer_idx}"
+
+        # --- Attention sinks (direct copy) ---
+        new_state_dict[f"{new_prefix}.attn.sinks"] = state_dict[f"{prefix}.self_attn.sinks"]
+
+        # --- Layernorms: bf16 → float32 ---
+        new_state_dict[f"{new_prefix}.attn.norm.scale"] = (
+            state_dict[f"{prefix}.input_layernorm.weight"].to(torch.float32)
         )
-    
-    # Initialize model
-    model = Transformer(config, device=device)
-    
-    # Load checkpoint if it exists
-    if os.path.exists(checkpoint_path):
-        print(f"Loading pretrained model from: {checkpoint_path}")
-        state_dict = load_state_dict_from_file(checkpoint_path, device=device)
-        model.load_state_dict(state_dict, strict=strict)
-        print(f"✅ Successfully loaded pretrained model")
-    else:
-        print(f"⚠️  Checkpoint not found at {checkpoint_path}")
-        print(f"   Initializing model with random weights")
-    
-    return model
+        new_state_dict[f"{new_prefix}.mlp.norm.scale"] = (
+            state_dict[f"{prefix}.post_attention_layernorm.weight"].to(torch.float32)
+        )
 
+        # --- Fuse Q, K, V into single qkv weight and bias ---
+        q_weight = state_dict[f"{prefix}.self_attn.q_proj.weight"]  # [4096, 2880]
+        k_weight = state_dict[f"{prefix}.self_attn.k_proj.weight"]  # [512, 2880]
+        v_weight = state_dict[f"{prefix}.self_attn.v_proj.weight"]  # [512, 2880]
+        new_state_dict[f"{new_prefix}.attn.qkv.weight"] = torch.cat([q_weight, k_weight, v_weight], dim=0)  # [5120, 2880]
 
-def load_pretrained_gpt2(
-    checkpoint_path: str = "models/gpt2_best.pt",
-    config: dict = None,
-    device: str = "cuda:0",
-    strict: bool = False
-) -> GPTModel:
-    """
-    Load a pretrained GPT2 model from checkpoint.
-    
-    Args:
-        checkpoint_path: Path to the .pt checkpoint file
-        config: Config dict. If None, uses default GPT_CONFIG
-        device: Device to load model on
-        strict: Whether to strictly enforce state_dict keys match
-        
-    Returns:
-        Loaded GPTModel
-    """
-    if config is None:
-        config = GPT_CONFIG
-    
-    # Initialize model
-    model = GPTModel(config).to(device)
-    
-    # Load checkpoint if it exists
-    if os.path.exists(checkpoint_path):
-        print(f"Loading pretrained GPT2 model from: {checkpoint_path}")
-        state_dict = load_state_dict_from_file(checkpoint_path, device=device)
-        model.load_state_dict(state_dict, strict=strict)
-        print(f"✅ Successfully loaded pretrained GPT2 model")
-    else:
-        print(f"⚠️  Checkpoint not found at {checkpoint_path}")
-        print(f"   Initializing model with random weights")
-    
-    return model
+        q_bias = state_dict[f"{prefix}.self_attn.q_proj.bias"]  # [4096]
+        k_bias = state_dict[f"{prefix}.self_attn.k_proj.bias"]  # [512]
+        v_bias = state_dict[f"{prefix}.self_attn.v_proj.bias"]  # [512]
+        new_state_dict[f"{new_prefix}.attn.qkv.bias"] = torch.cat([q_bias, k_bias, v_bias], dim=0)  # [5120]
 
+        # --- Output projection (direct copy) ---
+        new_state_dict[f"{new_prefix}.attn.out.weight"] = state_dict[f"{prefix}.self_attn.o_proj.weight"]
+        new_state_dict[f"{new_prefix}.attn.out.bias"] = state_dict[f"{prefix}.self_attn.o_proj.bias"]
 
-def save_model(
-    model, 
-    save_path: str, 
-    create_dir: bool = True,
-    use_safetensors: bool = False
-):
-    """
-    Save model checkpoint in .pt or .safetensors format.
-    
-    Args:
-        model: PyTorch model to save
-        save_path: Path where to save the checkpoint
-        create_dir: Whether to create directory if it doesn't exist
-        use_safetensors: Whether to save in safetensors format
-    """
-    if create_dir:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
-    state_dict = model.state_dict()
-    
-    if use_safetensors:
-        if not SAFETENSORS_AVAILABLE:
-            print("⚠️  safetensors not available. Saving as .pt instead")
-            torch.save(state_dict, save_path)
-        else:
-            from safetensors.torch import save_file as save_safetensors
-            # Ensure path has .safetensors extension
-            if not save_path.endswith('.safetensors'):
-                save_path = save_path.replace('.pt', '.safetensors')
-            save_safetensors(state_dict, save_path)
-            print(f"💾 Model saved to SafeTensors: {save_path}")
-    else:
-        torch.save(state_dict, save_path)
-        print(f"💾 Model saved to: {save_path}")
+        # --- Router / Gate (direct copy) ---
+        new_state_dict[f"{new_prefix}.mlp.gate.weight"] = state_dict[f"{prefix}.mlp.router.weight"]
+        new_state_dict[f"{new_prefix}.mlp.gate.bias"] = state_dict[f"{prefix}.mlp.router.bias"]
 
+        # --- Dequantize and split experts ---
+        # gate_up_proj: [32, 5760, 90, 16] → dequant → [32, 5760, 1440]
+        gate_up_blocks = state_dict[f"{prefix}.mlp.experts.gate_up_proj_blocks"]
+        gate_up_scales = state_dict[f"{prefix}.mlp.experts.gate_up_proj_scales"]
+        gate_up_weight = dequantize_mxfp4(gate_up_blocks, gate_up_scales)  # [32, 5760, 1440]
+        gate_up_bias = state_dict[f"{prefix}.mlp.experts.gate_up_proj_bias"]  # [32, 5760]
 
-def list_available_checkpoints(models_dir: str = "models") -> list:
-    """
-    List all available model checkpoints in the models directory.
-    Supports both .pt and .safetensors formats.
-    
-    Args:
-        models_dir: Directory to search for checkpoints
-        
-    Returns:
-        List of checkpoint file paths
-    """
-    if not os.path.exists(models_dir):
-        print(f"Models directory not found: {models_dir}")
-        return []
-    
-    # Search for both .pt and .safetensors files
-    pt_checkpoints = list(Path(models_dir).glob("*.pt"))
-    safetensors_checkpoints = list(Path(models_dir).glob("*.safetensors"))
-    checkpoints = pt_checkpoints + safetensors_checkpoints
-    
-    if checkpoints:
-        print(f"\n📦 Available checkpoints in {models_dir}:")
-        for ckpt in sorted(checkpoints):
-            size_mb = ckpt.stat().st_size / (1024 * 1024)
-            file_type = "SafeTensors" if ckpt.suffix == ".safetensors" else "PyTorch"
-            print(f"   - {ckpt.name} ({size_mb:.2f} MB) [{file_type}]")
-    else:
-        print(f"No checkpoints found in {models_dir}")
-    
-    return [str(ckpt) for ckpt in checkpoints]
+        # down_proj: [32, 2880, 90, 16] → dequant → [32, 2880, 1440]
+        down_blocks = state_dict[f"{prefix}.mlp.experts.down_proj_blocks"]
+        down_scales = state_dict[f"{prefix}.mlp.experts.down_proj_scales"]
+        down_weight = dequantize_mxfp4(down_blocks, down_scales)  # [32, 2880, 1440]
+        down_bias = state_dict[f"{prefix}.mlp.experts.down_proj_bias"]  # [32, 2880]
 
+        # Split into individual experts
+        num_experts = gate_up_weight.shape[0]  # 32
+        for expert_idx in range(num_experts):
+            # Expert .0 = gate_up_proj (up projection)
+            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.0.weight"] = gate_up_weight[expert_idx]  # [5760, 1440]
+            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.0.bias"] = gate_up_bias[expert_idx]      # [5760]
 
+            # Expert .1 = down_proj (down projection)
+            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.1.weight"] = down_weight[expert_idx]    # [2880, 1440]
+            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.1.bias"] = down_bias[expert_idx]        # [2880]
+
+        print(f"  ✅ Layer {layer_idx} remapped")
+
+    # --- Embedding (direct copy) ---
+    if "model.embed_tokens.weight" in state_dict:
+        new_state_dict["embedding.weight"] = state_dict["model.embed_tokens.weight"]
+    
+    # --- Final layernorm / LM head (check what keys exist) ---
+    if "model.norm.weight" in state_dict:
+        new_state_dict["final_norm.scale"] = state_dict["model.norm.weight"].to(torch.float32)
+    if "lm_head.weight" in state_dict:
+        new_state_dict["lm_head.weight"] = state_dict["lm_head.weight"]
+
+    return new_state_dict
 
 
 def load_from_huggingface(
     model_path: str,
-    config: ModelConfig = None,
+    config=None,
     device: str = "cuda:0",
     strict: bool = False,
-    safetensors_filename: str = "model.safetensors"
-) -> Transformer:
-    """
-    Load a model from a HuggingFace downloaded directory.
-    
-    Args:
-        model_path: Path to directory containing model files
-        config: ModelConfig object. If None, will try to load from config.json
-        device: Device to load model on
-        strict: Whether to strictly enforce state_dict keys match
-        safetensors_filename: Name of the safetensors file (default: "model.safetensors")
-        
-    Returns:
-        Loaded Transformer model
-        
-    Example:
-        # After downloading from HuggingFace
-        model = load_from_huggingface(
-            model_path="models/downloaded_model",
-            config=config,
-            device="cuda:0"
-        )
-    """
-    import json
-    
+):
+    """Load GPT-OSS from sharded MXFP4 checkpoint into your custom Transformer."""
+    from architecture.gptoss import Transformer, ModelConfig
+
     model_path = Path(model_path)
-    
-    # Try to load config from config.json if not provided
+
+    # Load config
     if config is None:
         config_file = model_path / "config.json"
         if config_file.exists():
-            print(f"Loading config from: {config_file}")
             with open(config_file, 'r') as f:
                 config_dict = json.load(f)
-            # Try to map HuggingFace config to ModelConfig
             config = ModelConfig(**config_dict)
         else:
-            raise ValueError(
-                "No config provided and config.json not found. "
-                "Please provide a ModelConfig object."
-            )
-    
-    # Initialize model
+            raise ValueError("No config.json found.")
+
+    # Init model
     model = Transformer(config, device=device)
-    
-    # Look for safetensors or pytorch_model.bin
-    safetensors_path = model_path / safetensors_filename
-    pytorch_path = model_path / "pytorch_model.bin"
-    
-    if safetensors_path.exists():
-        print(f"Loading from HuggingFace SafeTensors: {safetensors_path}")
-        state_dict = load_state_dict_from_file(str(safetensors_path), device=device)
-    elif pytorch_path.exists():
-        print(f"Loading from HuggingFace PyTorch: {pytorch_path}")
-        state_dict = load_state_dict_from_file(str(pytorch_path), device=device)
-    else:
-        raise FileNotFoundError(
-            f"No model file found in {model_path}. "
-            f"Expected {safetensors_filename} or pytorch_model.bin"
-        )
 
+    # Load sharded checkpoint
+    print("Loading sharded checkpoint...")
+    raw_state_dict = load_sharded_state_dict(str(model_path), device=device)
 
-    
+    # Remap keys + dequantize
+    print("Remapping keys and dequantizing experts...")
+    state_dict = remap_state_dict(raw_state_dict)
+
+    # Debug: check for mismatches before loading
+    model_keys = set(model.state_dict().keys())
+    checkpoint_keys = set(state_dict.keys())
+    missing = model_keys - checkpoint_keys
+    unexpected = checkpoint_keys - model_keys
+
+    if missing:
+        print(f"\n⚠️  Missing keys ({len(missing)}):")
+        for k in sorted(missing):
+            print(f"    {k}")
+    if unexpected:
+        print(f"\n⚠️  Unexpected keys ({len(unexpected)}):")
+        for k in sorted(unexpected):
+            print(f"    {k}")
+
+    # Load
     model.load_state_dict(state_dict, strict=strict)
-    print(f"✅ Successfully loaded model from HuggingFace directory")
-    
+    print(f"\n✅ Successfully loaded GPT-OSS model")
     return model
-def get_model_info(model) -> dict:
-    """
-    Get information about a model.
-    
-    Args:
-        model: PyTorch model
-        
-    Returns:
-        Dictionary with model information
-    """
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    info = {
-        "total_parameters": total_params,
-        "trainable_parameters": trainable_params,
-        "model_size_mb": total_params * 4 / (1024 * 1024),  # Assuming float32
-    }
-    
-    print(f"\n🔍 Model Information:")
-    print(f"   Total parameters: {total_params:,}")
-    print(f"   Trainable parameters: {trainable_params:,}")
-    print(f"   Estimated size: {info['model_size_mb']:.2f} MB")
-    
-    return info
