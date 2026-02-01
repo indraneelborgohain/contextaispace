@@ -46,7 +46,7 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
 def main():
     """Download GPT-OSS 20B weights if missing, load model, and generate text."""
     repo_id = "ORG/REPO_NAME"  # TODO: replace with the actual Hugging Face repo id
-    local_dir = "model/gptoss-20b/original"
+    local_dir = "model/gptoss-20b/"
 
     # Load model (downloads if not present)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
