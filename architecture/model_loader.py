@@ -7,18 +7,28 @@ from typing import Dict, Tuple
 
 def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """
-    Dequantize MXFP4 expert weights.
+    Dequantize MXFP4 weights. Each uint8 contains 2 packed 4-bit values.
     blocks: [num_experts, out_features, num_blocks, 16] uint8
     scales: [num_experts, out_features, num_blocks] uint8
-    returns: [num_experts, out_features, num_blocks * 16] bfloat16
+    returns: [num_experts, out_features, num_blocks * 32] bfloat16
     """
-    weights = blocks.to(torch.bfloat16)
-    scales_bf16 = scales.to(torch.bfloat16).unsqueeze(-1)  # [E, O, B, 1]
-    weights = weights * scales_bf16
-    E, O, B, _ = weights.shape
-    weights = weights.reshape(E, O, B * 16)  # [E, O, 1440]
-    return weights
+    # Unpack each uint8 into two 4-bit values (high nibble and low nibble)
+    high = (blocks >> 4).to(torch.bfloat16)       # upper 4 bits
+    low = (blocks & 0x0F).to(torch.bfloat16)      # lower 4 bits
 
+    # Interleave high and low: [E, O, B, 16] -> [E, O, B, 32]
+    unpacked = torch.stack([high, low], dim=-1)    # [E, O, B, 16, 2]
+    E, O, B, _, _ = unpacked.shape
+    unpacked = unpacked.reshape(E, O, B, 32)       # [E, O, B, 32]
+
+    # Apply scales
+    scales_bf16 = scales.to(torch.bfloat16).unsqueeze(-1)  # [E, O, B, 1]
+    weights = unpacked * scales_bf16                        # [E, O, B, 32]
+
+    # Flatten: [E, O, B * 32] -> [E, O, 2880] (90 * 32 = 2880) ✅
+    weights = weights.reshape(E, O, B * 32)
+
+    return weights 
 
 def load_sharded_state_dict(model_path: str, device: str = "cuda:0") -> Dict[str, torch.Tensor]:
     """Load from sharded safetensors using the index file."""
@@ -141,20 +151,22 @@ def load_from_huggingface(
     from architecture.gptoss import Transformer, ModelConfig
 
     model_path = Path(model_path)
-
-    # Load config
     if config is None:
         config_file = model_path / "config.json"
         if config_file.exists():
             with open(config_file, 'r') as f:
                 config_dict = json.load(f)
-            config = ModelConfig(**config_dict)
-        else:
-            raise ValueError("No config.json found.")
-
+        # Filter to only keys ModelConfig accepts
+        import inspect
+        valid_keys = inspect.signature(ModelConfig.__init__).parameters.keys()
+        filtered_config = {k: v for k, v in config_dict.items() if k in valid_keys}
+        print(f"Using config keys: {list(filtered_config.keys())}")
+        print(f"Skipped keys: {[k for k in config_dict if k not in valid_keys]}")
+        config = ModelConfig(**filtered_config)
+    else:
+        raise ValueError("No config.json found.")
     # Init model
     model = Transformer(config, device=device)
-
     # Load sharded checkpoint
     print("Loading sharded checkpoint...")
     raw_state_dict = load_sharded_state_dict(str(model_path), device=device)

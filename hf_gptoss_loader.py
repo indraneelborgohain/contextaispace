@@ -80,7 +80,7 @@ def load_gptoss_from_hf(
 
     Returns:
         Loaded GPT-OSS Transformer model.
-    """
+    
     snapshot_path = download_hf_weights(
         repo_id=repo_id,
         local_dir=local_dir,
@@ -89,9 +89,9 @@ def load_gptoss_from_hf(
         allow_patterns=allow_patterns,
         ignore_patterns=ignore_patterns,
     )
-
+    """
     return load_from_huggingface(
-        model_path=str(snapshot_path),
+        model_path=str(local_dir),
         config=config,
         device=device,
         strict=strict,
