@@ -56,8 +56,8 @@ def load_sharded_state_dict(model_path: str, device: str = "cuda:0") -> Dict[str
 
 def remap_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
-    Remap checkpoint keys to match your Transformer model's naming,
-    fuse Q/K/V, dequantize MXFP4 experts, and split batched experts.
+    Remap checkpoint keys to match the GPT-OSS-20B Transformer naming,
+    dequantize MXFP4 experts, and align tensor layouts.
     """
     new_state_dict = {}
 
@@ -70,71 +70,68 @@ def remap_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Ten
 
     for layer_idx in sorted(layer_indices):
         prefix = f"model.layers.{layer_idx}"
-        new_prefix = f"block.{layer_idx}"
+        new_prefix = f"layers.{layer_idx}"
 
         # --- Attention sinks (direct copy) ---
-        new_state_dict[f"{new_prefix}.attn.sinks"] = state_dict[f"{prefix}.self_attn.sinks"]
+        if f"{prefix}.self_attn.sinks" in state_dict:
+            new_state_dict[f"{new_prefix}.attn.sink_logit"] = (
+                state_dict[f"{prefix}.self_attn.sinks"].to(torch.float32)
+            )
 
         # --- Layernorms: bf16 → float32 ---
-        new_state_dict[f"{new_prefix}.attn.norm.scale"] = (
+        new_state_dict[f"{new_prefix}.norm1.weight"] = (
             state_dict[f"{prefix}.input_layernorm.weight"].to(torch.float32)
         )
-        new_state_dict[f"{new_prefix}.mlp.norm.scale"] = (
+        new_state_dict[f"{new_prefix}.norm2.weight"] = (
             state_dict[f"{prefix}.post_attention_layernorm.weight"].to(torch.float32)
         )
 
-        # --- Fuse Q, K, V into single qkv weight and bias ---
-        q_weight = state_dict[f"{prefix}.self_attn.q_proj.weight"]  # [4096, 2880]
-        k_weight = state_dict[f"{prefix}.self_attn.k_proj.weight"]  # [512, 2880]
-        v_weight = state_dict[f"{prefix}.self_attn.v_proj.weight"]  # [512, 2880]
-        new_state_dict[f"{new_prefix}.attn.qkv.weight"] = torch.cat([q_weight, k_weight, v_weight], dim=0)  # [5120, 2880]
-
-        q_bias = state_dict[f"{prefix}.self_attn.q_proj.bias"]  # [4096]
-        k_bias = state_dict[f"{prefix}.self_attn.k_proj.bias"]  # [512]
-        v_bias = state_dict[f"{prefix}.self_attn.v_proj.bias"]  # [512]
-        new_state_dict[f"{new_prefix}.attn.qkv.bias"] = torch.cat([q_bias, k_bias, v_bias], dim=0)  # [5120]
+        # --- Q, K, V (direct copy) ---
+        new_state_dict[f"{new_prefix}.attn.q.weight"] = state_dict[f"{prefix}.self_attn.q_proj.weight"]
+        new_state_dict[f"{new_prefix}.attn.k.weight"] = state_dict[f"{prefix}.self_attn.k_proj.weight"]
+        new_state_dict[f"{new_prefix}.attn.v.weight"] = state_dict[f"{prefix}.self_attn.v_proj.weight"]
+        new_state_dict[f"{new_prefix}.attn.q.bias"] = state_dict[f"{prefix}.self_attn.q_proj.bias"]
+        new_state_dict[f"{new_prefix}.attn.k.bias"] = state_dict[f"{prefix}.self_attn.k_proj.bias"]
+        new_state_dict[f"{new_prefix}.attn.v.bias"] = state_dict[f"{prefix}.self_attn.v_proj.bias"]
 
         # --- Output projection (direct copy) ---
-        new_state_dict[f"{new_prefix}.attn.out.weight"] = state_dict[f"{prefix}.self_attn.o_proj.weight"]
-        new_state_dict[f"{new_prefix}.attn.out.bias"] = state_dict[f"{prefix}.self_attn.o_proj.bias"]
+        new_state_dict[f"{new_prefix}.attn.o.weight"] = state_dict[f"{prefix}.self_attn.o_proj.weight"]
+        new_state_dict[f"{new_prefix}.attn.o.bias"] = state_dict[f"{prefix}.self_attn.o_proj.bias"]
 
         # --- Router / Gate (direct copy) ---
-        new_state_dict[f"{new_prefix}.mlp.gate.weight"] = state_dict[f"{prefix}.mlp.router.weight"]
-        new_state_dict[f"{new_prefix}.mlp.gate.bias"] = state_dict[f"{prefix}.mlp.router.bias"]
+        new_state_dict[f"{new_prefix}.moe.router.weight"] = state_dict[f"{prefix}.mlp.router.weight"]
+        new_state_dict[f"{new_prefix}.moe.router.bias"] = state_dict[f"{prefix}.mlp.router.bias"]
 
         # --- Dequantize and split experts ---
-        # gate_up_proj: [32, 5760, 90, 16] → dequant → [32, 5760, 1440]
+        # gate_up_proj: [E, 5760, 90, 16] → dequant → [E, 5760, 2880]
         gate_up_blocks = state_dict[f"{prefix}.mlp.experts.gate_up_proj_blocks"]
         gate_up_scales = state_dict[f"{prefix}.mlp.experts.gate_up_proj_scales"]
-        gate_up_weight = dequantize_mxfp4(gate_up_blocks, gate_up_scales)  # [32, 5760, 1440]
-        gate_up_bias = state_dict[f"{prefix}.mlp.experts.gate_up_proj_bias"]  # [32, 5760]
+        gate_up_weight = dequantize_mxfp4(gate_up_blocks, gate_up_scales)  # [E, 5760, 2880]
+        gate_up_bias = state_dict[f"{prefix}.mlp.experts.gate_up_proj_bias"]  # [E, 5760]
 
-        # down_proj: [32, 2880, 90, 16] → dequant → [32, 2880, 1440]
+        # down_proj: [E, 2880, 90, 16] → dequant → [E, 2880, 2880]
         down_blocks = state_dict[f"{prefix}.mlp.experts.down_proj_blocks"]
         down_scales = state_dict[f"{prefix}.mlp.experts.down_proj_scales"]
-        down_weight = dequantize_mxfp4(down_blocks, down_scales)  # [32, 2880, 1440]
-        down_bias = state_dict[f"{prefix}.mlp.experts.down_proj_bias"]  # [32, 2880]
+        down_weight = dequantize_mxfp4(down_blocks, down_scales)  # [E, 2880, 2880]
+        down_bias = state_dict[f"{prefix}.mlp.experts.down_proj_bias"]  # [E, 2880]
 
-        # Split into individual experts
-        num_experts = gate_up_weight.shape[0]  # 32
-        for expert_idx in range(num_experts):
-            # Expert .0 = gate_up_proj (up projection)
-            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.0.weight"] = gate_up_weight[expert_idx]  # [5760, 1440]
-            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.0.bias"] = gate_up_bias[expert_idx]      # [5760]
-
-            # Expert .1 = down_proj (down projection)
-            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.1.weight"] = down_weight[expert_idx]    # [2880, 1440]
-            new_state_dict[f"{new_prefix}.mlp.experts.{expert_idx}.1.bias"] = down_bias[expert_idx]        # [2880]
+        # Align to MoE param layout
+        # W_in: (E, H, 2*FF) where checkpoint is (E, 2*FF, H)
+        new_state_dict[f"{new_prefix}.moe.W_in"] = gate_up_weight.transpose(1, 2)
+        new_state_dict[f"{new_prefix}.moe.b_in"] = gate_up_bias
+        # W_out: (E, FF, H) where checkpoint is (E, H, FF)
+        new_state_dict[f"{new_prefix}.moe.W_out"] = down_weight.transpose(1, 2)
+        new_state_dict[f"{new_prefix}.moe.b_out"] = down_bias
 
         print(f"  ✅ Layer {layer_idx} remapped")
 
     # --- Embedding (direct copy) ---
     if "model.embed_tokens.weight" in state_dict:
-        new_state_dict["embedding.weight"] = state_dict["model.embed_tokens.weight"]
+        new_state_dict["embed.weight"] = state_dict["model.embed_tokens.weight"]
     
     # --- Final layernorm / LM head (check what keys exist) ---
     if "model.norm.weight" in state_dict:
-        new_state_dict["final_norm.scale"] = state_dict["model.norm.weight"].to(torch.float32)
+        new_state_dict["norm_f.weight"] = state_dict["model.norm.weight"].to(torch.float32)
     if "lm_head.weight" in state_dict:
         new_state_dict["lm_head.weight"] = state_dict["lm_head.weight"]
 
@@ -148,7 +145,7 @@ def load_from_huggingface(
     strict: bool = False,
 ):
     """Load GPT-OSS from sharded MXFP4 checkpoint into your custom Transformer."""
-    from architecture.gptoss import Transformer, ModelConfig
+    from architecture.gptoss20B import Transformer, ModelConfig
 
     model_path = Path(model_path)
     if config is None:

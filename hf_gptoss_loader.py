@@ -10,8 +10,10 @@ from typing import Iterable, Optional
 
 from huggingface_hub import snapshot_download
 
-from architecture.gptoss import ModelConfig, Transformer
+from architecture.gptoss20B import ModelConfig, Transformer
 from architecture.model_loader import load_from_huggingface
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
 def download_hf_weights(
@@ -37,6 +39,8 @@ def download_hf_weights(
         Path to the downloaded snapshot directory.
     """
     local_dir = Path(local_dir)
+    if not local_dir.is_absolute():
+        local_dir = (BASE_DIR / local_dir).resolve()
     local_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot_path = snapshot_download(
@@ -80,18 +84,13 @@ def load_gptoss_from_hf(
 
     Returns:
         Loaded GPT-OSS Transformer model.
-    
-    snapshot_path = download_hf_weights(
-        repo_id=repo_id,
-        local_dir=local_dir,
-        revision=revision,
-        token=token,
-        allow_patterns=allow_patterns,
-        ignore_patterns=ignore_patterns,
-    )
     """
+    local_dir_path = Path(local_dir)
+    if not local_dir_path.is_absolute():
+        local_dir_path = (BASE_DIR / local_dir_path).resolve()
+
     return load_from_huggingface(
-        model_path=str(local_dir),
+        model_path=str(local_dir_path),
         config=config,
         device=device,
         strict=strict,
