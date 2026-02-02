@@ -56,31 +56,19 @@ def download_hf_weights(
 
 
 def load_gptoss_from_hf(
-    repo_id: str,
     local_dir: str | Path = "models/gptoss-20b",
     device: str = "cuda:0",
     config: Optional[ModelConfig] = None,
     strict: bool = False,
-    safetensors_filename: str = "model.safetensors",
-    revision: Optional[str] = None,
-    token: Optional[str] = None,
-    allow_patterns: Optional[Iterable[str]] = None,
-    ignore_patterns: Optional[Iterable[str]] = None,
 ) -> Transformer:
     """
-    Download the repo snapshot (if needed) and load weights into the GPT-OSS model.
+    Load weights from local directory into the GPT-OSS model.
 
     Args:
-        repo_id: Hugging Face repo id (e.g., "org/model-name").
-        local_dir: Local directory to store the snapshot.
+        local_dir: Local directory containing the downloaded weights.
         device: Device to load model on (e.g., "cuda:0" or "cpu").
         config: Optional ModelConfig. If None, loads from config.json in repo.
         strict: Whether to strictly enforce state_dict keys match.
-        safetensors_filename: Name of the safetensors file in the repo.
-        revision: Optional revision/branch/tag/commit.
-        token: Optional Hugging Face token (or set HF_TOKEN env var).
-        allow_patterns: Optional allowlist patterns for downloading files.
-        ignore_patterns: Optional ignore patterns.
 
     Returns:
         Loaded GPT-OSS Transformer model.
@@ -94,5 +82,4 @@ def load_gptoss_from_hf(
         config=config,
         device=device,
         strict=strict,
-        safetensors_filename=safetensors_filename,
     )

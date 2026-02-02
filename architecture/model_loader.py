@@ -41,7 +41,9 @@ def load_sharded_state_dict(model_path: str, device: str = "cuda:0") -> Dict[str
     with open(index_file, 'r') as f:
         index = json.load(f)
 
+    # Get unique shard filenames from the weight_map
     shard_files = sorted(set(index["weight_map"].values()))
+    print(f"Found {len(shard_files)} shards: {shard_files}")
 
     state_dict = {}
     for shard in shard_files:
@@ -58,6 +60,20 @@ def remap_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Ten
     """
     Remap checkpoint keys to match the GPT-OSS-20B Transformer naming,
     dequantize MXFP4 experts, and align tensor layouts.
+    
+    HuggingFace checkpoint keys -> gptoss20B.py model keys:
+      model.layers.{i}.input_layernorm.weight         -> layers.{i}.norm1.weight
+      model.layers.{i}.post_attention_layernorm.weight -> layers.{i}.norm2.weight
+      model.layers.{i}.self_attn.q_proj.weight/bias   -> layers.{i}.attn.q.weight/bias
+      model.layers.{i}.self_attn.k_proj.weight/bias   -> layers.{i}.attn.k.weight/bias
+      model.layers.{i}.self_attn.v_proj.weight/bias   -> layers.{i}.attn.v.weight/bias
+      model.layers.{i}.self_attn.o_proj.weight/bias   -> layers.{i}.attn.o.weight/bias
+      model.layers.{i}.self_attn.sinks                -> layers.{i}.attn.sink_logit
+      model.layers.{i}.mlp.router.weight/bias         -> layers.{i}.moe.router.weight/bias
+      model.layers.{i}.mlp.experts.*                  -> layers.{i}.moe.W_in/b_in/W_out/b_out
+      model.embed_tokens.weight                       -> embed.weight
+      model.norm.weight                               -> norm_f.weight
+      lm_head.weight                                  -> lm_head.weight
     """
     new_state_dict = {}
 
@@ -145,7 +161,7 @@ def load_from_huggingface(
     strict: bool = False,
 ):
     """Load GPT-OSS from sharded MXFP4 checkpoint into your custom Transformer."""
-    from architecture.gptoss20B import Transformer, ModelConfig
+    from architecture.gptoss20B import Transformer, ModelConfig, RopeScalingConfig
 
     model_path = Path(model_path)
     if config is None:
@@ -153,6 +169,21 @@ def load_from_huggingface(
         if config_file.exists():
             with open(config_file, 'r') as f:
                 config_dict = json.load(f)
+        else:
+            raise ValueError(f"No config.json found at {config_file}")
+        
+        # Handle HF config -> ModelConfig mapping
+        # 1. swiglu_limit -> swiglu_clip
+        if "swiglu_limit" in config_dict and "swiglu_clip" not in config_dict:
+            config_dict["swiglu_clip"] = config_dict.pop("swiglu_limit")
+        
+        # 2. rope_scaling dict -> RopeScalingConfig
+        if "rope_scaling" in config_dict and isinstance(config_dict["rope_scaling"], dict):
+            rs = config_dict["rope_scaling"]
+            # HF uses 'factor' key
+            factor = rs.get("factor", 32.0)
+            config_dict["rope_scaling"] = RopeScalingConfig(factor=factor)
+        
         # Filter to only keys ModelConfig accepts
         import inspect
         valid_keys = inspect.signature(ModelConfig.__init__).parameters.keys()
@@ -160,13 +191,11 @@ def load_from_huggingface(
         print(f"Using config keys: {list(filtered_config.keys())}")
         print(f"Skipped keys: {[k for k in config_dict if k not in valid_keys]}")
         config = ModelConfig(**filtered_config)
-    else:
-        raise ValueError("No config.json found.")
-    # Init model
-    model = Transformer(config, device=device)
+    # Init model on CPU first, then move to device after loading weights
+    model = Transformer(config)
     # Load sharded checkpoint
     print("Loading sharded checkpoint...")
-    raw_state_dict = load_sharded_state_dict(str(model_path), device=device)
+    raw_state_dict = load_sharded_state_dict(str(model_path), device="cpu")  # load to CPU first
 
     # Remap keys + dequantize
     print("Remapping keys and dequantizing experts...")
@@ -178,16 +207,52 @@ def load_from_huggingface(
     missing = model_keys - checkpoint_keys
     unexpected = checkpoint_keys - model_keys
 
+    print(f"\n{'='*60}")
+    print(f"Weight Loading Debug Info")
+    print(f"{'='*60}")
+    print(f"Model has {len(model_keys)} parameters")
+    print(f"Checkpoint has {len(checkpoint_keys)} parameters")
+    print(f"Matching keys: {len(model_keys & checkpoint_keys)}")
+    
     if missing:
-        print(f"\n⚠️  Missing keys ({len(missing)}):")
+        print(f"\n⚠️  Missing keys ({len(missing)}) - in model but NOT in checkpoint:")
         for k in sorted(missing):
-            print(f"    {k}")
+            model_shape = model.state_dict()[k].shape
+            print(f"    {k}: {model_shape}")
+    else:
+        print(f"\n✅ No missing keys")
+        
     if unexpected:
-        print(f"\n⚠️  Unexpected keys ({len(unexpected)}):")
+        print(f"\n⚠️  Unexpected keys ({len(unexpected)}) - in checkpoint but NOT in model:")
         for k in sorted(unexpected):
-            print(f"    {k}")
+            ckpt_shape = state_dict[k].shape
+            print(f"    {k}: {ckpt_shape}")
+    else:
+        print(f"\n✅ No unexpected keys")
+    
+    # Check for shape mismatches in matching keys
+    shape_mismatches = []
+    for k in model_keys & checkpoint_keys:
+        model_shape = model.state_dict()[k].shape
+        ckpt_shape = state_dict[k].shape
+        if model_shape != ckpt_shape:
+            shape_mismatches.append((k, model_shape, ckpt_shape))
+    
+    if shape_mismatches:
+        print(f"\n❌ Shape mismatches ({len(shape_mismatches)}):")
+        for k, model_shape, ckpt_shape in shape_mismatches:
+            print(f"    {k}: model={model_shape} vs checkpoint={ckpt_shape}")
+    else:
+        print(f"\n✅ All matching keys have correct shapes")
+    
+    print(f"{'='*60}\n")
 
     # Load
     model.load_state_dict(state_dict, strict=strict)
     print(f"\n✅ Successfully loaded GPT-OSS model")
+    
+    # Move to target device
+    model = model.to(device)
+    print(f"Model moved to {device}")
+    
     return model

@@ -17,19 +17,20 @@ def token_ids_to_text(token_ids, tokenizer):
 
 def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
     """Generate text from a prompt using trained model."""
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
+    device = next(model.parameters()).device
     model.eval()
     
     # Tokenize input
+    idx = text_to_token_ids(prompt, tokenizer).to(device)
     
-    idx = text_to_token_ids(prompt,tokenizer).to(device)
     # Generate
     for _ in range(max_tokens):
         idx_cond = idx[-context_len:]
         with torch.inference_mode():
-            logits= model(idx_cond)
-        logits = logits[-1, :] / temperature
+            # Model expects (B, T) input and returns (logits, aux_dict)
+            logits, _ = model(idx_cond.unsqueeze(0))  # add batch dim
+        # logits shape: (1, T, vocab_size) -> take last token
+        logits = logits[0, -1, :] / temperature
 
         if top_k is not None:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -44,16 +45,15 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
 
 
 def main():
-    """Download GPT-OSS 20B weights if missing, load model, and generate text."""
-    repo_id = "ORG/REPO_NAME"  # TODO: replace with the actual Hugging Face repo id
-    local_dir = "model/gptoss-20b/"
+    """Load model from local weights and generate text."""
+    local_dir = "models/gptoss-20b"
 
-    # Load model (downloads if not present)
+    # Load model from local weights
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model = load_gptoss_from_hf(
-        repo_id=repo_id,
         local_dir=local_dir,
         device=device,
+        strict=True,
     )
 
     prompt = "Once upon a time"
