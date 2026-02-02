@@ -46,7 +46,7 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
 
 def main():
     """Load model from local weights and generate text."""
-    local_dir = "models/gptoss-20b"
+    local_dir = "model/gpt-oss-20b"
 
     # Load model from local weights
     device = "cuda:0" if torch.cuda.is_available() else "cpu"

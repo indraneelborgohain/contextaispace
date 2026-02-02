@@ -1,8 +1,9 @@
+import gc
 import json
 import torch
 from pathlib import Path
 from safetensors import safe_open
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 
 def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -30,6 +31,46 @@ def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
 
     return weights 
 
+def get_shard_info(model_path: str) -> Tuple[Dict, List[str]]:
+    """Get index and shard files from model path."""
+    model_path = Path(model_path)
+    index_file = model_path / "model.safetensors.index.json"
+
+    if not index_file.exists():
+        raise FileNotFoundError(f"No index file at {index_file}")
+
+    with open(index_file, 'r') as f:
+        index = json.load(f)
+
+    shard_files = sorted(set(index["weight_map"].values()))
+    return index, shard_files
+
+
+def load_keys_from_shards(model_path: str, keys: List[str], device: str = "cpu") -> Dict[str, torch.Tensor]:
+    """Load only specific keys from sharded safetensors (memory efficient)."""
+    model_path = Path(model_path)
+    index, shard_files = get_shard_info(str(model_path))
+    weight_map = index["weight_map"]
+    
+    # Group keys by shard
+    keys_by_shard = {}
+    for key in keys:
+        if key in weight_map:
+            shard = weight_map[key]
+            if shard not in keys_by_shard:
+                keys_by_shard[shard] = []
+            keys_by_shard[shard].append(key)
+    
+    result = {}
+    for shard, shard_keys in keys_by_shard.items():
+        shard_path = model_path / shard
+        with safe_open(str(shard_path), framework="pt", device=device) as f:
+            for key in shard_keys:
+                result[key] = f.get_tensor(key)
+    
+    return result
+
+
 def load_sharded_state_dict(model_path: str, device: str = "cuda:0") -> Dict[str, torch.Tensor]:
     """Load from sharded safetensors using the index file."""
     model_path = Path(model_path)
@@ -54,6 +95,99 @@ def load_sharded_state_dict(model_path: str, device: str = "cuda:0") -> Dict[str
                 state_dict[key] = f.get_tensor(key)
 
     return state_dict
+
+
+def remap_layer_weights(
+    model_path: str,
+    layer_idx: int,
+    device: str = "cpu"
+) -> Dict[str, torch.Tensor]:
+    """
+    Load and remap weights for a single layer (memory efficient).
+    Returns remapped state_dict entries for just this layer.
+    """
+    prefix = f"model.layers.{layer_idx}"
+    new_prefix = f"layers.{layer_idx}"
+    
+    # Keys we need for this layer
+    layer_keys = [
+        f"{prefix}.input_layernorm.weight",
+        f"{prefix}.post_attention_layernorm.weight",
+        f"{prefix}.self_attn.q_proj.weight",
+        f"{prefix}.self_attn.q_proj.bias",
+        f"{prefix}.self_attn.k_proj.weight",
+        f"{prefix}.self_attn.k_proj.bias",
+        f"{prefix}.self_attn.v_proj.weight",
+        f"{prefix}.self_attn.v_proj.bias",
+        f"{prefix}.self_attn.o_proj.weight",
+        f"{prefix}.self_attn.o_proj.bias",
+        f"{prefix}.self_attn.sinks",
+        f"{prefix}.mlp.router.weight",
+        f"{prefix}.mlp.router.bias",
+        f"{prefix}.mlp.experts.gate_up_proj_blocks",
+        f"{prefix}.mlp.experts.gate_up_proj_scales",
+        f"{prefix}.mlp.experts.gate_up_proj_bias",
+        f"{prefix}.mlp.experts.down_proj_blocks",
+        f"{prefix}.mlp.experts.down_proj_scales",
+        f"{prefix}.mlp.experts.down_proj_bias",
+    ]
+    
+    # Load only this layer's keys
+    layer_data = load_keys_from_shards(model_path, layer_keys, device=device)
+    
+    result = {}
+    
+    # --- Attention sinks ---
+    sink_key = f"{prefix}.self_attn.sinks"
+    if sink_key in layer_data:
+        result[f"{new_prefix}.attn.sink_logit"] = layer_data[sink_key].to(torch.float32)
+    
+    # --- Layernorms: bf16 → float32 ---
+    result[f"{new_prefix}.norm1.weight"] = layer_data[f"{prefix}.input_layernorm.weight"].to(torch.float32)
+    result[f"{new_prefix}.norm2.weight"] = layer_data[f"{prefix}.post_attention_layernorm.weight"].to(torch.float32)
+    
+    # --- Q, K, V ---
+    result[f"{new_prefix}.attn.q.weight"] = layer_data[f"{prefix}.self_attn.q_proj.weight"]
+    result[f"{new_prefix}.attn.k.weight"] = layer_data[f"{prefix}.self_attn.k_proj.weight"]
+    result[f"{new_prefix}.attn.v.weight"] = layer_data[f"{prefix}.self_attn.v_proj.weight"]
+    result[f"{new_prefix}.attn.q.bias"] = layer_data[f"{prefix}.self_attn.q_proj.bias"]
+    result[f"{new_prefix}.attn.k.bias"] = layer_data[f"{prefix}.self_attn.k_proj.bias"]
+    result[f"{new_prefix}.attn.v.bias"] = layer_data[f"{prefix}.self_attn.v_proj.bias"]
+    
+    # --- Output projection ---
+    result[f"{new_prefix}.attn.o.weight"] = layer_data[f"{prefix}.self_attn.o_proj.weight"]
+    result[f"{new_prefix}.attn.o.bias"] = layer_data[f"{prefix}.self_attn.o_proj.bias"]
+    
+    # --- Router / Gate ---
+    result[f"{new_prefix}.moe.router.weight"] = layer_data[f"{prefix}.mlp.router.weight"]
+    result[f"{new_prefix}.moe.router.bias"] = layer_data[f"{prefix}.mlp.router.bias"]
+    
+    # --- Dequantize experts ---
+    gate_up_blocks = layer_data[f"{prefix}.mlp.experts.gate_up_proj_blocks"]
+    gate_up_scales = layer_data[f"{prefix}.mlp.experts.gate_up_proj_scales"]
+    gate_up_weight = dequantize_mxfp4(gate_up_blocks, gate_up_scales)
+    gate_up_bias = layer_data[f"{prefix}.mlp.experts.gate_up_proj_bias"]
+    
+    # Free quantized tensors immediately
+    del gate_up_blocks, gate_up_scales
+    
+    down_blocks = layer_data[f"{prefix}.mlp.experts.down_proj_blocks"]
+    down_scales = layer_data[f"{prefix}.mlp.experts.down_proj_scales"]
+    down_weight = dequantize_mxfp4(down_blocks, down_scales)
+    down_bias = layer_data[f"{prefix}.mlp.experts.down_proj_bias"]
+    
+    # Free quantized tensors
+    del down_blocks, down_scales
+    del layer_data
+    gc.collect()
+    
+    # Align to MoE param layout
+    result[f"{new_prefix}.moe.W_in"] = gate_up_weight.transpose(1, 2)
+    result[f"{new_prefix}.moe.b_in"] = gate_up_bias
+    result[f"{new_prefix}.moe.W_out"] = down_weight.transpose(1, 2)
+    result[f"{new_prefix}.moe.b_out"] = down_bias
+    
+    return result
 
 
 def remap_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -159,8 +293,18 @@ def load_from_huggingface(
     config=None,
     device: str = "cuda:0",
     strict: bool = False,
+    low_memory: bool = True,
 ):
-    """Load GPT-OSS from sharded MXFP4 checkpoint into your custom Transformer."""
+    """
+    Load GPT-OSS from sharded MXFP4 checkpoint into your custom Transformer.
+    
+    Args:
+        model_path: Path to the model directory with safetensors files.
+        config: Optional ModelConfig. If None, loads from config.json.
+        device: Target device for the final model.
+        strict: Whether to strictly enforce state_dict keys match.
+        low_memory: If True, load and process one layer at a time to reduce peak memory.
+    """
     from architecture.gptoss20B import Transformer, ModelConfig, RopeScalingConfig
 
     model_path = Path(model_path)
@@ -191,65 +335,142 @@ def load_from_huggingface(
         print(f"Using config keys: {list(filtered_config.keys())}")
         print(f"Skipped keys: {[k for k in config_dict if k not in valid_keys]}")
         config = ModelConfig(**filtered_config)
-    # Init model on CPU first, then move to device after loading weights
+    
+    # Init model on CPU first with empty weights to save memory
+    print("Initializing model structure...")
     model = Transformer(config)
-    # Load sharded checkpoint
-    print("Loading sharded checkpoint...")
-    raw_state_dict = load_sharded_state_dict(str(model_path), device="cpu")  # load to CPU first
-
-    # Remap keys + dequantize
-    print("Remapping keys and dequantizing experts...")
-    state_dict = remap_state_dict(raw_state_dict)
-
-    # Debug: check for mismatches before loading
-    model_keys = set(model.state_dict().keys())
-    checkpoint_keys = set(state_dict.keys())
-    missing = model_keys - checkpoint_keys
-    unexpected = checkpoint_keys - model_keys
-
-    print(f"\n{'='*60}")
-    print(f"Weight Loading Debug Info")
-    print(f"{'='*60}")
-    print(f"Model has {len(model_keys)} parameters")
-    print(f"Checkpoint has {len(checkpoint_keys)} parameters")
-    print(f"Matching keys: {len(model_keys & checkpoint_keys)}")
     
-    if missing:
-        print(f"\n⚠️  Missing keys ({len(missing)}) - in model but NOT in checkpoint:")
-        for k in sorted(missing):
-            model_shape = model.state_dict()[k].shape
-            print(f"    {k}: {model_shape}")
-    else:
-        print(f"\n✅ No missing keys")
+    num_layers = config.num_hidden_layers
+    
+    if low_memory:
+        # ==================== LOW MEMORY MODE ====================
+        # Load and process one layer at a time, immediately loading into model
+        print(f"Loading checkpoint in low-memory mode ({num_layers} layers)...")
         
-    if unexpected:
-        print(f"\n⚠️  Unexpected keys ({len(unexpected)}) - in checkpoint but NOT in model:")
-        for k in sorted(unexpected):
-            ckpt_shape = state_dict[k].shape
-            print(f"    {k}: {ckpt_shape}")
+        # Load embedding and final layers first (small)
+        print("  Loading embedding and final layers...")
+        embed_keys = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
+        embed_data = load_keys_from_shards(str(model_path), embed_keys, device="cpu")
+        
+        if "model.embed_tokens.weight" in embed_data:
+            model.embed.weight.data.copy_(embed_data["model.embed_tokens.weight"])
+        if "model.norm.weight" in embed_data:
+            model.norm_f.weight.data.copy_(embed_data["model.norm.weight"].to(torch.float32))
+        if "lm_head.weight" in embed_data:
+            model.lm_head.weight.data.copy_(embed_data["lm_head.weight"])
+        
+        del embed_data
+        gc.collect()
+        print("  ✅ Embedding layers loaded")
+        
+        # Process each transformer layer one at a time
+        print("Remapping and loading transformer layers...")
+        for layer_idx in range(num_layers):
+            # Load, remap, and dequantize this layer
+            layer_state_dict = remap_layer_weights(str(model_path), layer_idx, device="cpu")
+            
+            # Copy weights directly into model parameters
+            layer = model.layers[layer_idx]
+            
+            layer.norm1.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.norm1.weight"])
+            layer.norm2.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.norm2.weight"])
+            
+            layer.attn.q.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.q.weight"])
+            layer.attn.k.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.k.weight"])
+            layer.attn.v.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.v.weight"])
+            layer.attn.q.bias.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.q.bias"])
+            layer.attn.k.bias.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.k.bias"])
+            layer.attn.v.bias.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.v.bias"])
+            layer.attn.o.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.o.weight"])
+            layer.attn.o.bias.data.copy_(layer_state_dict[f"layers.{layer_idx}.attn.o.bias"])
+            
+            sink_key = f"layers.{layer_idx}.attn.sink_logit"
+            if sink_key in layer_state_dict:
+                layer.attn.sink_logit.data.copy_(layer_state_dict[sink_key])
+            
+            layer.moe.router.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.router.weight"])
+            layer.moe.router.bias.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.router.bias"])
+            layer.moe.W_in.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.W_in"])
+            layer.moe.b_in.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.b_in"])
+            layer.moe.W_out.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.W_out"])
+            layer.moe.b_out.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.b_out"])
+            
+            # Free memory immediately
+            del layer_state_dict
+            gc.collect()
+            
+            print(f"  ✅ Layer {layer_idx} loaded")
+        
+        print(f"\n✅ Successfully loaded GPT-OSS model (low-memory mode)")
+    
     else:
-        print(f"\n✅ No unexpected keys")
-    
-    # Check for shape mismatches in matching keys
-    shape_mismatches = []
-    for k in model_keys & checkpoint_keys:
-        model_shape = model.state_dict()[k].shape
-        ckpt_shape = state_dict[k].shape
-        if model_shape != ckpt_shape:
-            shape_mismatches.append((k, model_shape, ckpt_shape))
-    
-    if shape_mismatches:
-        print(f"\n❌ Shape mismatches ({len(shape_mismatches)}):")
-        for k, model_shape, ckpt_shape in shape_mismatches:
-            print(f"    {k}: model={model_shape} vs checkpoint={ckpt_shape}")
-    else:
-        print(f"\n✅ All matching keys have correct shapes")
-    
-    print(f"{'='*60}\n")
+        # ==================== ORIGINAL MODE (high memory) ====================
+        # Load sharded checkpoint
+        print("Loading sharded checkpoint...")
+        raw_state_dict = load_sharded_state_dict(str(model_path), device="cpu")
 
-    # Load
-    model.load_state_dict(state_dict, strict=strict)
-    print(f"\n✅ Successfully loaded GPT-OSS model")
+        # Remap keys + dequantize
+        print("Remapping keys and dequantizing experts...")
+        state_dict = remap_state_dict(raw_state_dict)
+        
+        # Free original state dict
+        del raw_state_dict
+        gc.collect()
+
+        # Debug: check for mismatches before loading
+        model_keys = set(model.state_dict().keys())
+        checkpoint_keys = set(state_dict.keys())
+        missing = model_keys - checkpoint_keys
+        unexpected = checkpoint_keys - model_keys
+
+        print(f"\n{'='*60}")
+        print(f"Weight Loading Debug Info")
+        print(f"{'='*60}")
+        print(f"Model has {len(model_keys)} parameters")
+        print(f"Checkpoint has {len(checkpoint_keys)} parameters")
+        print(f"Matching keys: {len(model_keys & checkpoint_keys)}")
+        
+        if missing:
+            print(f"\n⚠️  Missing keys ({len(missing)}) - in model but NOT in checkpoint:")
+            for k in sorted(missing):
+                model_shape = model.state_dict()[k].shape
+                print(f"    {k}: {model_shape}")
+        else:
+            print(f"\n✅ No missing keys")
+            
+        if unexpected:
+            print(f"\n⚠️  Unexpected keys ({len(unexpected)}) - in checkpoint but NOT in model:")
+            for k in sorted(unexpected):
+                ckpt_shape = state_dict[k].shape
+                print(f"    {k}: {ckpt_shape}")
+        else:
+            print(f"\n✅ No unexpected keys")
+        
+        # Check for shape mismatches in matching keys
+        shape_mismatches = []
+        for k in model_keys & checkpoint_keys:
+            model_shape = model.state_dict()[k].shape
+            ckpt_shape = state_dict[k].shape
+            if model_shape != ckpt_shape:
+                shape_mismatches.append((k, model_shape, ckpt_shape))
+        
+        if shape_mismatches:
+            print(f"\n❌ Shape mismatches ({len(shape_mismatches)}):")
+            for k, model_shape, ckpt_shape in shape_mismatches:
+                print(f"    {k}: model={model_shape} vs checkpoint={ckpt_shape}")
+        else:
+            print(f"\n✅ All matching keys have correct shapes")
+        
+        print(f"{'='*60}\n")
+
+        # Load
+        model.load_state_dict(state_dict, strict=strict)
+        
+        # Free state dict
+        del state_dict
+        gc.collect()
+        
+        print(f"\n✅ Successfully loaded GPT-OSS model")
     
     # Move to target device
     model = model.to(device)
