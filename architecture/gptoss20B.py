@@ -486,6 +486,8 @@ class Transformer(nn.Module):
                 aux_losses.append(aux["router_aux_loss"])
 
         x = self.norm_f(x)
+        # Cast back to bfloat16 for lm_head (norm_f outputs float32 for precision)
+        x = x.to(self.lm_head.weight.dtype)
         logits = self.lm_head(x)
 
         loss = None
