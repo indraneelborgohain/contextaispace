@@ -35,47 +35,45 @@ def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     """
     Dequantize MXFP4 weights. Each uint8 contains 2 packed 4-bit values.
     blocks: [num_experts, out_features, num_blocks, 16] uint8
-    scales: [num_experts, out_features, num_blocks] uint8 (actually E4M3 floats stored as uint8)
+    scales: [num_experts, out_features, num_blocks] uint8 (E8M0 scale stored as uint8)
     returns: [num_experts, out_features, num_blocks * 32] bfloat16
     
-    MXFP4 format:
-    - 4-bit values are unsigned (0-15) and need to be centered around 0
-    - The scale is an E4M3 float stored in uint8 format
+    MXFP4 format uses FP4 E2M1 encoding for values:
+    - Bit 3 is sign bit
+    - Bits 2-1 are exponent (bias=1)  
+    - Bit 0 is mantissa
+    
+    FP4 E2M1 lookup table:
+    0000=0, 0001=0.5, 0010=1, 0011=1.5, 0100=2, 0101=3, 0110=4, 0111=6
+    1000=-0, 1001=-0.5, 1010=-1, 1011=-1.5, 1100=-2, 1101=-3, 1110=-4, 1111=-6
     """
+    # FP4 E2M1 lookup table (index = 4-bit value, value = decoded float)
+    fp4_lut = torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,   # positive values (0-7)
+        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0  # negative values (8-15)
+    ], dtype=torch.float32, device=blocks.device)
+    
     # Unpack each uint8 into two 4-bit values (high nibble and low nibble)
-    high = (blocks >> 4).to(torch.float32)       # upper 4 bits (0-15)
-    low = (blocks & 0x0F).to(torch.float32)      # lower 4 bits (0-15)
+    high = (blocks >> 4) & 0x0F   # upper 4 bits (0-15)
+    low = blocks & 0x0F           # lower 4 bits (0-15)
 
     # Interleave high and low: [E, O, B, 16] -> [E, O, B, 32]
     unpacked = torch.stack([high, low], dim=-1)    # [E, O, B, 16, 2]
     E, O, B, _, _ = unpacked.shape
-    unpacked = unpacked.reshape(E, O, B, 32)       # [E, O, B, 32]
+    unpacked = unpacked.reshape(E, O, B, 32).to(torch.long)  # [E, O, B, 32]
 
-    # CENTER the values around 0: convert 0-15 to -8 to +7
-    # This is crucial for proper weight distribution!
-    unpacked = unpacked - 8.0
+    # Convert to FP4 values using lookup table
+    fp4_values = fp4_lut[unpacked]  # [E, O, B, 32]
 
-    # Decode E4M3 scale from uint8
-    # E4M3 has 4 exponent bits (bias=7) and 3 mantissa bits
+    # Decode E8M0 scale from uint8
+    # E8M0 has 8 exponent bits with bias=127, no mantissa
+    # value = 2^(exp - 127)
     scale_uint8 = scales.to(torch.int32)
-    
-    # Extract sign, exponent, and mantissa
-    sign = ((scale_uint8 >> 7) & 0x1).to(torch.float32)
-    exp = ((scale_uint8 >> 3) & 0x0F).to(torch.float32)  # 4 exponent bits
-    mant = (scale_uint8 & 0x07).to(torch.float32)        # 3 mantissa bits
-    
-    # Reconstruct the E4M3 float value
-    # For E4M3: value = (-1)^sign * 2^(exp-7) * (1 + mant/8)
-    # Handle special case: exp=0 is subnormal
-    normal_value = (1.0 - 2.0 * sign) * torch.pow(2.0, exp - 7.0) * (1.0 + mant / 8.0)
-    subnormal_value = (1.0 - 2.0 * sign) * torch.pow(2.0, -6.0) * (mant / 8.0)
-    
-    # Use subnormal for exp=0, otherwise normal
-    scales_float = torch.where(exp == 0, subnormal_value, normal_value)
+    scales_float = torch.pow(2.0, scale_uint8.to(torch.float32) - 127.0)
     
     # Apply scales
     scales_expanded = scales_float.unsqueeze(-1)  # [E, O, B, 1]
-    weights = unpacked * scales_expanded           # [E, O, B, 32]
+    weights = fp4_values * scales_expanded         # [E, O, B, 32]
 
     # Flatten: [E, O, B * 32] -> [E, O, 2880] (90 * 32 = 2880)
     weights = weights.reshape(E, O, B * 32)
