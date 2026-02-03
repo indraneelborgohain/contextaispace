@@ -1,35 +1,86 @@
 import gc
 import json
+import os
 import torch
 from pathlib import Path
 from safetensors import safe_open
 from typing import Dict, Tuple, List
 
 
+def tensor_stats(t: torch.Tensor) -> Dict:
+    """Get statistics for a tensor to verify correctness."""
+    t_float = t.float()
+    return {
+        "shape": tuple(t.shape),
+        "dtype": str(t.dtype),
+        "min": t_float.min().item(),
+        "max": t_float.max().item(),
+        "mean": t_float.mean().item(),
+        "std": t_float.std().item(),
+        "norm": t_float.norm().item(),
+        "nonzero": (t != 0).sum().item(),
+    }
+
+
+def print_tensor_stats(name: str, t: torch.Tensor):
+    """Print tensor statistics in a readable format."""
+    stats = tensor_stats(t)
+    print(f"  {name}:")
+    print(f"    shape={stats['shape']}, dtype={stats['dtype']}")
+    print(f"    min={stats['min']:.6f}, max={stats['max']:.6f}, mean={stats['mean']:.6f}, std={stats['std']:.6f}")
+    print(f"    norm={stats['norm']:.2f}, nonzero={stats['nonzero']}/{t.numel()}")
+
+
 def dequantize_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """
     Dequantize MXFP4 weights. Each uint8 contains 2 packed 4-bit values.
     blocks: [num_experts, out_features, num_blocks, 16] uint8
-    scales: [num_experts, out_features, num_blocks] uint8
+    scales: [num_experts, out_features, num_blocks] uint8 (actually E4M3 floats stored as uint8)
     returns: [num_experts, out_features, num_blocks * 32] bfloat16
+    
+    MXFP4 format:
+    - 4-bit values are unsigned (0-15) and need to be centered around 0
+    - The scale is an E4M3 float stored in uint8 format
     """
     # Unpack each uint8 into two 4-bit values (high nibble and low nibble)
-    high = (blocks >> 4).to(torch.bfloat16)       # upper 4 bits
-    low = (blocks & 0x0F).to(torch.bfloat16)      # lower 4 bits
+    high = (blocks >> 4).to(torch.float32)       # upper 4 bits (0-15)
+    low = (blocks & 0x0F).to(torch.float32)      # lower 4 bits (0-15)
 
     # Interleave high and low: [E, O, B, 16] -> [E, O, B, 32]
     unpacked = torch.stack([high, low], dim=-1)    # [E, O, B, 16, 2]
     E, O, B, _, _ = unpacked.shape
     unpacked = unpacked.reshape(E, O, B, 32)       # [E, O, B, 32]
 
-    # Apply scales
-    scales_bf16 = scales.to(torch.bfloat16).unsqueeze(-1)  # [E, O, B, 1]
-    weights = unpacked * scales_bf16                        # [E, O, B, 32]
+    # CENTER the values around 0: convert 0-15 to -8 to +7
+    # This is crucial for proper weight distribution!
+    unpacked = unpacked - 8.0
 
-    # Flatten: [E, O, B * 32] -> [E, O, 2880] (90 * 32 = 2880) ✅
+    # Decode E4M3 scale from uint8
+    # E4M3 has 4 exponent bits (bias=7) and 3 mantissa bits
+    scale_uint8 = scales.to(torch.int32)
+    
+    # Extract sign, exponent, and mantissa
+    sign = ((scale_uint8 >> 7) & 0x1).to(torch.float32)
+    exp = ((scale_uint8 >> 3) & 0x0F).to(torch.float32)  # 4 exponent bits
+    mant = (scale_uint8 & 0x07).to(torch.float32)        # 3 mantissa bits
+    
+    # Reconstruct the E4M3 float value
+    # For E4M3: value = (-1)^sign * 2^(exp-7) * (1 + mant/8)
+    # Handle special case: exp=0 is subnormal
+    normal_value = (1.0 - 2.0 * sign) * torch.pow(2.0, exp - 7.0) * (1.0 + mant / 8.0)
+    subnormal_value = (1.0 - 2.0 * sign) * torch.pow(2.0, -6.0) * (mant / 8.0)
+    
+    # Use subnormal for exp=0, otherwise normal
+    scales_float = torch.where(exp == 0, subnormal_value, normal_value)
+    
+    # Apply scales
+    scales_expanded = scales_float.unsqueeze(-1)  # [E, O, B, 1]
+    weights = unpacked * scales_expanded           # [E, O, B, 32]
+
+    # Flatten: [E, O, B * 32] -> [E, O, 2880] (90 * 32 = 2880)
     weights = weights.reshape(E, O, B * 32)
 
-    return weights 
+    return weights.to(torch.bfloat16) 
 
 def get_shard_info(model_path: str) -> Tuple[Dict, List[str]]:
     """Get index and shard files from model path."""
@@ -477,3 +528,118 @@ def load_from_huggingface(
     print(f"Model moved to {device}")
     
     return model
+
+
+def verify_loaded_weights(model, model_path: str, layer_to_check: int = 0):
+    """
+    Verify that weights were loaded correctly by comparing model weights
+    against the original checkpoint. Checks a single layer to save memory.
+    
+    Args:
+        model: The loaded Transformer model
+        model_path: Path to the checkpoint directory
+        layer_to_check: Which layer index to verify (default: 0)
+    """
+    print(f"\n{'='*60}")
+    print(f"Weight Verification for Layer {layer_to_check}")
+    print(f"{'='*60}")
+    
+    model_path = Path(model_path)
+    prefix = f"model.layers.{layer_to_check}"
+    
+    # Load original checkpoint keys for this layer
+    check_keys = [
+        f"{prefix}.input_layernorm.weight",
+        f"{prefix}.self_attn.q_proj.weight",
+        f"{prefix}.self_attn.q_proj.bias",
+        f"{prefix}.self_attn.k_proj.weight",
+        f"{prefix}.mlp.router.weight",
+        f"{prefix}.mlp.experts.gate_up_proj_blocks",
+        f"{prefix}.mlp.experts.gate_up_proj_scales",
+        f"{prefix}.mlp.experts.gate_up_proj_bias",
+    ]
+    
+    ckpt_data = load_keys_from_shards(str(model_path), check_keys, device="cpu")
+    
+    layer = model.layers[layer_to_check]
+    
+    # 1. Check layernorm (should be identical after dtype conversion)
+    print("\n1. LayerNorm weight:")
+    ckpt_ln = ckpt_data[f"{prefix}.input_layernorm.weight"].to(torch.float32)
+    model_ln = layer.norm1.weight.data.cpu()
+    print_tensor_stats("  Checkpoint", ckpt_ln)
+    print_tensor_stats("  Model", model_ln)
+    ln_match = torch.allclose(ckpt_ln, model_ln, atol=1e-6)
+    print(f"  ✅ Match: {ln_match}" if ln_match else f"  ❌ MISMATCH!")
+    
+    # 2. Check Q projection weight (should be identical)
+    print("\n2. Q projection weight:")
+    ckpt_q = ckpt_data[f"{prefix}.self_attn.q_proj.weight"]
+    model_q = layer.attn.q.weight.data.cpu()
+    print_tensor_stats("  Checkpoint", ckpt_q)
+    print_tensor_stats("  Model", model_q)
+    q_match = torch.allclose(ckpt_q.float(), model_q.float(), atol=1e-5)
+    print(f"  ✅ Match: {q_match}" if q_match else f"  ❌ MISMATCH!")
+    
+    # 3. Check Q projection bias
+    print("\n3. Q projection bias:")
+    ckpt_qb = ckpt_data[f"{prefix}.self_attn.q_proj.bias"]
+    model_qb = layer.attn.q.bias.data.cpu()
+    print_tensor_stats("  Checkpoint", ckpt_qb)
+    print_tensor_stats("  Model", model_qb)
+    qb_match = torch.allclose(ckpt_qb.float(), model_qb.float(), atol=1e-5)
+    print(f"  ✅ Match: {qb_match}" if qb_match else f"  ❌ MISMATCH!")
+    
+    # 4. Check router weight
+    print("\n4. MoE Router weight:")
+    ckpt_router = ckpt_data[f"{prefix}.mlp.router.weight"]
+    model_router = layer.moe.router.weight.data.cpu()
+    print_tensor_stats("  Checkpoint", ckpt_router)
+    print_tensor_stats("  Model", model_router)
+    router_match = torch.allclose(ckpt_router.float(), model_router.float(), atol=1e-5)
+    print(f"  ✅ Match: {router_match}" if router_match else f"  ❌ MISMATCH!")
+    
+    # 5. Check dequantized expert weights
+    print("\n5. Expert gate_up_proj (dequantized):")
+    gate_up_blocks = ckpt_data[f"{prefix}.mlp.experts.gate_up_proj_blocks"]
+    gate_up_scales = ckpt_data[f"{prefix}.mlp.experts.gate_up_proj_scales"]
+    ckpt_gate_up = dequantize_mxfp4(gate_up_blocks, gate_up_scales)
+    # W_in in model is transposed: (E, H, 2*FF) vs checkpoint (E, 2*FF, H)
+    model_W_in = layer.moe.W_in.data.cpu()
+    print(f"  Checkpoint dequantized shape: {ckpt_gate_up.shape}")
+    print(f"  Model W_in shape: {model_W_in.shape}")
+    # Transpose model back to compare
+    model_W_in_t = model_W_in.transpose(1, 2)
+    print_tensor_stats("  Checkpoint (gate_up)", ckpt_gate_up)
+    print_tensor_stats("  Model W_in (transposed back)", model_W_in_t)
+    expert_match = torch.allclose(ckpt_gate_up.float(), model_W_in_t.float(), atol=1e-4)
+    print(f"  ✅ Match: {expert_match}" if expert_match else f"  ❌ MISMATCH!")
+    
+    # 6. Check expert bias
+    print("\n6. Expert gate_up_proj bias:")
+    ckpt_bias = ckpt_data[f"{prefix}.mlp.experts.gate_up_proj_bias"]
+    model_bias = layer.moe.b_in.data.cpu()
+    print_tensor_stats("  Checkpoint", ckpt_bias)
+    print_tensor_stats("  Model b_in", model_bias)
+    bias_match = torch.allclose(ckpt_bias.float(), model_bias.float(), atol=1e-5)
+    print(f"  ✅ Match: {bias_match}" if bias_match else f"  ❌ MISMATCH!")
+    
+    # 7. Check embedding
+    print("\n7. Embedding weight:")
+    embed_data = load_keys_from_shards(str(model_path), ["model.embed_tokens.weight"], device="cpu")
+    ckpt_embed = embed_data["model.embed_tokens.weight"]
+    model_embed = model.embed.weight.data.cpu()
+    print_tensor_stats("  Checkpoint", ckpt_embed)
+    print_tensor_stats("  Model", model_embed)
+    embed_match = torch.allclose(ckpt_embed.float(), model_embed.float(), atol=1e-5)
+    print(f"  ✅ Match: {embed_match}" if embed_match else f"  ❌ MISMATCH!")
+    
+    print(f"\n{'='*60}")
+    all_match = all([ln_match, q_match, qb_match, router_match, expert_match, bias_match, embed_match])
+    if all_match:
+        print("✅ All weights verified successfully!")
+    else:
+        print("❌ Some weights don't match - check the details above")
+    print(f"{'='*60}\n")
+    
+    return all_match

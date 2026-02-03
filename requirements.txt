@@ -6,3 +6,4 @@ wandb
 ipywidgets
 huggingface_hub
 safetensors
+psutil
