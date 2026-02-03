@@ -385,42 +385,60 @@ def load_from_huggingface(
         print(f"Skipped keys: {[k for k in config_dict if k not in valid_keys]}")
         config = ModelConfig(**filtered_config)
     
-    # Init model on CPU first with empty weights to save memory
-    print("Initializing model structure...")
-    model = Transformer(config)
-    
     num_layers = config.num_hidden_layers
     
     if low_memory:
-        # ==================== LOW MEMORY MODE ====================
-        # Load and process one layer at a time, immediately loading into model
-        print(f"Loading checkpoint in low-memory mode ({num_layers} layers)...")
+        # ==================== ULTRA LOW MEMORY MODE ====================
+        # Initialize model with meta tensors, then materialize one layer at a time
+        print(f"Loading checkpoint in ultra-low-memory mode ({num_layers} layers)...")
         
-        # Load embedding and final layers first (small)
+        # Initialize model structure on meta device (no actual memory allocated)
+        print("Initializing model structure on meta device...")
+        with torch.device('meta'):
+            model = Transformer(config)
+        
+        # Now materialize and load weights layer by layer
+        # First: embedding and final layers (small, load to device directly)
         print("  Loading embedding and final layers...")
         embed_keys = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
         embed_data = load_keys_from_shards(str(model_path), embed_keys, device="cpu")
         
+        # Materialize embedding on device
+        model.embed = torch.nn.Embedding(config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16)
         if "model.embed_tokens.weight" in embed_data:
-            model.embed.weight.data.copy_(embed_data["model.embed_tokens.weight"])
+            model.embed.weight.data.copy_(embed_data["model.embed_tokens.weight"].to(device))
+        
+        # Materialize final norm on device
+        from architecture.gptoss20B import RMSNorm
+        model.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        model.norm_f = model.norm_f.to(device)
         if "model.norm.weight" in embed_data:
-            model.norm_f.weight.data.copy_(embed_data["model.norm.weight"].to(torch.float32))
+            model.norm_f.weight.data.copy_(embed_data["model.norm.weight"].to(torch.float32).to(device))
+        
+        # Materialize lm_head on device
+        model.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False, device=device, dtype=torch.bfloat16)
         if "lm_head.weight" in embed_data:
-            model.lm_head.weight.data.copy_(embed_data["lm_head.weight"])
+            model.lm_head.weight.data.copy_(embed_data["lm_head.weight"].to(device))
         
         del embed_data
         gc.collect()
-        print("  ✅ Embedding layers loaded")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("  ✅ Embedding layers loaded to GPU")
         
         # Process each transformer layer one at a time
         print("Remapping and loading transformer layers...")
+        from architecture.gptoss20B import TransformerBlock
+        
+        # Replace meta layers with real layers one at a time
         for layer_idx in range(num_layers):
-            # Load, remap, and dequantize this layer
+            # Load and remap weights for this layer (on CPU to save GPU memory during dequant)
             layer_state_dict = remap_layer_weights(str(model_path), layer_idx, device="cpu")
             
-            # Copy weights directly into model parameters
-            layer = model.layers[layer_idx]
+            # Create a real layer on the target device
+            layer = TransformerBlock(config)
             
+            # Copy weights
             layer.norm1.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.norm1.weight"])
             layer.norm2.weight.data.copy_(layer_state_dict[f"layers.{layer_idx}.norm2.weight"])
             
@@ -444,15 +462,32 @@ def load_from_huggingface(
             layer.moe.W_out.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.W_out"])
             layer.moe.b_out.data.copy_(layer_state_dict[f"layers.{layer_idx}.moe.b_out"])
             
+            # Move layer to GPU immediately to free CPU memory
+            layer = layer.to(device)
+            
+            # Replace meta layer with real loaded layer
+            model.layers[layer_idx] = layer
+            
             # Free memory immediately
             del layer_state_dict
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
-            print(f"  ✅ Layer {layer_idx} loaded")
+            print(f"  ✅ Layer {layer_idx} loaded to GPU")
         
-        print(f"\n✅ Successfully loaded GPT-OSS model (low-memory mode)")
+        # Recreate drop layer (it's just a module, doesn't hold weights)
+        model.drop = torch.nn.Dropout(config.dropout).to(device)
+        
+        print(f"\n✅ Successfully loaded GPT-OSS model (ultra-low-memory mode)")
     
     else:
+        # Init model on CPU first with empty weights 
+        print("Initializing model structure...")
+        model = Transformer(config)
+        
+        num_layers = config.num_hidden_layers
+
         # ==================== ORIGINAL MODE (high memory) ====================
         # Load sharded checkpoint
         print("Loading sharded checkpoint...")
@@ -520,10 +555,13 @@ def load_from_huggingface(
         gc.collect()
         
         print(f"\n✅ Successfully loaded GPT-OSS model")
+        
+        # Move to target device (only needed in high-memory mode since model was on CPU)
+        model = model.to(device)
+        print(f"Model moved to {device}")
     
-    # Move to target device
-    model = model.to(device)
-    print(f"Model moved to {device}")
+    # Set model to eval mode
+    model.eval()
     
     return model
 
