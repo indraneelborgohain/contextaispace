@@ -58,17 +58,19 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
 def main():
     """Load model from local weights and generate text."""
     
-    # Create your custom model instance
-    model = Transformer(ModelConfig)
+    # Create your custom model instance (empty weights, low memory)
+    with torch.device('meta'):
+        model = Transformer(ModelConfig)
     
-    # Load HuggingFace model
+    # Load HuggingFace model with minimal memory footprint
     hf_model = AutoModelForCausalLM.from_pretrained(
         "openai/gpt-oss-20b",
         torch_dtype=torch.bfloat16,
-        device_map="cpu",               # CPU so both fit in RAM side by side
+        device_map="cpu",
+        low_cpu_mem_usage=True,
         trust_remote_code=True)
     
-    # Compare architectures
+    # Compare architectures (meta device model has no actual weights)
     results = compare_model_architectures(
         model, 
         hf_model, 
@@ -77,7 +79,12 @@ def main():
     )
     print_architecture_comparison(results)
     
-    
+    # Free memory from both models before loading for inference
+    del model
+    del hf_model
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     local_dir = "model/gpt-oss-20b"
     # Load model from local weights
