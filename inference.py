@@ -56,44 +56,18 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
 
 
 def main():
-    """Load model from local weights and generate text."""
+    """Load model from saved weights and generate text."""
     
-    # Create your custom model instance (empty weights, low memory)
-    with torch.device('meta'):
-        model = Transformer(ModelConfig)
-    
-    # Load HuggingFace model with minimal memory footprint
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        "openai/gpt-oss-20b",
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        trust_remote_code=True)
-    
-    # Compare architectures (meta device model has no actual weights)
-    results = compare_model_architectures(
-        model, 
-        hf_model, 
-        model1_name="Custom GPToss", 
-        model2_name="HuggingFace GPT-OSS"
-    )
-    print_architecture_comparison(results)
-    
-    # Free memory from both models before loading for inference
-    del model
-    del hf_model
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    local_dir = "model/gpt-oss-20b"
-    # Load model from local weights
+    # Load custom model with transferred HuggingFace weights
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    model = load_gptoss_from_hf(
-        local_dir=local_dir,
-        device=device,
-        strict=True,
-    )
+    weights_path = "model/gptoss_custom_weights.pt"
+    
+    print(f"Loading custom model from '{weights_path}'...")
+    model = Transformer(ModelConfig())
+    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    model = model.to(device)
+    model.eval()
+    print(f"✅ Model loaded to {device}")
 
     prompt = "Once upon a time"
     output = generate_text(model, prompt, max_tokens=80, temperature=0.8, top_k=50)
