@@ -3,6 +3,17 @@ from torch.nn import functional as F
 
 from architecture.tokenizer import get_tokenizer
 from hf_gptoss_loader import load_gptoss_from_hf
+from architecture.model_loader import (
+    compare_model_architectures,
+    print_architecture_comparison,
+    copy_weights,
+    print_copy_results,
+    create_weight_mapping,
+)
+
+from transformers import AutoModelForCausalLM
+from architecture.gptoss20B import Transformer, ModelConfig, RopeScalingConfig
+
 
 context_len=4096
 tokenizer= get_tokenizer()
@@ -46,8 +57,29 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
 
 def main():
     """Load model from local weights and generate text."""
+    
+    # Create your custom model instance
+    model = Transformer(ModelConfig)
+    
+    # Load HuggingFace model
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "openai/gpt-oss-20b",
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",               # CPU so both fit in RAM side by side
+        trust_remote_code=True)
+    
+    # Compare architectures
+    results = compare_model_architectures(
+        model, 
+        hf_model, 
+        model1_name="Custom GPToss", 
+        model2_name="HuggingFace GPT-OSS"
+    )
+    print_architecture_comparison(results)
+    
+    
+    
     local_dir = "model/gpt-oss-20b"
-
     # Load model from local weights
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model = load_gptoss_from_hf(

@@ -679,3 +679,336 @@ def verify_loaded_weights(model, model_path: str, layer_to_check: int = 0):
     print(f"{'='*60}\n")
     
     return all_match
+
+
+def compare_model_architectures(model1, model2, model1_name="Model 1", model2_name="Model 2"):
+    """
+    Compare the architecture of two PyTorch models.
+    
+    Args:
+        model1: First model to compare
+        model2: Second model to compare
+        model1_name: Display name for model1
+        model2_name: Display name for model2
+    
+    Returns:
+        dict: Comparison results with differences and similarities
+    """
+    
+    def get_layer_info(model):
+        """Extract layer names, types, and parameter shapes from a model."""
+        layer_info = {}
+        for name, module in model.named_modules():
+            if name:  # Skip the root module
+                layer_info[name] = {
+                    'type': type(module).__name__,
+                    'params': {p_name: p.shape for p_name, p in module.named_parameters(recurse=False)}
+                }
+        return layer_info
+    
+    def get_param_info(model):
+        """Extract all parameter names and shapes."""
+        return {name: param.shape for name, param in model.named_parameters()}
+    
+    # Get layer and parameter info for both models
+    layers1 = get_layer_info(model1)
+    layers2 = get_layer_info(model2)
+    params1 = get_param_info(model1)
+    params2 = get_param_info(model2)
+    
+    # Calculate total parameters
+    total_params1 = sum(p.numel() for p in model1.parameters())
+    total_params2 = sum(p.numel() for p in model2.parameters())
+    
+    # Find differences
+    results = {
+        'model1_name': model1_name,
+        'model2_name': model2_name,
+        'total_params': {
+            model1_name: total_params1,
+            model2_name: total_params2,
+            'difference': total_params1 - total_params2
+        },
+        'layer_count': {
+            model1_name: len(layers1),
+            model2_name: len(layers2)
+        },
+        'param_count': {
+            model1_name: len(params1),
+            model2_name: len(params2)
+        },
+        'only_in_model1': {},
+        'only_in_model2': {},
+        'shape_mismatches': {},
+        'matching_params': []
+    }
+    
+    # Find parameters only in model1
+    for name, shape in params1.items():
+        if name not in params2:
+            results['only_in_model1'][name] = shape
+        elif params2[name] != shape:
+            results['shape_mismatches'][name] = {
+                model1_name: shape,
+                model2_name: params2[name]
+            }
+        else:
+            results['matching_params'].append(name)
+    
+    # Find parameters only in model2
+    for name, shape in params2.items():
+        if name not in params1:
+            results['only_in_model2'][name] = shape
+    
+    return results
+
+
+def print_architecture_comparison(results):
+    """Pretty print the architecture comparison results."""
+    
+    print("=" * 80)
+    print(f"MODEL ARCHITECTURE COMPARISON")
+    print(f"{results['model1_name']} vs {results['model2_name']}")
+    print("=" * 80)
+    
+    # Total parameters
+    print(f"\n📊 TOTAL PARAMETERS:")
+    print(f"  {results['model1_name']}: {results['total_params'][results['model1_name']]:,}")
+    print(f"  {results['model2_name']}: {results['total_params'][results['model2_name']]:,}")
+    print(f"  Difference: {results['total_params']['difference']:,}")
+    
+    # Layer counts
+    print(f"\n📦 LAYER COUNT:")
+    print(f"  {results['model1_name']}: {results['layer_count'][results['model1_name']]}")
+    print(f"  {results['model2_name']}: {results['layer_count'][results['model2_name']]}")
+    
+    # Parameter counts
+    print(f"\n🔢 PARAMETER TENSORS:")
+    print(f"  {results['model1_name']}: {results['param_count'][results['model1_name']]}")
+    print(f"  {results['model2_name']}: {results['param_count'][results['model2_name']]}")
+    
+    # Parameters only in model1
+    if results['only_in_model1']:
+        print(f"\n❌ PARAMETERS ONLY IN {results['model1_name']}:")
+        for name, shape in results['only_in_model1'].items():
+            print(f"  - {name}: {tuple(shape)}")
+    else:
+        print(f"\n✅ No parameters unique to {results['model1_name']}")
+    
+    # Parameters only in model2
+    if results['only_in_model2']:
+        print(f"\n❌ PARAMETERS ONLY IN {results['model2_name']}:")
+        for name, shape in results['only_in_model2'].items():
+            print(f"  - {name}: {tuple(shape)}")
+    else:
+        print(f"\n✅ No parameters unique to {results['model2_name']}")
+    
+    # Shape mismatches
+    if results['shape_mismatches']:
+        print(f"\n⚠️ SHAPE MISMATCHES:")
+        for name, shapes in results['shape_mismatches'].items():
+            print(f"  - {name}:")
+            print(f"      {results['model1_name']}: {tuple(shapes[results['model1_name']])}")
+            print(f"      {results['model2_name']}: {tuple(shapes[results['model2_name']])}")
+    else:
+        print(f"\n✅ All common parameters have matching shapes")
+    
+    # Matching parameters
+    print(f"\n✅ MATCHING PARAMETERS: {len(results['matching_params'])}")
+    
+    print("\n" + "=" * 80)
+
+
+def copy_weights(source_model, target_model, weight_mapping=None, strict=False, verbose=True):
+    """
+    Copy weights from source model to target model.
+    
+    Args:
+        source_model: Model to copy weights from
+        target_model: Model to copy weights to
+        weight_mapping: Optional dict mapping source param names to target param names.
+                       If None, assumes identical parameter names.
+                       Example: {"source.layer.weight": "target.layer.weight"}
+        strict: If True, raise error if any weights can't be copied. If False, skip mismatches.
+        verbose: If True, print detailed information about the copy process.
+    
+    Returns:
+        dict: Results containing copied, skipped, and failed parameters
+    """
+    source_state = source_model.state_dict()
+    target_state = target_model.state_dict()
+    
+    results = {
+        'copied': [],
+        'skipped_not_in_target': [],
+        'skipped_shape_mismatch': [],
+        'skipped_not_in_source': [],
+    }
+    
+    # Build the mapping (source_name -> target_name)
+    if weight_mapping is None:
+        # Default: assume same names
+        mapping = {name: name for name in source_state.keys()}
+    else:
+        mapping = weight_mapping
+    
+    # Track which target params we've handled
+    handled_target_params = set()
+    
+    # Copy weights from source to target
+    new_state_dict = {}
+    
+    for source_name, target_name in mapping.items():
+        # Check if source param exists
+        if source_name not in source_state:
+            results['skipped_not_in_source'].append((source_name, target_name))
+            if strict:
+                raise ValueError(f"Source parameter '{source_name}' not found in source model")
+            continue
+        
+        # Check if target param exists
+        if target_name not in target_state:
+            results['skipped_not_in_target'].append(source_name)
+            if strict:
+                raise ValueError(f"Target parameter '{target_name}' not found in target model")
+            continue
+        
+        source_tensor = source_state[source_name]
+        target_tensor = target_state[target_name]
+        
+        # Check shapes match
+        if source_tensor.shape != target_tensor.shape:
+            results['skipped_shape_mismatch'].append({
+                'source_name': source_name,
+                'target_name': target_name,
+                'source_shape': tuple(source_tensor.shape),
+                'target_shape': tuple(target_tensor.shape)
+            })
+            if strict:
+                raise ValueError(
+                    f"Shape mismatch for '{source_name}' -> '{target_name}': "
+                    f"{source_tensor.shape} vs {target_tensor.shape}"
+                )
+            continue
+        
+        # Copy the weight
+        new_state_dict[target_name] = source_tensor.clone()
+        results['copied'].append((source_name, target_name))
+        handled_target_params.add(target_name)
+    
+    # Find target params that weren't copied to (keep original values)
+    for target_name in target_state.keys():
+        if target_name not in handled_target_params:
+            new_state_dict[target_name] = target_state[target_name]
+    
+    # Load the new state dict into target model
+    target_model.load_state_dict(new_state_dict)
+    
+    if verbose:
+        print_copy_results(results)
+    
+    return results
+
+
+def print_copy_results(results):
+    """Pretty print the weight copy results."""
+    
+    print("=" * 80)
+    print("WEIGHT COPY RESULTS")
+    print("=" * 80)
+    
+    print(f"\n✅ SUCCESSFULLY COPIED: {len(results['copied'])}")
+    if results['copied'] and len(results['copied']) <= 20:
+        for source_name, target_name in results['copied']:
+            if source_name == target_name:
+                print(f"  - {source_name}")
+            else:
+                print(f"  - {source_name} -> {target_name}")
+    
+    if results['skipped_not_in_target']:
+        print(f"\n⚠️ SKIPPED (not in target): {len(results['skipped_not_in_target'])}")
+        for name in results['skipped_not_in_target'][:10]:
+            print(f"  - {name}")
+        if len(results['skipped_not_in_target']) > 10:
+            print(f"  ... and {len(results['skipped_not_in_target']) - 10} more")
+    
+    if results['skipped_not_in_source']:
+        print(f"\n⚠️ SKIPPED (not in source): {len(results['skipped_not_in_source'])}")
+        for source_name, target_name in results['skipped_not_in_source'][:10]:
+            print(f"  - {source_name} -> {target_name}")
+        if len(results['skipped_not_in_source']) > 10:
+            print(f"  ... and {len(results['skipped_not_in_source']) - 10} more")
+    
+    if results['skipped_shape_mismatch']:
+        print(f"\n❌ SKIPPED (shape mismatch): {len(results['skipped_shape_mismatch'])}")
+        for item in results['skipped_shape_mismatch'][:10]:
+            print(f"  - {item['source_name']} -> {item['target_name']}")
+            print(f"      Source: {item['source_shape']}, Target: {item['target_shape']}")
+        if len(results['skipped_shape_mismatch']) > 10:
+            print(f"  ... and {len(results['skipped_shape_mismatch']) - 10} more")
+    
+    print("\n" + "=" * 80)
+
+
+def create_weight_mapping(source_model, target_model, auto_match=True):
+    """
+    Helper function to create a weight mapping between two models.
+    
+    Args:
+        source_model: Source model
+        target_model: Target model  
+        auto_match: If True, automatically match parameters with same suffix
+    
+    Returns:
+        dict: Mapping from source param names to target param names
+    """
+    source_params = dict(source_model.named_parameters())
+    target_params = dict(target_model.named_parameters())
+    
+    mapping = {}
+    unmatched_source = []
+    unmatched_target = list(target_params.keys())
+    
+    for source_name, source_param in source_params.items():
+        # Try exact match first
+        if source_name in target_params:
+            if source_param.shape == target_params[source_name].shape:
+                mapping[source_name] = source_name
+                if source_name in unmatched_target:
+                    unmatched_target.remove(source_name)
+                continue
+        
+        # Try suffix matching if auto_match enabled
+        if auto_match:
+            source_suffix = source_name.split('.')[-1]  # e.g., "weight", "bias"
+            matched = False
+            
+            for target_name in unmatched_target:
+                target_suffix = target_name.split('.')[-1]
+                
+                if source_suffix == target_suffix:
+                    if source_param.shape == target_params[target_name].shape:
+                        # Additional heuristic: check if layer indices match
+                        source_parts = source_name.split('.')
+                        target_parts = target_name.split('.')
+                        
+                        # Extract numeric indices
+                        source_nums = [p for p in source_parts if p.isdigit()]
+                        target_nums = [p for p in target_parts if p.isdigit()]
+                        
+                        if source_nums == target_nums:
+                            mapping[source_name] = target_name
+                            unmatched_target.remove(target_name)
+                            matched = True
+                            break
+            
+            if not matched:
+                unmatched_source.append(source_name)
+        else:
+            unmatched_source.append(source_name)
+    
+    print(f"Auto-mapped {len(mapping)} parameters")
+    print(f"Unmatched source params: {len(unmatched_source)}")
+    print(f"Unmatched target params: {len(unmatched_target)}")
+    
+    return mapping, unmatched_source, unmatched_target
