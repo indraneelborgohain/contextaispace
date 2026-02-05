@@ -11,10 +11,10 @@ from architecture.model_loader import (
     create_weight_mapping,
 )
 
-from transformers import AutoModelForCausalLM
+#from transformers import AutoModelForCausalLM
 from architecture.gptoss20B import Transformer, ModelConfig, RopeScalingConfig
 
-
+from architecture.gptoss20B import TokenGenerator
 context_len=4096
 tokenizer= get_tokenizer()
 
@@ -64,6 +64,7 @@ def main():
     
     print(f"Loading custom model from '{weights_path}'...")
     model = Transformer(ModelConfig())
+    model.from_checkpoint()
     model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
     model = model.to(device)
     model.eval()
@@ -75,5 +76,27 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    device = torch.device("cuda:0")
+    generator = TokenGenerator(checkpoint="gpt-oss-20b/original/", device=device)
+    prompt = "Once upon a time"
+    stop_token_ids = [
+    tokenizer.encode("<|end|>")[0],      # 200007
+    tokenizer.encode("<|return|>")[0],    # 200002
+    tokenizer.encode("<|call|>")[0],      # 200012
+    ]
+    idx = text_to_token_ids(prompt, tokenizer).to(device)
+    prompt = (
+    "<|start|>system<|message|>"
+    "You are a helpful assistant."
+    "<|end|>"
+    "<|start|>user<|message|>"
+    "What is the capital of France?"
+    "<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>"
+)
+    prompt_tokens = tokenizer.encode(prompt)
+    stop_token_ids = [200002, 200007, 200012]  # <|return|>, <|end|>, <|call|>
+
+    output  = generator.generate(prompt_tokens,stop_token_ids)
+  
 
