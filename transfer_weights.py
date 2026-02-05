@@ -480,11 +480,47 @@ if __name__ == "__main__":
     )
     
     print("\n" + "=" * 80)
+    print("INFERENCE TEST")
+    print("=" * 80)
+    
+    # Quick inference test to verify model works
+    from architecture.tokenizer import get_tokenizer
+    from torch.nn import functional as F
+    
+    tokenizer = get_tokenizer()
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    
+    print(f"Moving model to {device} for inference test...")
+    custom_model = custom_model.to(device)
+    custom_model.eval()
+    
+    prompt = "Once upon a time"
+    print(f"Prompt: {prompt}")
+    
+    # Tokenize
+    input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
+    
+    # Generate 50 tokens
+    max_tokens = 50
+    for _ in range(max_tokens):
+        with torch.inference_mode():
+            logits, _ = custom_model(input_ids)
+        
+        # Sample from last token
+        logits = logits[0, -1, :] / 0.8  # temperature
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+    
+    output = tokenizer.decode(input_ids[0].tolist())
+    print(f"\nGenerated:\n{output}")
+    
+    print("\n" + "=" * 80)
     print("NEXT STEPS")
     print("=" * 80)
     print("1. Check that 'Transferred' count matches expected (e.g., 411 weights)")
     print("2. Verify all sampled weights show ✅")
-    print("3. Run inference with your custom model:")
+    print("3. Check if the generated text makes sense")
     print("")
     print("   from transfer_weights import load_custom_model")
     print("   model = load_custom_model('model/gptoss_custom_weights.safetensors', device='cuda:0')")
