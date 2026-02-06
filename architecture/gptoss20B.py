@@ -170,14 +170,18 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0, start_pos: int = 0):
     # K positions: [0, kv_len)
     q_positions = torch.arange(start_pos, start_pos + q_len, device=Q.device)
     k_positions = torch.arange(kv_len, device=Q.device)
+    
+    # Create mask using masked_fill to avoid 0 * -inf = NaN
+    mask = torch.zeros((q_len, kv_len), device=Q.device, dtype=Q.dtype)
     # mask[i,j] = -inf if k_positions[j] > q_positions[i] (future token)
-    mask = (k_positions[None, :] > q_positions[:, None]).float() * -float("inf")
+    causal_mask = k_positions[None, :] > q_positions[:, None]
+    mask.masked_fill_(causal_mask, -float("inf"))
     
     if sliding_window > 0:
         # Also mask tokens outside sliding window
         # mask[i,j] = -inf if q_positions[i] - k_positions[j] >= sliding_window
-        window_mask = (q_positions[:, None] - k_positions[None, :] >= sliding_window).float() * -float("inf")
-        mask = mask + window_mask
+        window_mask = q_positions[:, None] - k_positions[None, :] >= sliding_window
+        mask.masked_fill_(window_mask, -float("inf"))
     
     QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
     QK *= sm_scale
