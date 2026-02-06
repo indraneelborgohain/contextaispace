@@ -77,26 +77,26 @@ def main():
 
 if __name__ == "__main__":
     device = torch.device("cuda:0")
-    generator = TokenGenerator(checkpoint="gpt-oss-20b/original/", device=device)
     prompt = "Once upon a time"
     stop_token_ids = [
-    tokenizer.encode("<|end|>")[0],      # 200007
-    tokenizer.encode("<|return|>")[0],    # 200002
-    tokenizer.encode("<|call|>")[0],      # 200012
-    ]
+    tokenizer.encode("<|end|>",allowed_special='all')[0],      # 200007
+    tokenizer.encode("<|return|>",allowed_special='all')[0],    # 200002
+    tokenizer.encode("<|call|>",allowed_special='all')[0],      # 200012
+        ]
     idx = text_to_token_ids(prompt, tokenizer).to(device)
     prompt = (
     "<|start|>system<|message|>"
-    "You are a helpful assistant."
+    "You are a helpful assistant. "
+    "Always provide complete, informative answers in full sentences. "  # Add this
+    "Reasoning effort: low"
     "<|end|>"
     "<|start|>user<|message|>"
     "What is the capital of France?"
     "<|end|>"
-    "<|start|>assistant<|channel|>final<|message|>"
+    "<|start|>assistant"
 )
-    prompt_tokens = tokenizer.encode(prompt)
-    stop_token_ids = [200002, 200007, 200012]  # <|return|>, <|end|>, <|call|>
-
+    prompt_tokens = tokenizer.encode(prompt,allowed_special='all')
+    generator = TokenGenerator(checkpoint="model/gpt-oss-20b/original/", device=device)
     # Consume the generator and collect all tokens
     output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
     # Decode tokens to text
