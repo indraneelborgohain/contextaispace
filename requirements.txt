@@ -9,3 +9,5 @@ safetensors
 psutil
 transformers
 torch
+flask
+flask-cors
