@@ -134,9 +134,13 @@ class RotaryEmbedding(torch.nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        start_pos: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        # Compute cos/sin for positions [start_pos, start_pos + num_tokens)
+        cos, sin = self._compute_cos_sin(start_pos + num_tokens)
+        cos = cos[start_pos:]
+        sin = sin[start_pos:]
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_dim)
@@ -150,19 +154,31 @@ class RotaryEmbedding(torch.nn.Module):
         return query, key
 
 
-def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
+def sdpa(Q, K, V, S, sm_scale, sliding_window=0, start_pos: int = 0):
     # sliding_window == 0 means no sliding window
-    n_tokens, n_heads, q_mult, d_head = Q.shape
-    assert K.shape == (n_tokens, n_heads, d_head)
-    assert V.shape == (n_tokens, n_heads, d_head)
+    # start_pos: position of first Q token (for KV cache)
+    q_len, n_heads, q_mult, d_head = Q.shape
+    kv_len = K.shape[0]
+    assert K.shape == (kv_len, n_heads, d_head)
+    assert V.shape == (kv_len, n_heads, d_head)
     K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
     V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
-    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
-    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
+    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, q_len, -1)
+    
+    # Build causal mask: Q tokens can only attend to K tokens at positions <= their own
+    # Q positions: [start_pos, start_pos + q_len)
+    # K positions: [0, kv_len)
+    q_positions = torch.arange(start_pos, start_pos + q_len, device=Q.device)
+    k_positions = torch.arange(kv_len, device=Q.device)
+    # mask[i,j] = -inf if k_positions[j] > q_positions[i] (future token)
+    mask = (k_positions[None, :] > q_positions[:, None]).float() * -float("inf")
+    
     if sliding_window > 0:
-        mask += torch.tril(
-            mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
-        )
+        # Also mask tokens outside sliding window
+        # mask[i,j] = -inf if q_positions[i] - k_positions[j] >= sliding_window
+        window_mask = (q_positions[:, None] - k_positions[None, :] >= sliding_window).float() * -float("inf")
+        mask = mask + window_mask
+    
     QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
     QK *= sm_scale
     QK += mask[None, None, :, :]
@@ -170,7 +186,7 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
     W = torch.softmax(QK, dim=-1)
     W = W[..., :-1]
     attn = torch.einsum("hmqk,khmd->qhmd", W, V)
-    return attn.reshape(n_tokens, -1)
+    return attn.reshape(q_len, -1)
 
 
 class AttentionBlock(torch.nn.Module):
@@ -214,7 +230,12 @@ class AttentionBlock(torch.nn.Module):
             device=device,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         t = self.norm(x)
         qkv = self.qkv(t)
         q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
@@ -239,11 +260,24 @@ class AttentionBlock(torch.nn.Module):
         )
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
-        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
+        
+        # Get start position from cache
+        start_pos = 0 if kv_cache is None else kv_cache[0].shape[0]
+        
+        # Apply rotary embeddings with correct positions
+        q, k = self.rope(q, k, start_pos=start_pos)
+        
+        # Concatenate cached K, V with new K, V
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=0)
+            v = torch.cat([kv_cache[1], v], dim=0)
+        
+        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window, start_pos=start_pos)
         t = self.out(t)
         t = x + t
-        return t
+        
+        new_cache = (k, v) if use_cache else None
+        return t, new_cache
 
 
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
@@ -348,10 +382,15 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        x, new_cache = self.attn(x, kv_cache=kv_cache, use_cache=use_cache)
         x = self.mlp(x)
-        return x
+        return x, new_cache
 
 
 class Transformer(torch.nn.Module):
@@ -379,13 +418,25 @@ class Transformer(torch.nn.Module):
             dtype=torch.bfloat16,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]] | None]:
         x = self.embedding(x)
-        for block in self.block:
-            x = block(x)
+        
+        new_kv_cache = [] if use_cache else None
+        
+        for i, block in enumerate(self.block):
+            layer_cache = kv_cache[i] if kv_cache is not None else None
+            x, layer_new_cache = block(x, kv_cache=layer_cache, use_cache=use_cache)
+            if use_cache:
+                new_kv_cache.append(layer_new_cache)
+        
         x = self.norm(x)
         x = self.unembedding(x)
-        return x
+        return x, new_kv_cache
 
     @staticmethod
     def from_checkpoint(
@@ -452,18 +503,21 @@ class TokenGenerator:
                  prompt_tokens: list[int],
                  stop_tokens: list[int],
                  temperature: float = 1.0,
-                 max_tokens: int = 0,
+                 max_tokens: int = 100,
                  return_logprobs: bool = False):
-        tokens = list(prompt_tokens)
+        # First pass: process entire prompt, build KV cache
+        input_tensor = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
+        logits, kv_cache = self.model(input_tensor, use_cache=True)
+        logits = logits[-1]  # Logits for last token
+        
         num_generated_tokens = 0
-        while max_tokens == 0 or num_generated_tokens < max_tokens:
-            logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
+        while num_generated_tokens < max_tokens:
             if temperature == 0.0:
                 predicted_token = torch.argmax(logits, dim=-1).item()
             else:
                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
                 predicted_token = torch.multinomial(probs, num_samples=1).item()
-            tokens.append(predicted_token)
+            
             num_generated_tokens += 1
 
             if return_logprobs:
@@ -475,3 +529,8 @@ class TokenGenerator:
 
             if predicted_token in stop_tokens:
                 break
+            
+            # Process only the new token, reuse KV cache
+            input_tensor = torch.as_tensor([predicted_token], dtype=torch.int32, device=self.device)
+            logits, kv_cache = self.model(input_tensor, kv_cache=kv_cache, use_cache=True)
+            logits = logits[-1]
