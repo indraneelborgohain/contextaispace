@@ -12,7 +12,7 @@ from architecture.model_loader import (
 )
 
 #from transformers import AutoModelForCausalLM
-from architecture.gptoss20B import Transformer, ModelConfig, RopeScalingConfig
+from architecture.gptoss20B import Transformer, ModelConfig
 
 from architecture.gptoss20B import TokenGenerator
 from system_generator import HybridSystemGenerator, format_prompt_with_system
@@ -106,8 +106,11 @@ if __name__ == "__main__":
     generator = TokenGenerator(checkpoint="model/gpt-oss-20b/original/", device=device)
     output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
     
-    # Decode and print
-    full_output = tokenizer.decode(prompt_tokens + output_tokens)
-    print(full_output)
+    # Decode only the generated tokens (without system/user prompt)
+    special_token_ids = set(tokenizer._special_tokens.values())
+    clean_tokens = [t for t in output_tokens if t not in special_token_ids]
+    clean_output = tokenizer.decode(clean_tokens)
+    
+    print(f"Response: {clean_output}")
   
 
