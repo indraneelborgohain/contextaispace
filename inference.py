@@ -98,7 +98,6 @@ if __name__ == "__main__":
         tokenizer.encode("<|return|>", allowed_special='all')[0],   # 200002
         tokenizer.encode("<|call|>", allowed_special='all')[0],     # 200012
     ]
-    
     # Tokenize prompt
     prompt_tokens = tokenizer.encode(prompt, allowed_special='all')
     
@@ -108,7 +107,7 @@ if __name__ == "__main__":
     
     # Decode only the generated tokens (without system/user prompt)
     special_token_ids = set(tokenizer._special_tokens.values())
-    clean_tokens = [t for t in output_tokens if t not in special_token_ids]
+    clean_tokens = [t for t in output_tokens if t not in special_token_ids][1:]
     clean_output = tokenizer.decode(clean_tokens)
     
     print(f"Response: {clean_output}")
