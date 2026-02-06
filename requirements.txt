@@ -7,3 +7,5 @@ ipywidgets
 huggingface_hub
 safetensors
 psutil
+transformers
+torch

@@ -15,6 +15,7 @@ from architecture.model_loader import (
 from architecture.gptoss20B import Transformer, ModelConfig, RopeScalingConfig
 
 from architecture.gptoss20B import TokenGenerator
+from system_generator import HybridSystemGenerator, format_prompt_with_system
 context_len=4096
 tokenizer= get_tokenizer()
 
@@ -77,29 +78,35 @@ def main():
 
 if __name__ == "__main__":
     device = torch.device("cuda:0")
-    prompt = "Once upon a time"
+    
+    # Initialize system message generator
+    system_gen = HybridSystemGenerator(device=-1)  # Run classifier on CPU
+    
+    # User query
+    user_query = "What is the capital of France?"
+    
+    # Generate system message based on query sentiment/intent
+    system_message = system_gen.generate(user_query, verbose=True)
+    print(f"Generated system message: {system_message}\n")
+    
+    # Format prompt using Harmony format
+    prompt = format_prompt_with_system(user_query, system_message)
+    
+    # Stop tokens
     stop_token_ids = [
-    tokenizer.encode("<|end|>",allowed_special='all')[0],      # 200007
-    tokenizer.encode("<|return|>",allowed_special='all')[0],    # 200002
-    tokenizer.encode("<|call|>",allowed_special='all')[0],      # 200012
-        ]
-    idx = text_to_token_ids(prompt, tokenizer).to(device)
-    prompt = (
-    "<|start|>system<|message|>"
-    "You are a helpful assistant. "
-    "Always provide complete, informative answers in full sentences. "  # Add this
-    "Reasoning effort: low"
-    "<|end|>"
-    "<|start|>user<|message|>"
-    "What is the capital of France?"
-    "<|end|>"
-    "<|start|>assistant"
-)
-    prompt_tokens = tokenizer.encode(prompt,allowed_special='all')
+        tokenizer.encode("<|end|>", allowed_special='all')[0],      # 200007
+        tokenizer.encode("<|return|>", allowed_special='all')[0],   # 200002
+        tokenizer.encode("<|call|>", allowed_special='all')[0],     # 200012
+    ]
+    
+    # Tokenize prompt
+    prompt_tokens = tokenizer.encode(prompt, allowed_special='all')
+    
+    # Generate
     generator = TokenGenerator(checkpoint="model/gpt-oss-20b/original/", device=device)
-    # Consume the generator and collect all tokens
     output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
-    # Decode tokens to text
+    
+    # Decode and print
     full_output = tokenizer.decode(prompt_tokens + output_tokens)
     print(full_output)
   
