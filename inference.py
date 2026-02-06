@@ -55,57 +55,28 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
     result = token_ids_to_text(idx,tokenizer)
     return result
 
-
-def main():
-    """Load model from saved weights and generate text."""
-    
-    # Load custom model with transferred HuggingFace weights
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    weights_path = "model/gptoss_custom_weights.pt"
-    
-    print(f"Loading custom model from '{weights_path}'...")
-    model = Transformer(ModelConfig())
-    model.from_checkpoint()
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
-    model = model.to(device)
-    model.eval()
-    print(f"✅ Model loaded to {device}")
-
-    prompt = "Once upon a time"
-    output = generate_text(model, prompt, max_tokens=80, temperature=0.8, top_k=50)
-    print(output)
-
-
-if __name__ == "__main__":
+def generateResults(prompt):
     device = torch.device("cuda:0")
-    
     # Initialize system message generator
-    system_gen = HybridSystemGenerator(device=-1)  # Run classifier on CPU
-    
+    system_gen = HybridSystemGenerator(device=-1) # Run classifier on CPU
     # User query
-    user_query = "What is the capital of France?"
-    
+    user_query = prompt
     # Generate system message based on query sentiment/intent
     system_message = system_gen.generate(user_query, verbose=True)
     print(f"Generated system message: {system_message}\n")
-    
     # Format prompt using Harmony format
     prompt = format_prompt_with_system(user_query, system_message)
-    
     # Stop tokens
     stop_token_ids = [
-        tokenizer.encode("<|end|>", allowed_special='all')[0],      # 200007
-        tokenizer.encode("<|return|>", allowed_special='all')[0],   # 200002
-        tokenizer.encode("<|call|>", allowed_special='all')[0],     # 200012
+    tokenizer.encode("<|return|>", allowed_special='all')[0], # 200002
     ]
     # Tokenize prompt
     prompt_tokens = tokenizer.encode(prompt, allowed_special='all')
-    
     # Generate
-    generator = TokenGenerator(checkpoint="model/gpt-oss-20b/original/", device=device)
+    generator = TokenGenerator(checkpoint="model/gpt-oss-20b/original/",
+    device=device)
     output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
     full_output = tokenizer.decode(output_tokens)
-    
     # Extract final answer only (skip reasoning if present)
     if '<|channel|>final<|message|>' in full_output:
         # Has explicit final channel
@@ -119,30 +90,9 @@ if __name__ == "__main__":
         special_ids = set(tokenizer._special_tokens.values())
         clean_tokens = [t for t in output_tokens if t not in special_ids]
         answer = tokenizer.decode(clean_tokens).strip()
-        
-
-    """
-    # Extract only the newly generated tokens (exclude the input prompt)
-    generated_tokens = output_tokens[len(prompt_tokens):]
+    return answer
     
-    # Output format: <|channel|>final<|message|>RESPONSE<|return|>
-    # Find <|message|> token in the generated portion and take content after it
-    message_token_id = tokenizer.encode("<|message|>", allowed_special='all')[0]  # 200008
-    special_token_ids = set(tokenizer._special_tokens.values())
-    
-    # Find <|message|> in generated tokens - content follows it
-    try:
-        message_idx = generated_tokens.index(message_token_id)
-        response_tokens = generated_tokens[message_idx + 1:]
-    except ValueError:
-        # No <|message|> found, use all generated tokens
-        response_tokens = generated_tokens
-    
-    # Remove any remaining special tokens (like <|return|>, <|end|>)
-    clean_tokens = [t for t in response_tokens if t not in special_token_ids]
-    clean_output = tokenizer.decode(clean_tokens)
-    """
-    
-    print(f"Response: {answer}")
-  
-
+if __name__ == "__main__":
+    prompt = "What is the capital of France?"
+    result = generateResults(prompt)
+    print(f"Final Answer: {result}")

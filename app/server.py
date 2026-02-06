@@ -14,96 +14,32 @@ from flask_cors import CORS
 import time
 import torch
 
-from architecture.tokenizer import get_tokenizer
-from architecture.gptoss20B import TokenGenerator
-from system_generator import HybridSystemGenerator, format_prompt_with_system
+from inference import generateResults
+from system_generator import HybridSystemGenerator
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
 
-# Global variables for model and generator
-generator = None
+# Global variables for system generator (for exposing system message in API)
 system_gen = None
-tokenizer = None
-stop_token_ids = None
 device = None
 
 
 def initialize_model():
-    """Initialize the model, tokenizer, and system generator."""
-    global generator, system_gen, tokenizer, stop_token_ids, device
+    """Initialize the system generator for API visibility."""
+    global system_gen, device
     
-    print("Initializing model...")
+    print("Initializing...")
     
     # Setup device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Initialize tokenizer
-    tokenizer = get_tokenizer()
-    
     # Initialize system message generator (runs on CPU for efficiency)
+    # This is used to expose the system message in the API response
     system_gen = HybridSystemGenerator(device=-1)
     
-    # Stop tokens
-    stop_token_ids = [
-        tokenizer.encode("<|end|>", allowed_special='all')[0],      # 200007
-        tokenizer.encode("<|return|>", allowed_special='all')[0],   # 200002
-        tokenizer.encode("<|call|>", allowed_special='all')[0],     # 200012
-    ]
-    
-    # Initialize model
-    checkpoint_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "model/gpt-oss-20b/original/"
-    )
-    
-    if os.path.exists(checkpoint_path):
-        generator = TokenGenerator(checkpoint=checkpoint_path, device=device)
-        print(f"Model loaded from {checkpoint_path}")
-    else:
-        print(f"Warning: Checkpoint not found at {checkpoint_path}")
-        print("Running in demo mode without model")
-        generator = None
-    
     print("Initialization complete!")
-
-
-def generate_response(user_query: str, max_tokens: int = 100) -> str:
-    """
-    Generate a response for the user query.
-    
-    Args:
-        user_query: The user's input text
-        max_tokens: Maximum tokens to generate
-        
-    Returns:
-        Generated response text
-    """
-    if generator is None:
-        return "Model not loaded. Please ensure the checkpoint is available."
-    
-    # Generate system message based on query sentiment/intent
-    system_message = system_gen.generate(user_query)
-    
-    # Format prompt
-    prompt = format_prompt_with_system(user_query, system_message)
-    
-    # Tokenize
-    prompt_tokens = tokenizer.encode(prompt, allowed_special='all')
-    
-    # Generate
-    output_tokens = list(generator.generate(
-        prompt_tokens, 
-        stop_token_ids,
-        max_tokens=max_tokens
-    ))
-    
-    # Clean decode (remove special tokens)
-    special_token_ids_set = set(tokenizer._special_tokens.values())
-    clean_tokens = [t for t in output_tokens if t not in special_token_ids_set]
-    
-    return tokenizer.decode(clean_tokens)
 
 
 @app.route('/')
@@ -143,9 +79,9 @@ def chat():
         # Generate system message for debugging/visibility
         system_message = system_gen.generate(user_message) if system_gen else ""
         
-        # Generate response
+        # Generate response using generateResults from inference.py
         start_time = time.time()
-        response_text = generate_response(user_message, max_tokens=max_tokens)
+        response_text = generateResults(user_message)
         generation_time = time.time() - start_time
         
         return jsonify({
@@ -165,7 +101,6 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'mode': 'model' if generator is not None else 'demo',
         'device': str(device) if device else 'not initialized',
         'timestamp': int(time.time())
     })
