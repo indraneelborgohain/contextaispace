@@ -97,6 +97,10 @@ if __name__ == "__main__":
     prompt_tokens = tokenizer.encode(prompt)
     stop_token_ids = [200002, 200007, 200012]  # <|return|>, <|end|>, <|call|>
 
-    output  = generator.generate(prompt_tokens,stop_token_ids)
+    # Consume the generator and collect all tokens
+    output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
+    # Decode tokens to text
+    full_output = tokenizer.decode(prompt_tokens + output_tokens)
+    print(full_output)
   
 
