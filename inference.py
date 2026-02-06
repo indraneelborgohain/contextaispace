@@ -104,12 +104,45 @@ if __name__ == "__main__":
     # Generate
     generator = TokenGenerator(checkpoint="model/gpt-oss-20b/original/", device=device)
     output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
+    full_output = tokenizer.decode(output_tokens)
     
-    # Decode only the generated tokens (without system/user prompt)
+    # Extract final answer only (skip reasoning if present)
+    if '<|channel|>final<|message|>' in full_output:
+        # Has explicit final channel
+        final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
+        final_end = full_output.find('<|return|>', final_start)
+        if final_end == -1:
+            final_end = len(full_output)
+        answer = full_output[final_start:final_end].strip()
+    else:
+        # No channel marker, clean all special tokens
+        special_ids = set(tokenizer._special_tokens.values())
+        clean_tokens = [t for t in output_tokens if t not in special_ids]
+        answer = tokenizer.decode(clean_tokens).strip()
+        
+
+    """
+    # Extract only the newly generated tokens (exclude the input prompt)
+    generated_tokens = output_tokens[len(prompt_tokens):]
+    
+    # Output format: <|channel|>final<|message|>RESPONSE<|return|>
+    # Find <|message|> token in the generated portion and take content after it
+    message_token_id = tokenizer.encode("<|message|>", allowed_special='all')[0]  # 200008
     special_token_ids = set(tokenizer._special_tokens.values())
-    clean_tokens = [t for t in output_tokens if t not in special_token_ids][1:]
-    clean_output = tokenizer.decode(clean_tokens)
     
-    print(f"Response: {clean_output}")
+    # Find <|message|> in generated tokens - content follows it
+    try:
+        message_idx = generated_tokens.index(message_token_id)
+        response_tokens = generated_tokens[message_idx + 1:]
+    except ValueError:
+        # No <|message|> found, use all generated tokens
+        response_tokens = generated_tokens
+    
+    # Remove any remaining special tokens (like <|return|>, <|end|>)
+    clean_tokens = [t for t in response_tokens if t not in special_token_ids]
+    clean_output = tokenizer.decode(clean_tokens)
+    """
+    
+    print(f"Response: {answer}")
   
 
