@@ -16,19 +16,21 @@ import torch
 
 from inference import generateResults, create_models
 from system_generator import HybridSystemGenerator
+from services.chat_history import get_chat_history_service, ChatHistoryService
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
 
-# Global variables for models
+# Global variables for models and services
 system_gen = None
 generator = None
 device = None
+chat_history: ChatHistoryService = None
 
 
 def initialize_model():
-    """Initialize the model and system generator at startup."""
-    global system_gen, generator, device
+    """Initialize the model, system generator, and chat history at startup."""
+    global system_gen, generator, device, chat_history
     
     print("Initializing models...")
     
@@ -38,6 +40,10 @@ def initialize_model():
     
     # Initialize both models using create_models from inference
     generator, system_gen = create_models(device=device)
+    
+    # Initialize chat history service
+    chat_history = get_chat_history_service()
+    print(f"Chat history loaded from: {chat_history.history_file}")
     
     print("Model initialization complete!")
 
@@ -79,10 +85,24 @@ def chat():
         # Generate system message for debugging/visibility
         system_message = system_gen.generate(user_message) if system_gen else ""
         
+        # Save user message to history
+        if chat_history:
+            chat_history.add_message(conversation_id, "user", user_message)
+        
         # Generate response using generateResults with pre-initialized models
         start_time = time.time()
         response_text = generateResults(user_message, generator=generator, system_gen=system_gen)
         generation_time = time.time() - start_time
+        
+        # Save assistant response to history
+        if chat_history:
+            chat_history.add_message(
+                conversation_id,
+                "assistant",
+                response_text,
+                system_message=system_message,
+                generation_time=round(generation_time, 2)
+            )
         
         return jsonify({
             'response': response_text,
@@ -108,11 +128,57 @@ def health():
 
 @app.route('/api/clear', methods=['POST'])
 def clear_conversation():
-    """Clear conversation history (placeholder for now)"""
+    """Clear conversation history for a specific conversation or all."""
+    data = request.get_json() or {}
+    conversation_id = data.get('conversation_id')
+    
+    if chat_history:
+        if conversation_id:
+            # Clear specific conversation
+            cleared = chat_history.clear_conversation(conversation_id)
+            if cleared:
+                return jsonify({
+                    'status': 'cleared',
+                    'message': f'Conversation {conversation_id} cleared successfully'
+                })
+            else:
+                return jsonify({
+                    'status': 'not_found',
+                    'message': f'Conversation {conversation_id} not found'
+                }), 404
+        else:
+            # Clear all conversations
+            count = chat_history.clear_all()
+            return jsonify({
+                'status': 'cleared',
+                'message': f'Cleared {count} conversation(s)'
+            })
+    
     return jsonify({
         'status': 'cleared',
-        'message': 'Conversation cleared successfully'
+        'message': 'No history to clear'
     })
+
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    """Get conversation history."""
+    conversation_id = request.args.get('conversation_id')
+    
+    if not chat_history:
+        return jsonify({'error': 'Chat history not initialized'}), 500
+    
+    if conversation_id:
+        # Get specific conversation
+        conversation = chat_history.get_conversation(conversation_id)
+        if conversation:
+            return jsonify(conversation)
+        else:
+            return jsonify({'error': 'Conversation not found'}), 404
+    else:
+        # List all conversations
+        conversations = chat_history.list_conversations()
+        return jsonify({'conversations': conversations})
 
 
 if __name__ == '__main__':
