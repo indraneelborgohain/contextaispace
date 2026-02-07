@@ -16,20 +16,29 @@ from architecture.gptoss20B import Transformer, ModelConfig
 
 from architecture.gptoss20B import TokenGenerator
 from system_generator import HybridSystemGenerator, format_prompt_with_system
+import os
+
+# Project root directory (where inference.py is located)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-20b", "original")
+
 context_len=4096
 tokenizer= get_tokenizer()
 
-def create_models(device=None, checkpoint="model/gpt-oss-20b/original/"):
+def create_models(device=None, checkpoint=None):
     """
     Initialize and return the model and system generator for reuse.
     
     Args:
         device: torch device to use. Defaults to cuda:0 if available.
-        checkpoint: Path to model checkpoint.
+        checkpoint: Path to model checkpoint. Defaults to model/gpt-oss-20b/original/ in project root.
     
     Returns:
         tuple: (TokenGenerator, HybridSystemGenerator)
     """
+    if checkpoint is None:
+        checkpoint = DEFAULT_CHECKPOINT
+    
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     
