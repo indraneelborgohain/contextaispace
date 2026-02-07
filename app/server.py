@@ -14,32 +14,32 @@ from flask_cors import CORS
 import time
 import torch
 
-from inference import generateResults
+from inference import generateResults, create_models
 from system_generator import HybridSystemGenerator
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
 
-# Global variables for system generator (for exposing system message in API)
+# Global variables for models
 system_gen = None
+generator = None
 device = None
 
 
 def initialize_model():
-    """Initialize the system generator for API visibility."""
-    global system_gen, device
+    """Initialize the model and system generator at startup."""
+    global system_gen, generator, device
     
-    print("Initializing...")
+    print("Initializing models...")
     
     # Setup device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Initialize system message generator (runs on CPU for efficiency)
-    # This is used to expose the system message in the API response
-    system_gen = HybridSystemGenerator(device=-1)
+    # Initialize both models using create_models from inference
+    generator, system_gen = create_models(device=device)
     
-    print("Initialization complete!")
+    print("Model initialization complete!")
 
 
 @app.route('/')
@@ -79,9 +79,9 @@ def chat():
         # Generate system message for debugging/visibility
         system_message = system_gen.generate(user_message) if system_gen else ""
         
-        # Generate response using generateResults from inference.py
+        # Generate response using generateResults with pre-initialized models
         start_time = time.time()
-        response_text = generateResults(user_message)
+        response_text = generateResults(user_message, generator=generator, system_gen=system_gen)
         generation_time = time.time() - start_time
         
         return jsonify({

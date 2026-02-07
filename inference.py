@@ -19,6 +19,28 @@ from system_generator import HybridSystemGenerator, format_prompt_with_system
 context_len=4096
 tokenizer= get_tokenizer()
 
+def create_models(device=None, checkpoint="model/gpt-oss-20b/original/"):
+    """
+    Initialize and return the model and system generator for reuse.
+    
+    Args:
+        device: torch device to use. Defaults to cuda:0 if available.
+        checkpoint: Path to model checkpoint.
+    
+    Returns:
+        tuple: (TokenGenerator, HybridSystemGenerator)
+    """
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # Initialize system message generator (runs on CPU for efficiency)
+    system_gen = HybridSystemGenerator(device=-1)
+    
+    # Initialize token generator with the model
+    generator = TokenGenerator(checkpoint=checkpoint, device=device)
+    
+    return generator, system_gen
+
 def text_to_token_ids(text, tokenizer):
     encoded = tokenizer.encode(text)
     encoded_tensor = torch.tensor(encoded)
@@ -55,10 +77,24 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
     result = token_ids_to_text(idx,tokenizer)
     return result
 
-def generateResults(prompt):
-    device = torch.device("cuda:0")
-    # Initialize system message generator
-    system_gen = HybridSystemGenerator(device=-1) # Run classifier on CPU
+def generateResults(prompt, generator=None, system_gen=None):
+    """
+    Generate results for a given prompt.
+    
+    Args:
+        prompt: User's input prompt/query.
+        generator: Pre-initialized TokenGenerator. If None, creates a new one.
+        system_gen: Pre-initialized HybridSystemGenerator. If None, creates a new one.
+    
+    Returns:
+        str: Generated answer text.
+    """
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # Use provided models or create new ones
+    if generator is None or system_gen is None:
+        generator, system_gen = create_models(device=device)
+    
     # User query
     user_query = prompt
     # Generate system message based on query sentiment/intent
@@ -73,8 +109,6 @@ def generateResults(prompt):
     # Tokenize prompt
     prompt_tokens = tokenizer.encode(prompt, allowed_special='all')
     # Generate
-    generator = TokenGenerator(checkpoint="model/gpt-oss-20b/original/",
-    device=device)
     output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
     full_output = tokenizer.decode(output_tokens)
     # Extract final answer only (skip reasoning if present)
