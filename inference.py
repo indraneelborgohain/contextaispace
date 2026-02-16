@@ -17,6 +17,7 @@ from architecture.gptoss20B import Transformer, ModelConfig
 from architecture.gptoss20B import TokenGenerator
 from system_generator import HybridSystemGenerator, format_prompt_with_system
 import os
+from typing import List, Tuple, Optional
 
 # Project root directory (where inference.py is located)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -134,7 +135,95 @@ def generateResults(prompt, generator=None, system_gen=None):
         clean_tokens = [t for t in output_tokens if t not in special_ids]
         answer = tokenizer.decode(clean_tokens).strip()
     return answer
+
+
+def generateResultsWithCache(
+    prompt: str,
+    generator,
+    system_gen,
+    kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    tokens_so_far: Optional[List[int]] = None,
+    max_tokens: int = 100,
+    temperature: float = 1.0
+) -> Tuple[str, List[Tuple[torch.Tensor, torch.Tensor]], List[int]]:
+    """
+    Generate results with KV cache support for multi-turn conversations.
     
+    For new conversations (kv_cache=None), processes the full prompt.
+    For continuing conversations, only processes new tokens while reusing cache.
+    
+    Args:
+        prompt: User's input prompt/query.
+        generator: Pre-initialized TokenGenerator.
+        system_gen: Pre-initialized HybridSystemGenerator.
+        kv_cache: Existing KV cache from previous turns. None for new conversation.
+        tokens_so_far: All tokens processed so far. None for new conversation.
+        max_tokens: Maximum tokens to generate.
+        temperature: Sampling temperature.
+    
+    Returns:
+        tuple: (answer_text, updated_kv_cache, updated_tokens_so_far)
+    """
+    # User query
+    user_query = prompt
+    
+    # Generate system message based on query sentiment/intent
+    system_message = system_gen.generate(user_query, verbose=True)
+    print(f"Generated system message: {system_message}\n")
+    
+    # Stop tokens
+    stop_token_ids = [
+        tokenizer.encode("<|return|>", allowed_special='all')[0],  # 200002
+    ]
+    
+    # Format tokens for this turn
+    if kv_cache is None or tokens_so_far is None:
+        # New conversation: format full prompt
+        formatted_prompt = format_prompt_with_system(user_query, system_message)
+        new_tokens = tokenizer.encode(formatted_prompt, allowed_special='all')
+        tokens_so_far = []
+    else:
+        # Continuing conversation: append response end + new user message
+        # Format: <|end|><|start|>user<|message|>{query}<|end|><|start|>assistant
+        continuation = (
+            f"<|end|>"  # End previous assistant response
+            f"<|start|>user<|message|>{user_query}<|end|>"
+            f"<|start|>assistant"
+        )
+        new_tokens = tokenizer.encode(continuation, allowed_special='all')
+    
+    # Generate with cache
+    output_tokens, updated_kv_cache = generator.generate_with_cache(
+        new_tokens=new_tokens,
+        stop_tokens=stop_token_ids,
+        kv_cache=kv_cache,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+    
+    # Update tokens_so_far with new tokens + generated output
+    updated_tokens = tokens_so_far + new_tokens + output_tokens
+    
+    # Decode the generated output
+    full_output = tokenizer.decode(output_tokens)
+    
+    # Extract final answer only (skip reasoning if present)
+    if '<|channel|>final<|message|>' in full_output:
+        # Has explicit final channel
+        final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
+        final_end = full_output.find('<|return|>', final_start)
+        if final_end == -1:
+            final_end = len(full_output)
+        answer = full_output[final_start:final_end].strip()
+    else:
+        # No channel marker, clean all special tokens
+        special_ids = set(tokenizer._special_tokens.values())
+        clean_tokens = [t for t in output_tokens if t not in special_ids]
+        answer = tokenizer.decode(clean_tokens).strip()
+    
+    return answer, updated_kv_cache, updated_tokens
+    
+
 if __name__ == "__main__":
     prompt = "What is the capital of France?"
     result = generateResults(prompt)

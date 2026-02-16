@@ -538,3 +538,56 @@ class TokenGenerator:
             input_tensor = torch.as_tensor([predicted_token], dtype=torch.int32, device=self.device)
             logits, kv_cache = self.model(input_tensor, kv_cache=kv_cache, use_cache=True)
             logits = logits[-1]
+
+    @torch.inference_mode()
+    def generate_with_cache(self,
+                            new_tokens: list[int],
+                            stop_tokens: list[int],
+                            kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+                            temperature: float = 1.0,
+                            max_tokens: int = 100) -> tuple[list[int], list[tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Generate tokens with KV cache persistence.
+        
+        Args:
+            new_tokens: New tokens to process (just the new part of the conversation).
+            stop_tokens: Token IDs that signal end of generation.
+            kv_cache: Existing KV cache from previous turns. None for new conversation.
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens to generate.
+        
+        Returns:
+            tuple: (generated_tokens, updated_kv_cache)
+        """
+        # Process new tokens, extending existing KV cache if provided
+        input_tensor = torch.as_tensor(new_tokens, dtype=torch.int32, device=self.device)
+        logits, kv_cache = self.model(input_tensor, kv_cache=kv_cache, use_cache=True)
+        logits = logits[-1]  # Logits for last token
+        
+        generated_tokens = []
+        num_generated_tokens = 0
+        
+        while num_generated_tokens < max_tokens:
+            if temperature == 0.0:
+                predicted_token = torch.argmax(logits, dim=-1).item()
+            else:
+                probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
+                predicted_token = torch.multinomial(probs, num_samples=1).item()
+            
+            num_generated_tokens += 1
+            generated_tokens.append(predicted_token)
+
+            if predicted_token in stop_tokens:
+                break
+            
+            # Process only the new token, reuse KV cache
+            input_tensor = torch.as_tensor([predicted_token], dtype=torch.int32, device=self.device)
+            logits, kv_cache = self.model(input_tensor, kv_cache=kv_cache, use_cache=True)
+            logits = logits[-1]
+        
+        return generated_tokens, kv_cache
+    
+    def clear_cache(self):
+        """Clear CUDA cache to free memory."""
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
