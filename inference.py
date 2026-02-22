@@ -47,7 +47,8 @@ def create_models(device=None, checkpoint=None):
     system_gen = HybridSystemGenerator(device=-1)
     
     # Initialize token generator with the model
-    generator = TokenGenerator(checkpoint=checkpoint, device=device)
+    generator = TokenGenerator(checkpoint=checkpoint, device="cpu")
+    generator = generator.to(device)
     
     return generator, system_gen
 

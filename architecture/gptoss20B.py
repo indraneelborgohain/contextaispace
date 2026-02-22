@@ -164,25 +164,25 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0, start_pos: int = 0):
     K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
     V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
     S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, q_len, -1)
-    
+
     # Build causal mask: Q tokens can only attend to K tokens at positions <= their own
     # Q positions: [start_pos, start_pos + q_len)
     # K positions: [0, kv_len)
     q_positions = torch.arange(start_pos, start_pos + q_len, device=Q.device)
     k_positions = torch.arange(kv_len, device=Q.device)
-    
+
     # Create mask using masked_fill to avoid 0 * -inf = NaN
     mask = torch.zeros((q_len, kv_len), device=Q.device, dtype=Q.dtype)
     # mask[i,j] = -inf if k_positions[j] > q_positions[i] (future token)
     causal_mask = k_positions[None, :] > q_positions[:, None]
     mask.masked_fill_(causal_mask, -float("inf"))
-    
+
     if sliding_window > 0:
         # Also mask tokens outside sliding window
         # mask[i,j] = -inf if q_positions[i] - k_positions[j] >= sliding_window
         window_mask = q_positions[:, None] - k_positions[None, :] >= sliding_window
         mask.masked_fill_(window_mask, -float("inf"))
-    
+
     QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
     QK *= sm_scale
     QK += mask[None, None, :, :]
@@ -264,23 +264,35 @@ class AttentionBlock(torch.nn.Module):
         )
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        
+
         # Get start position from cache
         start_pos = 0 if kv_cache is None else kv_cache[0].shape[0]
-        
+
         # Apply rotary embeddings with correct positions
         q, k = self.rope(q, k, start_pos=start_pos)
-        
+
         # Concatenate cached K, V with new K, V
         if kv_cache is not None:
             k = torch.cat([kv_cache[0], k], dim=0)
             v = torch.cat([kv_cache[1], v], dim=0)
-        
+
         t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window, start_pos=start_pos)
         t = self.out(t)
         t = x + t
-        
-        new_cache = (k, v) if use_cache else None
+
+        # FIX: Trim KV cache for sliding window layers to prevent unbounded memory growth.
+        # Full-context layers (sliding_window == 0) keep the entire history.
+        new_cache = None
+        if use_cache:
+            if self.sliding_window > 0:
+                # Only the last `sliding_window` tokens are ever attended to,
+                # so there is no benefit in retaining older entries.
+                k_cache = k[-self.sliding_window :]
+                v_cache = v[-self.sliding_window :]
+            else:
+                k_cache, v_cache = k, v
+            new_cache = (k_cache, v_cache)
+
         return t, new_cache
 
 
@@ -429,15 +441,15 @@ class Transformer(torch.nn.Module):
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]] | None]:
         x = self.embedding(x)
-        
+
         new_kv_cache = [] if use_cache else None
-        
+
         for i, block in enumerate(self.block):
             layer_cache = kv_cache[i] if kv_cache is not None else None
             x, layer_new_cache = block(x, kv_cache=layer_cache, use_cache=use_cache)
             if use_cache:
                 new_kv_cache.append(layer_new_cache)
-        
+
         x = self.norm(x)
         x = self.unembedding(x)
         return x, new_kv_cache
@@ -459,42 +471,55 @@ class Transformer(torch.nn.Module):
         my_rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # If intermediate_size is the per-expert full size (pre-fused),
-        # mlp1 (gate+up fused) has dim = 2 * intermediate_size
-        # Adjust if your config stores the fused size directly
-        per_rank_intermediate_size = config.intermediate_size // world_size
-
         checkpoint = Checkpoint(path, device)
         load_errors = []
 
         for name, param in model.named_parameters():
             loaded_tensor = checkpoint.get(name)
 
-            # Shard column-parallel (mlp1: gate+up fused, split on output dim)
-            if "mlp1" in name:
-                full_out_dim = loaded_tensor.shape[1]  # expect 2 * intermediate_size
-                assert full_out_dim % world_size == 0, (
-                    f"mlp1 output dim {full_out_dim} not divisible by world_size {world_size}"
-                )
-                chunk = full_out_dim // world_size
-                loaded_tensor = loaded_tensor[:, my_rank * chunk : (my_rank + 1) * chunk, ...]
+            # FIX: Use explicit name checks instead of "mlp1" in name to avoid
+            # accidentally matching unrelated parameters in future refactors.
 
-            # Shard row-parallel (mlp2: split on input dim)
+            # mlp1_weight: (num_experts, 2*intermediate_size, hidden_size)
+            # mlp1_bias:   (num_experts, 2*intermediate_size)
+            # Both are column-parallel: shard on dim 1 (the intermediate dim).
+            if "mlp1_weight" in name or "mlp1_bias" in name:
+                full_dim = loaded_tensor.shape[1]
+                assert full_dim % world_size == 0, (
+                    f"{name}: dim 1 size {full_dim} is not divisible by "
+                    f"world_size {world_size}"
+                )
+                chunk = full_dim // world_size
+                loaded_tensor = loaded_tensor[
+                    :, my_rank * chunk : (my_rank + 1) * chunk, ...
+                ]
+
+            # mlp2_weight: (num_experts, hidden_size, intermediate_size)
+            # Row-parallel: shard on dim 2 (the intermediate/input dim).
+            # mlp2_bias:   (num_experts, hidden_size) — NOT sharded.
+            # It is the same on every rank because it is added after all_reduce.
             elif "mlp2_weight" in name:
-                full_in_dim = loaded_tensor.shape[-1]  # expect intermediate_size
-                assert full_in_dim % world_size == 0, (
-                    f"mlp2 input dim {full_in_dim} not divisible by world_size {world_size}"
+                full_dim = loaded_tensor.shape[2]
+                assert full_dim % world_size == 0, (
+                    f"{name}: dim 2 size {full_dim} is not divisible by "
+                    f"world_size {world_size}"
                 )
-                chunk = full_in_dim // world_size
-                loaded_tensor = loaded_tensor[..., my_rank * chunk : (my_rank + 1) * chunk]
+                chunk = full_dim // world_size
+                loaded_tensor = loaded_tensor[
+                    :, :, my_rank * chunk : (my_rank + 1) * chunk
+                ]
 
-            # Dtype alignment
+            # Cast dtype if the checkpoint stores weights in a different precision
+            # (e.g. MXFP4 / FP8 checkpoints upcasted to bfloat16 at load time).
             if loaded_tensor.dtype != param.data.dtype:
                 loaded_tensor = loaded_tensor.to(param.data.dtype)
 
+            # Collect shape mismatches rather than crashing on the first one so
+            # the full picture is visible in a single error message.
             if loaded_tensor.shape != param.data.shape:
                 load_errors.append(
-                    f"  {name}: param={param.data.shape}, loaded={loaded_tensor.shape}"
+                    f"  {name}: param={tuple(param.data.shape)}, "
+                    f"loaded={tuple(loaded_tensor.shape)}"
                 )
                 continue
 
@@ -502,7 +527,8 @@ class Transformer(torch.nn.Module):
 
         if load_errors:
             raise RuntimeError(
-                f"Shape mismatches loading checkpoint from {path}:\n" + "\n".join(load_errors)
+                f"Shape mismatches loading checkpoint from '{path}':\n"
+                + "\n".join(load_errors)
             )
 
         return model
@@ -515,17 +541,21 @@ class TokenGenerator:
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
 
     @torch.inference_mode()
-    def generate(self,
-                 prompt_tokens: list[int],
-                 stop_tokens: list[int],
-                 temperature: float = 1.0,
-                 max_tokens: int = 100,
-                 return_logprobs: bool = False):
+    def generate(
+        self,
+        prompt_tokens: list[int],
+        stop_tokens: list[int],
+        temperature: float = 1.0,
+        max_tokens: int = 100,
+        return_logprobs: bool = False,
+    ):
         # First pass: process entire prompt, build KV cache
-        input_tensor = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
+        input_tensor = torch.as_tensor(
+            prompt_tokens, dtype=torch.int32, device=self.device
+        )
         logits, kv_cache = self.model(input_tensor, use_cache=True)
         logits = logits[-1]  # Logits for last token
-        
+
         num_generated_tokens = 0
         while num_generated_tokens < max_tokens:
             if temperature == 0.0:
@@ -533,7 +563,7 @@ class TokenGenerator:
             else:
                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
                 predicted_token = torch.multinomial(probs, num_samples=1).item()
-            
+
             num_generated_tokens += 1
 
             if return_logprobs:
@@ -545,61 +575,73 @@ class TokenGenerator:
 
             if predicted_token in stop_tokens:
                 break
-            
+
             # Process only the new token, reuse KV cache
-            input_tensor = torch.as_tensor([predicted_token], dtype=torch.int32, device=self.device)
-            logits, kv_cache = self.model(input_tensor, kv_cache=kv_cache, use_cache=True)
+            input_tensor = torch.as_tensor(
+                [predicted_token], dtype=torch.int32, device=self.device
+            )
+            logits, kv_cache = self.model(
+                input_tensor, kv_cache=kv_cache, use_cache=True
+            )
             logits = logits[-1]
 
     @torch.inference_mode()
-    def generate_with_cache(self,
-                            new_tokens: list[int],
-                            stop_tokens: list[int],
-                            kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-                            temperature: float = 1.0,
-                            max_tokens: int = 100) -> tuple[list[int], list[tuple[torch.Tensor, torch.Tensor]]]:
+    def generate_with_cache(
+        self,
+        new_tokens: list[int],
+        stop_tokens: list[int],
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        temperature: float = 1.0,
+        max_tokens: int = 100,
+    ) -> tuple[list[int], list[tuple[torch.Tensor, torch.Tensor]]]:
         """
         Generate tokens with KV cache persistence.
-        
+
         Args:
             new_tokens: New tokens to process (just the new part of the conversation).
             stop_tokens: Token IDs that signal end of generation.
             kv_cache: Existing KV cache from previous turns. None for new conversation.
             temperature: Sampling temperature.
             max_tokens: Maximum tokens to generate.
-        
+
         Returns:
             tuple: (generated_tokens, updated_kv_cache)
         """
         # Process new tokens, extending existing KV cache if provided
-        input_tensor = torch.as_tensor(new_tokens, dtype=torch.int32, device=self.device)
+        input_tensor = torch.as_tensor(
+            new_tokens, dtype=torch.int32, device=self.device
+        )
         logits, kv_cache = self.model(input_tensor, kv_cache=kv_cache, use_cache=True)
         logits = logits[-1]  # Logits for last token
-        
+
         generated_tokens = []
         num_generated_tokens = 0
-        
+
         while num_generated_tokens < max_tokens:
             if temperature == 0.0:
                 predicted_token = torch.argmax(logits, dim=-1).item()
             else:
                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
                 predicted_token = torch.multinomial(probs, num_samples=1).item()
-            
+
             num_generated_tokens += 1
             generated_tokens.append(predicted_token)
 
             if predicted_token in stop_tokens:
                 break
-            
+
             # Process only the new token, reuse KV cache
-            input_tensor = torch.as_tensor([predicted_token], dtype=torch.int32, device=self.device)
-            logits, kv_cache = self.model(input_tensor, kv_cache=kv_cache, use_cache=True)
+            input_tensor = torch.as_tensor(
+                [predicted_token], dtype=torch.int32, device=self.device
+            )
+            logits, kv_cache = self.model(
+                input_tensor, kv_cache=kv_cache, use_cache=True
+            )
             logits = logits[-1]
-        
+
         return generated_tokens, kv_cache
-    
+
     def clear_cache(self):
         """Clear CUDA cache to free memory."""
-        if self.device.type == 'cuda':
+        if self.device.type == "cuda":
             torch.cuda.empty_cache()
