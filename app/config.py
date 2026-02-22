@@ -27,7 +27,7 @@ MIN_GPUS_REQUIRED = int(os.getenv("MIN_GPUS_REQUIRED", 1))
 # Model configuration
 MODEL_CHECKPOINT_PATH = os.getenv(
     "MODEL_CHECKPOINT_PATH", 
-    str(PROJECT_DIR / "model/gpt-oss-20b/original/")
+    str(PROJECT_DIR / "model/gpt-oss-120b/original/")
 )
 
 # Virtual environment path for SLURM jobs

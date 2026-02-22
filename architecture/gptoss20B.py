@@ -442,56 +442,68 @@ class Transformer(torch.nn.Module):
         x = self.unembedding(x)
         return x, new_kv_cache
 
-    @staticmethod
+    @classmethod
     def from_checkpoint(
-        path: str, device: str | torch.device = "cuda"
+        cls, path: str, device: str | torch.device = "cuda"
     ) -> "Transformer":
         if not isinstance(device, torch.device):
             device = torch.device(device)
 
         config_path = os.path.join(path, "config.json")
         with open(config_path, "r") as f:
-            json_config = json.load(f)
-            config = ModelConfig(**json_config)
+            config = ModelConfig(**json.load(f))
 
-        model = Transformer(
-            config=config,
-            device=device,
-        )
+        model = Transformer(config=config, device=device)
         model.eval()
 
-        # Load weights
         my_rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        # If intermediate_size is the per-expert full size (pre-fused),
+        # mlp1 (gate+up fused) has dim = 2 * intermediate_size
+        # Adjust if your config stores the fused size directly
         per_rank_intermediate_size = config.intermediate_size // world_size
 
         checkpoint = Checkpoint(path, device)
+        load_errors = []
 
         for name, param in model.named_parameters():
             loaded_tensor = checkpoint.get(name)
 
-            # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-            # but for simplicity we do it after.
-            if "mlp1" in name:  # both weight and bias
-                loaded_tensor = loaded_tensor[
-                    :,
-                    my_rank * 2
-                    * per_rank_intermediate_size : (my_rank + 1) * 2
-                    * per_rank_intermediate_size,
-                    ...,
-                ]
-            elif "mlp2_weight" in name:  # only weight
-                loaded_tensor = loaded_tensor[
-                    ...,
-                    my_rank
-                    * per_rank_intermediate_size : (my_rank + 1)
-                    * per_rank_intermediate_size,
-                ]
-            try:
-                param.data.copy_(loaded_tensor)
-            except:
-                print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-                raise
+            # Shard column-parallel (mlp1: gate+up fused, split on output dim)
+            if "mlp1" in name:
+                full_out_dim = loaded_tensor.shape[1]  # expect 2 * intermediate_size
+                assert full_out_dim % world_size == 0, (
+                    f"mlp1 output dim {full_out_dim} not divisible by world_size {world_size}"
+                )
+                chunk = full_out_dim // world_size
+                loaded_tensor = loaded_tensor[:, my_rank * chunk : (my_rank + 1) * chunk, ...]
+
+            # Shard row-parallel (mlp2: split on input dim)
+            elif "mlp2_weight" in name:
+                full_in_dim = loaded_tensor.shape[-1]  # expect intermediate_size
+                assert full_in_dim % world_size == 0, (
+                    f"mlp2 input dim {full_in_dim} not divisible by world_size {world_size}"
+                )
+                chunk = full_in_dim // world_size
+                loaded_tensor = loaded_tensor[..., my_rank * chunk : (my_rank + 1) * chunk]
+
+            # Dtype alignment
+            if loaded_tensor.dtype != param.data.dtype:
+                loaded_tensor = loaded_tensor.to(param.data.dtype)
+
+            if loaded_tensor.shape != param.data.shape:
+                load_errors.append(
+                    f"  {name}: param={param.data.shape}, loaded={loaded_tensor.shape}"
+                )
+                continue
+
+            param.data.copy_(loaded_tensor)
+
+        if load_errors:
+            raise RuntimeError(
+                f"Shape mismatches loading checkpoint from {path}:\n" + "\n".join(load_errors)
+            )
 
         return model
 
