@@ -178,8 +178,6 @@ def generateResultsWithCache(
     user_query = prompt
     
     # Generate system message based on query sentiment/intent
-    system_message = system_gen.generate(user_query, verbose=True)
-    print(f"Generated system message: {system_message}\n")
     
     # Stop tokens
     stop_token_ids = [
@@ -189,6 +187,7 @@ def generateResultsWithCache(
     # Format tokens for this turn
     if kv_cache is None or tokens_so_far is None:
         # New conversation: format full prompt
+        system_message = system_gen.generate(user_query, verbose=True)
         formatted_prompt = format_prompt_with_system(user_query, system_message)
         new_tokens = tokenizer.encode(formatted_prompt, allowed_special='all')
         tokens_so_far = []
@@ -202,27 +201,22 @@ def generateResultsWithCache(
         )
         new_tokens = tokenizer.encode(continuation, allowed_special='all')
     
-    # Generate with cache and retry until final channel marker is present
-    current_kv_cache = kv_cache
-    current_tokens_so_far = tokens_so_far
-    
+    original_kv_cache = kv_cache
+    original_tokens_so_far = tokens_so_far  # Already guaranteed non-None here
+
     for attempt in range(max_retries):
         output_tokens, updated_kv_cache = generator.generate_with_cache(
             new_tokens=new_tokens,
             stop_tokens=stop_token_ids,
-            kv_cache=current_kv_cache,
+            kv_cache=original_kv_cache,
             temperature=temperature,
             max_tokens=max_tokens
         )
         
-        # Update tokens_so_far with new tokens + generated output
-        updated_tokens = current_tokens_so_far + new_tokens + output_tokens
-        
-        # Decode the generated output
+        updated_tokens = original_tokens_so_far + new_tokens + output_tokens
         full_output = tokenizer.decode(output_tokens)
         
         if '<|channel|>final<|message|>' in full_output:
-            # Has explicit final channel - extract answer
             final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
             final_end = full_output.find('<|return|>', final_start)
             if final_end == -1:
@@ -230,20 +224,14 @@ def generateResultsWithCache(
             answer = full_output[final_start:final_end].strip()
             return answer, updated_kv_cache, updated_tokens
         
-        # No final channel marker, retry with updated cache
         print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, retrying...")
-        current_kv_cache = updated_kv_cache
-        current_tokens_so_far = updated_tokens
-        # For retry, we continue generation from where we left off
-        new_tokens = []  # Empty - just continue generating
-    
-    # Max retries reached, return cleaned output as fallback
+
+    # Fallback
     print(f"Warning: No final channel marker after {max_retries} attempts, returning cleaned output")
     special_ids = set(tokenizer._special_tokens.values())
     clean_tokens = [t for t in output_tokens if t not in special_ids]
     answer = tokenizer.decode(clean_tokens).strip()
-    return answer, updated_kv_cache, updated_tokens
-    
+    return answer, updated_kv_cache, updated_tokens    
 
 if __name__ == "__main__":
     prompt = "What is the capital of France?"
