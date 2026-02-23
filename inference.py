@@ -195,10 +195,10 @@ def generateResultsWithCache(
         # Continuing conversation: append response end + new user message
         # Format: <|end|><|start|>user<|message|>{query}<|end|><|start|>assistant
         continuation = (
-            f"<|end|>"  # End previous assistant response
-            f"<|start|>user<|message|>{user_query}<|end|>"
+           f"<|start|>user<|message|>{user_query}<|end|>"
             f"<|start|>assistant"
         )
+       
         new_tokens = tokenizer.encode(continuation, allowed_special='all')
     
     original_kv_cache = kv_cache
