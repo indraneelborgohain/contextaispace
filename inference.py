@@ -222,7 +222,7 @@ def generateResultsWithCache(
             if final_end == -1:
                 final_end = len(full_output)
             answer = full_output[final_start:final_end].strip()
-            return answer, updated_kv_cache, updated_tokens
+            
         
         print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, retrying...")
 
