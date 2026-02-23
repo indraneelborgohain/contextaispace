@@ -88,7 +88,7 @@ def generate_text(model, prompt, max_tokens=100, temperature=0.8, top_k=50):
     result = token_ids_to_text(idx,tokenizer)
     return result
 
-def generateResults(prompt, generator=None, system_gen=None):
+def generateResults(prompt, generator=None, system_gen=None, max_retries: int = 3):
     """
     Generate results for a given prompt.
     
@@ -96,6 +96,7 @@ def generateResults(prompt, generator=None, system_gen=None):
         prompt: User's input prompt/query.
         generator: Pre-initialized TokenGenerator. If None, creates a new one.
         system_gen: Pre-initialized HybridSystemGenerator. If None, creates a new one.
+        max_retries: Maximum number of retries if final channel marker is missing.
     
     Returns:
         str: Generated answer text.
@@ -119,22 +120,29 @@ def generateResults(prompt, generator=None, system_gen=None):
     ]
     # Tokenize prompt
     prompt_tokens = tokenizer.encode(prompt, allowed_special='all')
-    # Generate
-    output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
-    full_output = tokenizer.decode(output_tokens)
-    # Extract final answer only (skip reasoning if present)
-    if '<|channel|>final<|message|>' in full_output:
-        # Has explicit final channel
-        final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
-        final_end = full_output.find('<|return|>', final_start)
-        if final_end == -1:
-            final_end = len(full_output)
-        answer = full_output[final_start:final_end].strip()
-    else:
-        # No channel marker, clean all special tokens
-        special_ids = set(tokenizer._special_tokens.values())
-        clean_tokens = [t for t in output_tokens if t not in special_ids]
-        answer = tokenizer.decode(clean_tokens).strip()
+    
+    # Generate with retry until final channel marker is present
+    for attempt in range(max_retries):
+        output_tokens = list(generator.generate(prompt_tokens, stop_token_ids))
+        full_output = tokenizer.decode(output_tokens)
+        
+        if '<|channel|>final<|message|>' in full_output:
+            # Has explicit final channel - extract answer
+            final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
+            final_end = full_output.find('<|return|>', final_start)
+            if final_end == -1:
+                final_end = len(full_output)
+            answer = full_output[final_start:final_end].strip()
+            return answer
+        
+        # No final channel marker, retry
+        print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, retrying...")
+    
+    # Max retries reached, return cleaned output as fallback
+    print(f"Warning: No final channel marker after {max_retries} attempts, returning cleaned output")
+    special_ids = set(tokenizer._special_tokens.values())
+    clean_tokens = [t for t in output_tokens if t not in special_ids]
+    answer = tokenizer.decode(clean_tokens).strip()
     return answer
 
 
@@ -145,7 +153,8 @@ def generateResultsWithCache(
     kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     tokens_so_far: Optional[List[int]] = None,
     max_tokens: int = 100,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    max_retries: int = 3
 ) -> Tuple[str, List[Tuple[torch.Tensor, torch.Tensor]], List[int]]:
     """
     Generate results with KV cache support for multi-turn conversations.
@@ -193,35 +202,46 @@ def generateResultsWithCache(
         )
         new_tokens = tokenizer.encode(continuation, allowed_special='all')
     
-    # Generate with cache
-    output_tokens, updated_kv_cache = generator.generate_with_cache(
-        new_tokens=new_tokens,
-        stop_tokens=stop_token_ids,
-        kv_cache=kv_cache,
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
+    # Generate with cache and retry until final channel marker is present
+    current_kv_cache = kv_cache
+    current_tokens_so_far = tokens_so_far
     
-    # Update tokens_so_far with new tokens + generated output
-    updated_tokens = tokens_so_far + new_tokens + output_tokens
+    for attempt in range(max_retries):
+        output_tokens, updated_kv_cache = generator.generate_with_cache(
+            new_tokens=new_tokens,
+            stop_tokens=stop_token_ids,
+            kv_cache=current_kv_cache,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        # Update tokens_so_far with new tokens + generated output
+        updated_tokens = current_tokens_so_far + new_tokens + output_tokens
+        
+        # Decode the generated output
+        full_output = tokenizer.decode(output_tokens)
+        
+        if '<|channel|>final<|message|>' in full_output:
+            # Has explicit final channel - extract answer
+            final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
+            final_end = full_output.find('<|return|>', final_start)
+            if final_end == -1:
+                final_end = len(full_output)
+            answer = full_output[final_start:final_end].strip()
+            return answer, updated_kv_cache, updated_tokens
+        
+        # No final channel marker, retry with updated cache
+        print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, retrying...")
+        current_kv_cache = updated_kv_cache
+        current_tokens_so_far = updated_tokens
+        # For retry, we continue generation from where we left off
+        new_tokens = []  # Empty - just continue generating
     
-    # Decode the generated output
-    full_output = tokenizer.decode(output_tokens)
-    
-    # Extract final answer only (skip reasoning if present)
-    if '<|channel|>final<|message|>' in full_output:
-        # Has explicit final channel
-        final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
-        final_end = full_output.find('<|return|>', final_start)
-        if final_end == -1:
-            final_end = len(full_output)
-        answer = full_output[final_start:final_end].strip()
-    else:
-        # No channel marker, clean all special tokens
-        special_ids = set(tokenizer._special_tokens.values())
-        clean_tokens = [t for t in output_tokens if t not in special_ids]
-        answer = tokenizer.decode(clean_tokens).strip()
-    
+    # Max retries reached, return cleaned output as fallback
+    print(f"Warning: No final channel marker after {max_retries} attempts, returning cleaned output")
+    special_ids = set(tokenizer._special_tokens.values())
+    clean_tokens = [t for t in output_tokens if t not in special_ids]
+    answer = tokenizer.decode(clean_tokens).strip()
     return answer, updated_kv_cache, updated_tokens
     
 
