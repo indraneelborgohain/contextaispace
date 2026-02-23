@@ -21,7 +21,7 @@ from typing import List, Tuple, Optional
 
 # Project root directory (where inference.py is located)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-120b", "original")
+DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-20b", "original")
 
 context_len=4096
 tokenizer= get_tokenizer()
