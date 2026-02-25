@@ -187,24 +187,25 @@ def generateResultsWithCache(
         )
         new_tokens = tokenizer.encode(continuation, allowed_special='all')
 
-    original_kv_cache = kv_cache
-    original_tokens_so_far = tokens_so_far
+    current_kv_cache = kv_cache
+    current_tokens = tokens_so_far if tokens_so_far else []
 
     output_tokens = None
     updated_kv_cache = None
-    updated_tokens = None
+    all_output_tokens = []  # Accumulate all reasoning steps
 
     for attempt in range(max_retries):
         output_tokens, updated_kv_cache = generator.generate_with_cache(
             new_tokens=new_tokens,
             stop_tokens=stop_token_ids,
-            kv_cache=original_kv_cache,
+            kv_cache=current_kv_cache,
             temperature=temperature,
             max_tokens=max_tokens
         )
 
-        updated_tokens = original_tokens_so_far + new_tokens + output_tokens
-        full_output = tokenizer.decode(output_tokens)
+        all_output_tokens.extend(output_tokens)
+        current_tokens = current_tokens + new_tokens + output_tokens
+        full_output = tokenizer.decode(all_output_tokens)
 
         if '<|channel|>final<|message|>' in full_output:
             final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
@@ -229,14 +230,20 @@ def generateResultsWithCache(
                     closing_tensor, kv_cache=clean_cache, use_cache=True
                 )
 
-            return answer, clean_cache, updated_tokens
+            return answer, clean_cache, current_tokens
 
-        print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, retrying...")
+        print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, continuing reasoning...")
+
+        # --- REASONING MODEL: Build on previous output ---
+        # Update cache and prepare to continue from where we left off
+        current_kv_cache = updated_kv_cache
+        # Next iteration continues from the last output (empty new_tokens since cache has it)
+        new_tokens = []
 
     # Fallback: max retries reached
     print(f"Warning: No final channel marker after {max_retries} attempts, returning cleaned output")
     special_ids = set(tokenizer._special_tokens.values())
-    clean_tokens = [t for t in output_tokens if t not in special_ids]
+    clean_tokens = [t for t in all_output_tokens if t not in special_ids]
     answer = tokenizer.decode(clean_tokens).strip()
 
     # Still clean up the cache for fallback path so caller isn't stuck with bad state
@@ -250,9 +257,9 @@ def generateResultsWithCache(
             _, clean_cache = generator.model(
                 closing_tensor, kv_cache=clean_cache, use_cache=True
             )
-        return answer, clean_cache, updated_tokens
+        return answer, clean_cache, current_tokens
 
-    return answer, updated_kv_cache, updated_tokens
+    return answer, updated_kv_cache, current_tokens
 
 if __name__ == "__main__":
     prompt = "What is the capital of France?"
