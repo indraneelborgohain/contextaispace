@@ -145,7 +145,15 @@ def generateResults(prompt, generator=None, system_gen=None, max_retries: int = 
     answer = tokenizer.decode(clean_tokens).strip()
     return answer
 
+def _trim_cache(
+    kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    n: int = 1
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Remove last n token positions from every layer of the KV cache."""
+    return [(k[:-n], v[:-n]) for k, v in kv_cache]
 
+"""
+"""
 def generateResultsWithCache(
     prompt: str,
     generator,
@@ -156,53 +164,35 @@ def generateResultsWithCache(
     temperature: float = 1.0,
     max_retries: int = 3
 ) -> Tuple[str, List[Tuple[torch.Tensor, torch.Tensor]], List[int]]:
-    """
-    Generate results with KV cache support for multi-turn conversations.
-    
-    For new conversations (kv_cache=None), processes the full prompt.
-    For continuing conversations, only processes new tokens while reusing cache.
-    
-    Args:
-        prompt: User's input prompt/query.
-        generator: Pre-initialized TokenGenerator.
-        system_gen: Pre-initialized HybridSystemGenerator.
-        kv_cache: Existing KV cache from previous turns. None for new conversation.
-        tokens_so_far: All tokens processed so far. None for new conversation.
-        max_tokens: Maximum tokens to generate.
-        temperature: Sampling temperature.
-    
-    Returns:
-        tuple: (answer_text, updated_kv_cache, updated_tokens_so_far)
-    """
-    # User query
+
     user_query = prompt
-    
-    # Generate system message based on query sentiment/intent
-    
-    # Stop tokens
+
     stop_token_ids = [
-        tokenizer.encode("<|return|>", allowed_special='all')[0],  # 200002
+        tokenizer.encode("<|return|>", allowed_special='all')[0],
     ]
-    
-    # Format tokens for this turn
+
     if kv_cache is None or tokens_so_far is None:
-        # New conversation: format full prompt
+        # New conversation: format full prompt with system message
         system_message = system_gen.generate(user_query, verbose=True)
+        print(f"Generated system message: {system_message}\n")
         formatted_prompt = format_prompt_with_system(user_query, system_message)
         new_tokens = tokenizer.encode(formatted_prompt, allowed_special='all')
         tokens_so_far = []
     else:
-        # Continuing conversation: append response end + new user message
-        # Format: <|end|><|start|>user<|message|>{query}<|end|><|start|>assistant
+        # Continuing conversation: cache already ends with proper <|end|>
+        # (we closed it after the previous turn), so just append new user turn
         continuation = (
-           f"<|start|>user<|message|>{user_query}<|end|>"
+            f"<|start|>user<|message|>{user_query}<|end|>"
             f"<|start|>assistant"
         )
-       
         new_tokens = tokenizer.encode(continuation, allowed_special='all')
-    
+
     original_kv_cache = kv_cache
-    original_tokens_so_far = tokens_so_far  # Already guaranteed non-None here
+    original_tokens_so_far = tokens_so_far
+
+    output_tokens = None
+    updated_kv_cache = None
+    updated_tokens = None
 
     for attempt in range(max_retries):
         output_tokens, updated_kv_cache = generator.generate_with_cache(
@@ -212,26 +202,57 @@ def generateResultsWithCache(
             temperature=temperature,
             max_tokens=max_tokens
         )
-        
+
         updated_tokens = original_tokens_so_far + new_tokens + output_tokens
         full_output = tokenizer.decode(output_tokens)
-        
+
         if '<|channel|>final<|message|>' in full_output:
             final_start = full_output.find('<|channel|>final<|message|>') + len('<|channel|>final<|message|>')
             final_end = full_output.find('<|return|>', final_start)
             if final_end == -1:
                 final_end = len(full_output)
             answer = full_output[final_start:final_end].strip()
-            
-        
+
+            # --- FIX 1: Trim <|return|> stop token from cache ---
+            clean_cache = _trim_cache(updated_kv_cache, n=1)
+
+            # --- FIX 2: Properly close the assistant block in the cache ---
+            # The model stopped at <|return|> without emitting <|end|>.
+            # We feed <|end|> into the model to close the turn cleanly,
+            # so the next turn's continuation starts from a valid state.
+            closing_tokens = tokenizer.encode("<|end|>", allowed_special='all')
+            closing_tensor = torch.as_tensor(
+                closing_tokens, dtype=torch.int32, device=generator.device
+            )
+            with torch.inference_mode():
+                _, clean_cache = generator.model(
+                    closing_tensor, kv_cache=clean_cache, use_cache=True
+                )
+
+            return answer, clean_cache, updated_tokens
+
         print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, retrying...")
 
-    # Fallback
+    # Fallback: max retries reached
     print(f"Warning: No final channel marker after {max_retries} attempts, returning cleaned output")
     special_ids = set(tokenizer._special_tokens.values())
     clean_tokens = [t for t in output_tokens if t not in special_ids]
     answer = tokenizer.decode(clean_tokens).strip()
-    return answer, updated_kv_cache, updated_tokens    
+
+    # Still clean up the cache for fallback path so caller isn't stuck with bad state
+    if updated_kv_cache is not None:
+        clean_cache = _trim_cache(updated_kv_cache, n=1)
+        closing_tokens = tokenizer.encode("<|end|>", allowed_special='all')
+        closing_tensor = torch.as_tensor(
+            closing_tokens, dtype=torch.int32, device=generator.device
+        )
+        with torch.inference_mode():
+            _, clean_cache = generator.model(
+                closing_tensor, kv_cache=clean_cache, use_cache=True
+            )
+        return answer, clean_cache, updated_tokens
+
+    return answer, updated_kv_cache, updated_tokens
 
 if __name__ == "__main__":
     prompt = "What is the capital of France?"
