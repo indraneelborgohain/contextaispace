@@ -24,6 +24,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-20b", "original")
 
 context_len=4096
+svd_budget=100  # Number of virtual tokens from SVD compression of overflow KV cache
 tokenizer= get_tokenizer()
 
 def create_models(device=None, checkpoint=None):
@@ -152,6 +153,105 @@ def _trim_cache(
     """Remove last n token positions from every layer of the KV cache."""
     return [(k[:-n], v[:-n]) for k, v in kv_cache]
 
+def _svd_compress_cache(
+    kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    max_len: int = context_len,
+    budget: int = svd_budget
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Compress KV cache when it exceeds max_len using SVD on the overflow.
+
+    Strategy:
+      - Keep the first (max_len - budget) positions as-is (preserves system prompt
+        and early conversation history).
+      - Compress the remaining overflow positions into `budget` virtual tokens
+        via truncated SVD (top-budget singular components).
+      - Final cache size = max_len.
+
+    Args:
+        kv_cache: Per-layer list of (K, V) tensors, each (seq_len, ...).
+        max_len: Maximum allowed cache length (model context window).
+        budget: Number of virtual tokens produced by SVD compression.
+
+    Returns:
+        Compressed KV cache with at most max_len positions per layer.
+    """
+    if kv_cache is None:
+        return None
+    # Check current length from first layer
+    current_len = kv_cache[0][0].shape[0]
+    if current_len <= max_len:
+        return kv_cache
+
+    keep_len = max_len - budget  # positions preserved verbatim
+
+    compressed = []
+    for k, v in kv_cache:
+        # k, v shape: (seq_len, num_kv_heads, head_dim) or (seq_len, dim)
+        k_keep = k[:keep_len]
+        v_keep = v[:keep_len]
+
+        k_overflow = k[keep_len:]  # (overflow_len, ...)
+        v_overflow = v[keep_len:]
+
+        k_compressed = _svd_compress_tensor(k_overflow, budget)
+        v_compressed = _svd_compress_tensor(v_overflow, budget)
+
+        compressed.append((
+            torch.cat([k_keep, k_compressed], dim=0),
+            torch.cat([v_keep, v_compressed], dim=0),
+        ))
+
+    return compressed
+
+
+def _svd_compress_tensor(tensor: torch.Tensor, budget: int) -> torch.Tensor:
+    """
+    Compress sequence positions via truncated SVD.
+
+    Given a tensor of shape (seq_len, ...), flatten to 2-D, compute SVD,
+    keep the top `budget` singular components, and reshape back.
+
+    The result has shape (budget, ...) — `budget` virtual token positions
+    that capture the most important patterns from the original positions.
+
+    Args:
+        tensor: (seq_len, *rest_dims) tensor to compress.
+        budget: Number of virtual positions to produce.
+
+    Returns:
+        Compressed tensor of shape (budget, *rest_dims).
+    """
+    orig_shape = tensor.shape  # (seq_len, ...)
+    seq_len = orig_shape[0]
+    rest_shape = orig_shape[1:]
+    hidden = 1
+    for d in rest_shape:
+        hidden *= d
+
+    # Flatten to 2-D: (seq_len, hidden)
+    mat = tensor.reshape(seq_len, hidden).float()  # SVD needs float32
+
+    # Clamp budget to the maximum rank we can extract
+    rank = min(budget, seq_len, hidden)
+
+    # Truncated SVD — only compute the top `rank` components
+    # U: (seq_len, rank), S: (rank,), Vh: (rank, hidden)
+    U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+    # Virtual tokens = diag(S[:rank]) @ Vh[:rank] → (rank, hidden)
+    compressed = torch.diag(S[:rank]) @ Vh[:rank]
+
+    # Pad with zeros if rank < budget (e.g. overflow was tiny)
+    if rank < budget:
+        pad = torch.zeros(
+            budget - rank, hidden, dtype=compressed.dtype, device=compressed.device
+        )
+        compressed = torch.cat([compressed, pad], dim=0)
+
+    # Cast back to original dtype and reshape
+    compressed = compressed.to(tensor.dtype).reshape(budget, *rest_shape)
+    return compressed
+
 """
 """
 def generateResultsWithCache(
@@ -216,6 +316,8 @@ def generateResultsWithCache(
 
             # --- FIX 1: Trim <|return|> stop token from cache ---
             clean_cache = _trim_cache(updated_kv_cache, n=1)
+            # Compress overflow via SVD to stay within context limit
+            clean_cache = _svd_compress_cache(clean_cache, max_len=context_len, budget=svd_budget)
 
             # --- FIX 2: Properly close the assistant block in the cache ---
             # The model stopped at <|return|> without emitting <|end|>.
@@ -235,8 +337,8 @@ def generateResultsWithCache(
         print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, continuing reasoning...")
 
         # --- REASONING MODEL: Build on previous output ---
-        # Update cache and prepare to continue from where we left off
-        current_kv_cache = updated_kv_cache
+        # Compress overflow via SVD to stay within context limit
+        current_kv_cache = _svd_compress_cache(updated_kv_cache, max_len=context_len, budget=svd_budget)
         # Next iteration continues from the last output (empty new_tokens since cache has it)
         new_tokens = []
 
@@ -249,6 +351,7 @@ def generateResultsWithCache(
     # Still clean up the cache for fallback path so caller isn't stuck with bad state
     if updated_kv_cache is not None:
         clean_cache = _trim_cache(updated_kv_cache, n=1)
+        clean_cache = _svd_compress_cache(clean_cache, max_len=context_len, budget=svd_budget)
         closing_tokens = tokenizer.encode("<|end|>", allowed_special='all')
         closing_tensor = torch.as_tensor(
             closing_tokens, dtype=torch.int32, device=generator.device
