@@ -60,6 +60,50 @@ def _apply_rotary_emb(
     return torch.cat((o1, o2), dim=-1)
 
 
+def reposition_rope(
+    k_cache: torch.Tensor,
+    old_positions: torch.Tensor,
+    new_positions: torch.Tensor,
+    rope_module: "RotaryEmbedding",
+) -> torch.Tensor:
+    """Re-number positional encodings on cached K tensors.
+
+    RoPE is reversible: apply_rotary(x, cos, -sin) undoes the original
+    rotation, then we re-apply with the desired positions.
+
+    Only K caches need this — V caches have no positional encoding.
+
+    Args:
+        k_cache: (seq_len, num_kv_heads, head_dim) — already-RoPE'd keys.
+        old_positions: (seq_len,) int tensor of original position indices.
+        new_positions: (seq_len,) int tensor of target position indices.
+        rope_module: The RotaryEmbedding instance (provides YaRN freqs).
+
+    Returns:
+        Re-positioned K cache with same shape.
+    """
+    seq_len = k_cache.shape[0]
+    concentration, inv_freq = rope_module._compute_concentration_and_inv_freq()
+
+    def _cos_sin_for(positions: torch.Tensor):
+        t = positions.float()
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        return freqs.cos() * concentration, freqs.sin() * concentration
+
+    cos_old, sin_old = _cos_sin_for(old_positions)
+    cos_new, sin_new = _cos_sin_for(new_positions)
+
+    orig_shape = k_cache.shape
+    k = k_cache.view(seq_len, -1, rope_module.head_dim)
+
+    # Un-rotate: negate sin
+    k = _apply_rotary_emb(k, cos_old, -sin_old)
+    # Re-rotate at new positions
+    k = _apply_rotary_emb(k, cos_new, sin_new)
+
+    return k.reshape(orig_shape)
+
+
 class RotaryEmbedding(torch.nn.Module):
     def __init__(
         self,

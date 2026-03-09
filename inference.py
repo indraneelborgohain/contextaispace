@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from torch.nn import functional as F
 
 from architecture.tokenizer import get_tokenizer
@@ -12,7 +13,7 @@ from architecture.model_loader import (
 )
 
 #from transformers import AutoModelForCausalLM
-from architecture.gptoss20B import Transformer, ModelConfig
+from architecture.gptoss20B import Transformer, ModelConfig, reposition_rope
 
 from architecture.gptoss20B import TokenGenerator
 from system_generator import HybridSystemGenerator, format_prompt_with_system
@@ -23,9 +24,20 @@ from typing import List, Tuple, Optional
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-20b", "original")
 
-context_len=4096
-svd_budget=100  # Number of virtual tokens from SVD compression of overflow KV cache
-tokenizer= get_tokenizer()
+# ---------------------------------------------------------------------------
+# Context-window budget layout  (configurable)
+#     context_len  = prefix_budget + lsi_budget + current_budget
+#     4096         = 3096          + 500        + 500
+# ---------------------------------------------------------------------------
+context_len: int = 4096
+prefix_budget: int = 3096   # Most-recent KV kept verbatim
+lsi_budget: int = 500       # Filled by LSI-retrieved past turn deltas
+current_budget: int = 500   # Reserved for the current turn
+
+# Legacy SVD budget kept as fallback (unused in LSI path)
+svd_budget: int = 100
+
+tokenizer = get_tokenizer()
 
 def create_models(device=None, checkpoint=None):
     """
@@ -161,41 +173,30 @@ def _svd_compress_cache(
     """
     Compress KV cache when it exceeds max_len using SVD on the overflow.
 
+    Legacy fallback — the primary path now uses LSI retrieval via
+    ``assemble_cache_with_lsi``.
+
     Strategy:
-      - Keep the first (max_len - budget) positions as-is (preserves system prompt
-        and early conversation history).
+      - Keep the first (max_len - budget) positions as-is.
       - Compress the remaining overflow positions into `budget` virtual tokens
-        via truncated SVD (top-budget singular components).
+        via truncated SVD.
       - Final cache size = max_len.
-
-    Args:
-        kv_cache: Per-layer list of (K, V) tensors, each (seq_len, ...).
-        max_len: Maximum allowed cache length (model context window).
-        budget: Number of virtual tokens produced by SVD compression.
-
-    Returns:
-        Compressed KV cache with at most max_len positions per layer.
     """
     if kv_cache is None:
         return None
-    # Check current length from first layer
     current_len = kv_cache[0][0].shape[0]
     if current_len <= max_len:
         return kv_cache
 
-    keep_len = max_len - budget  # positions preserved verbatim
+    keep_len = max_len - budget
 
     compressed = []
     for k, v in kv_cache:
-        # k, v shape: (seq_len, num_kv_heads, head_dim) or (seq_len, dim)
         k_keep = k[:keep_len]
         v_keep = v[:keep_len]
 
-        k_overflow = k[keep_len:]  # (overflow_len, ...)
-        v_overflow = v[keep_len:]
-
-        k_compressed = _svd_compress_tensor(k_overflow, budget)
-        v_compressed = _svd_compress_tensor(v_overflow, budget)
+        k_compressed = _svd_compress_tensor(k[keep_len:], budget)
+        v_compressed = _svd_compress_tensor(v[keep_len:], budget)
 
         compressed.append((
             torch.cat([k_keep, k_compressed], dim=0),
@@ -206,51 +207,191 @@ def _svd_compress_cache(
 
 
 def _svd_compress_tensor(tensor: torch.Tensor, budget: int) -> torch.Tensor:
-    """
-    Compress sequence positions via truncated SVD.
-
-    Given a tensor of shape (seq_len, ...), flatten to 2-D, compute SVD,
-    keep the top `budget` singular components, and reshape back.
-
-    The result has shape (budget, ...) — `budget` virtual token positions
-    that capture the most important patterns from the original positions.
-
-    Args:
-        tensor: (seq_len, *rest_dims) tensor to compress.
-        budget: Number of virtual positions to produce.
-
-    Returns:
-        Compressed tensor of shape (budget, *rest_dims).
-    """
-    orig_shape = tensor.shape  # (seq_len, ...)
+    """Compress sequence positions via truncated SVD (legacy helper)."""
+    orig_shape = tensor.shape
     seq_len = orig_shape[0]
     rest_shape = orig_shape[1:]
     hidden = 1
     for d in rest_shape:
         hidden *= d
 
-    # Flatten to 2-D: (seq_len, hidden)
-    mat = tensor.reshape(seq_len, hidden).float()  # SVD needs float32
-
-    # Clamp budget to the maximum rank we can extract
+    mat = tensor.reshape(seq_len, hidden).float()
     rank = min(budget, seq_len, hidden)
 
-    # Truncated SVD — only compute the top `rank` components
-    # U: (seq_len, rank), S: (rank,), Vh: (rank, hidden)
     U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
-    # Virtual tokens = diag(S[:rank]) @ Vh[:rank] → (rank, hidden)
     compressed = torch.diag(S[:rank]) @ Vh[:rank]
 
-    # Pad with zeros if rank < budget (e.g. overflow was tiny)
     if rank < budget:
         pad = torch.zeros(
             budget - rank, hidden, dtype=compressed.dtype, device=compressed.device
         )
         compressed = torch.cat([compressed, pad], dim=0)
 
-    # Cast back to original dtype and reshape
     compressed = compressed.to(tensor.dtype).reshape(budget, *rest_shape)
     return compressed
+
+
+# ---------------------------------------------------------------------------
+# LSI-based cache assembly
+# ---------------------------------------------------------------------------
+
+def _extract_turn_delta(
+    kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    start: int,
+    end: int,
+) -> List[Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Slice a range of positions from a cumulative KV cache.
+
+    For sliding-window layers whose cache is shorter than ``end``,
+    stores None (these layers are ephemeral and don't need LSI retrieval).
+    """
+    deltas = []
+    for k, v in kv_cache:
+        if k.shape[0] < end:
+            # Sliding-window layer — cache was already trimmed
+            deltas.append(None)
+        else:
+            deltas.append((k[start:end].clone(), v[start:end].clone()))
+    return deltas
+
+
+def _build_bow(token_ids: List[int], vocab_size: int) -> np.ndarray:
+    """Bag-of-words vector from token ids."""
+    vec = np.zeros(vocab_size, dtype=np.float32)
+    for tid in token_ids:
+        if 0 <= tid < vocab_size:
+            vec[tid] += 1.0
+    return vec
+
+
+def assemble_cache_with_lsi(
+    recent_kv: List[Tuple[torch.Tensor, torch.Tensor]],
+    past_turns: list,          # List[TurnDelta]
+    query_token_ids: List[int],
+    generator,                 # TokenGenerator — for rope modules
+    vocab_size: int = ModelConfig.vocab_size,
+    prefix_len: int = prefix_budget,
+    lsi_len: int = lsi_budget,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Assemble a context-window-sized KV cache.
+
+    Layout:  [first prefix_len positions (kept verbatim)] + [LSI-retrieved past turns (≤ lsi_len)]
+
+    The first prefix_len positions preserve the system prompt and early
+    conversation.  LSI-selected past turn deltas are re-RoPE'd and
+    appended after the prefix.
+
+    Args:
+        recent_kv: Current cumulative KV cache (may exceed context_len).
+        past_turns: Per-turn deltas from KVCacheStore.
+        query_token_ids: Current user query tokens (for LSI ranking).
+        generator: TokenGenerator whose model has RoPE modules.
+        vocab_size: Vocabulary size for BoW vectors.
+        prefix_len: Tokens kept verbatim from the start of the cache.
+        lsi_len: Token budget for LSI-retrieved turns.
+
+    Returns:
+        Assembled KV cache of size ≤ context_len.
+    """
+    from app.services.lsi_retrieval import select_turns_lsi
+
+    current_len = recent_kv[0][0].shape[0]
+
+    # If still within context window, nothing to do
+    if current_len <= context_len:
+        return recent_kv
+
+    # --- A. Keep the first prefix_len positions (system prompt + early context) ---
+    actual_prefix = min(prefix_len, current_len)
+    prefix_slice = [(k[:actual_prefix], v[:actual_prefix]) for k, v in recent_kv]
+
+    # --- B. Filter to only turns beyond the prefix ----------------------
+    # Turns whose tokens are entirely within the first prefix_len positions
+    # are already preserved verbatim — no need to select them via LSI.
+    overflow_turns = [
+        t for t in past_turns
+        if t.start_pos + t.num_tokens > actual_prefix
+    ]
+
+    # --- C. If no overflow turns stored yet, fall back to SVD ---------
+    if not overflow_turns:
+        return _svd_compress_cache(recent_kv, max_len=context_len, budget=lsi_len)
+
+    # --- D. Select from overflow turns via LSI ------------------------
+    selected_indices = select_turns_lsi(
+        turns=overflow_turns,
+        query_token_ids=query_token_ids,
+        vocab_size=vocab_size,
+        token_budget=lsi_len,
+    )
+
+    if not selected_indices:
+        # Nothing selected — just truncate to context_len
+        return [(k[:context_len], v[:context_len]) for k, v in recent_kv]
+
+    # --- D. Concatenate selected turn deltas & re-RoPE ----------------
+    num_layers = len(recent_kv)
+    assembled_k_parts: List[List[torch.Tensor]] = [[] for _ in range(num_layers)]
+    assembled_v_parts: List[List[torch.Tensor]] = [[] for _ in range(num_layers)]
+
+    # LSI turns are placed right after the prefix
+    new_pos_offset = actual_prefix
+
+    # Access rope modules from model layers
+    rope_modules = []
+    for block in generator.model.block:
+        rope_modules.append(block.attn.rope)
+
+    for turn_idx in selected_indices:
+        turn = overflow_turns[turn_idx]
+        turn_len = turn.num_tokens
+
+        old_positions = torch.arange(
+            turn.start_pos, turn.start_pos + turn_len,
+            device=generator.device,
+        )
+        new_positions = torch.arange(
+            new_pos_offset, new_pos_offset + turn_len,
+            device=generator.device,
+        )
+
+        for layer_idx in range(num_layers):
+            delta = turn.kv_delta[layer_idx]
+            if delta is None:
+                # Sliding-window layer — no delta stored; skip
+                continue
+            k_delta, v_delta = delta
+            k_delta = k_delta.to(generator.device)
+            v_delta = v_delta.to(generator.device)
+
+            # Re-RoPE the K cache to new contiguous positions
+            k_repositioned = reposition_rope(
+                k_delta, old_positions, new_positions, rope_modules[layer_idx]
+            )
+            assembled_k_parts[layer_idx].append(k_repositioned)
+            assembled_v_parts[layer_idx].append(v_delta)
+
+        new_pos_offset += turn_len
+
+    # --- E. Assemble: [prefix | LSI turns] ----------------------------
+    final_cache = []
+    for layer_idx in range(num_layers):
+        k_prefix, v_prefix = prefix_slice[layer_idx]
+
+        if assembled_k_parts[layer_idx]:
+            # Full-context layer: append LSI turns after prefix
+            all_k = [k_prefix] + assembled_k_parts[layer_idx]
+            all_v = [v_prefix] + assembled_v_parts[layer_idx]
+
+            final_cache.append((
+                torch.cat(all_k, dim=0),
+                torch.cat(all_v, dim=0),
+            ))
+        else:
+            # Sliding-window layer: just keep prefix
+            final_cache.append((k_prefix, v_prefix))
+
+    return final_cache
 
 """
 """
@@ -260,12 +401,22 @@ def generateResultsWithCache(
     system_gen,
     kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     tokens_so_far: Optional[List[int]] = None,
+    past_turns: Optional[list] = None,     # List[TurnDelta] from KVCacheStore
     max_tokens: int = 100,
     temperature: float = 1.0,
     max_retries: int = 3
-) -> Tuple[str, List[Tuple[torch.Tensor, torch.Tensor]], List[int]]:
+) -> tuple:
+    """Generate a response with KV-cache continuation and per-turn delta tracking.
+
+    Returns:
+        (answer, clean_cache, all_tokens, turn_delta)
+        * clean_cache  — the KV cache for the *current* turn only (delta).
+        * turn_delta   — a TurnDelta ready to be stored in KVCacheStore.
+    """
+    from app.services.kv_cache_store import TurnDelta
 
     user_query = prompt
+    vocab_size = ModelConfig.vocab_size
 
     stop_token_ids = [
         tokenizer.encode("<|return|>", allowed_special='all')[0],
@@ -279,20 +430,21 @@ def generateResultsWithCache(
         new_tokens = tokenizer.encode(formatted_prompt, allowed_special='all')
         tokens_so_far = []
     else:
-        # Continuing conversation: cache already ends with proper <|end|>
-        # (we closed it after the previous turn), so just append new user turn
         continuation = (
             f"<|start|>user<|message|>{user_query}<|end|>"
             f"<|start|>assistant"
         )
         new_tokens = tokenizer.encode(continuation, allowed_special='all')
 
+    # Track where this turn's KV delta starts (position in cumulative cache)
+    turn_kv_start = kv_cache[0][0].shape[0] if kv_cache is not None else 0
+
     current_kv_cache = kv_cache
     current_tokens = tokens_so_far if tokens_so_far else []
 
     output_tokens = None
     updated_kv_cache = None
-    all_output_tokens = []  # Accumulate all reasoning steps
+    all_output_tokens = []
 
     for attempt in range(max_retries):
         output_tokens, updated_kv_cache = generator.generate_with_cache(
@@ -314,15 +466,30 @@ def generateResultsWithCache(
                 final_end = len(full_output)
             answer = full_output[final_start:final_end].strip()
 
-            # --- FIX 1: Trim <|return|> stop token from cache ---
+            # Trim <|return|> stop token from cache
             clean_cache = _trim_cache(updated_kv_cache, n=1)
-            # Compress overflow via SVD to stay within context limit
-            clean_cache = _svd_compress_cache(clean_cache, max_len=context_len, budget=svd_budget)
 
-            # --- FIX 2: Properly close the assistant block in the cache ---
-            # The model stopped at <|return|> without emitting <|end|>.
-            # We feed <|end|> into the model to close the turn cleanly,
-            # so the next turn's continuation starts from a valid state.
+            # --- Extract this turn's KV delta BEFORE compression ------
+            turn_kv_end = clean_cache[0][0].shape[0]
+            turn_token_ids = new_tokens + all_output_tokens
+            turn_delta = TurnDelta(
+                kv_delta=_extract_turn_delta(clean_cache, turn_kv_start, turn_kv_end),
+                token_ids=turn_token_ids,
+                bow_vector=_build_bow(turn_token_ids, vocab_size),
+                start_pos=turn_kv_start,
+                num_tokens=turn_kv_end - turn_kv_start,
+            )
+
+            # --- Compress via LSI if over context limit ---------------
+            all_past = (past_turns or []) + [turn_delta]
+            clean_cache = assemble_cache_with_lsi(
+                recent_kv=clean_cache,
+                past_turns=all_past,
+                query_token_ids=new_tokens,
+                generator=generator,
+            )
+
+            # Close the assistant block in the cache
             closing_tokens = tokenizer.encode("<|end|>", allowed_special='all')
             closing_tensor = torch.as_tensor(
                 closing_tokens, dtype=torch.int32, device=generator.device
@@ -332,14 +499,17 @@ def generateResultsWithCache(
                     closing_tensor, kv_cache=clean_cache, use_cache=True
                 )
 
-            return answer, clean_cache, current_tokens
+            return answer, clean_cache, current_tokens, turn_delta
 
         print(f"Attempt {attempt + 1}/{max_retries}: No final channel marker, continuing reasoning...")
 
-        # --- REASONING MODEL: Build on previous output ---
-        # Compress overflow via SVD to stay within context limit
-        current_kv_cache = _svd_compress_cache(updated_kv_cache, max_len=context_len, budget=svd_budget)
-        # Next iteration continues from the last output (empty new_tokens since cache has it)
+        # Reasoning continuation: compress if needed, keep going
+        current_kv_cache = assemble_cache_with_lsi(
+            recent_kv=updated_kv_cache,
+            past_turns=past_turns or [],
+            query_token_ids=new_tokens,
+            generator=generator,
+        )
         new_tokens = []
 
     # Fallback: max retries reached
@@ -348,10 +518,30 @@ def generateResultsWithCache(
     clean_tokens = [t for t in all_output_tokens if t not in special_ids]
     answer = tokenizer.decode(clean_tokens).strip()
 
-    # Still clean up the cache for fallback path so caller isn't stuck with bad state
+    # Build turn delta even for fallback
+    turn_token_ids = new_tokens + all_output_tokens
+    turn_delta = None
+
     if updated_kv_cache is not None:
         clean_cache = _trim_cache(updated_kv_cache, n=1)
-        clean_cache = _svd_compress_cache(clean_cache, max_len=context_len, budget=svd_budget)
+
+        turn_kv_end = clean_cache[0][0].shape[0]
+        turn_delta = TurnDelta(
+            kv_delta=_extract_turn_delta(clean_cache, turn_kv_start, turn_kv_end),
+            token_ids=turn_token_ids,
+            bow_vector=_build_bow(turn_token_ids, vocab_size),
+            start_pos=turn_kv_start,
+            num_tokens=turn_kv_end - turn_kv_start,
+        )
+
+        all_past = (past_turns or []) + ([turn_delta] if turn_delta else [])
+        clean_cache = assemble_cache_with_lsi(
+            recent_kv=clean_cache,
+            past_turns=all_past,
+            query_token_ids=turn_token_ids,
+            generator=generator,
+        )
+
         closing_tokens = tokenizer.encode("<|end|>", allowed_special='all')
         closing_tensor = torch.as_tensor(
             closing_tokens, dtype=torch.int32, device=generator.device
@@ -360,9 +550,9 @@ def generateResultsWithCache(
             _, clean_cache = generator.model(
                 closing_tensor, kv_cache=clean_cache, use_cache=True
             )
-        return answer, clean_cache, current_tokens
+        return answer, clean_cache, current_tokens, turn_delta
 
-    return answer, updated_kv_cache, current_tokens
+    return answer, updated_kv_cache, current_tokens, turn_delta
 
 if __name__ == "__main__":
     prompt = "What is the capital of France?"

@@ -101,30 +101,36 @@ def chat():
         # Get existing KV cache for this conversation if available
         existing_cache = None
         tokens_so_far = None
+        past_turns = None
         if use_cache and kv_cache_store:
             cache_entry = kv_cache_store.get(conversation_id)
             if cache_entry:
-                existing_cache = cache_entry.kv_cache
+                existing_cache = cache_entry.live_cache
                 tokens_so_far = cache_entry.tokens_so_far
-                print(f"Reusing KV cache for conversation {conversation_id} ({len(tokens_so_far)} tokens cached)")
+                past_turns = cache_entry.turns if cache_entry.turns else None
+                print(f"Reusing KV cache for conversation {conversation_id} ({len(tokens_so_far)} tokens cached, {len(cache_entry.turns)} turns)")
         
         # Generate response
         start_time = time.time()
         
         if use_cache:
-            # Use cache-aware generation
-            response_text, updated_cache, updated_tokens = generateResultsWithCache(
+            # Use cache-aware generation with per-turn deltas
+            response_text, updated_cache, updated_tokens, turn_delta = generateResultsWithCache(
                 user_message,
                 generator=generator,
                 system_gen=system_gen,
                 kv_cache=existing_cache,
                 tokens_so_far=tokens_so_far,
+                past_turns=past_turns,
                 max_tokens=max_tokens
             )
             
-            # Store updated cache
-            if kv_cache_store:
-                kv_cache_store.set(conversation_id, updated_cache, updated_tokens)
+            # Store the turn delta and updated cumulative cache
+            if kv_cache_store and turn_delta is not None:
+                kv_cache_store.add_turn(
+                    conversation_id, turn_delta, updated_tokens,
+                    live_cache=updated_cache,
+                )
         else:
             # Use standard generation (no cache)
             response_text = generateResults(user_message, generator=generator, system_gen=system_gen)

@@ -1,8 +1,9 @@
 """
 KV Cache Store
 
-In-memory storage for KV caches per conversation to enable efficient
-continuation of multi-turn conversations without reprocessing history.
+In-memory storage for per-turn KV cache deltas and token metadata per
+conversation.  Each turn stores only its own KV slice (delta) together
+with a bag-of-words vector used for Latent Semantic Indexing retrieval.
 
 TODO: For scaling to many concurrent users, consider:
   - Reduce max_conversations or TTL
@@ -11,104 +12,116 @@ TODO: For scaling to many concurrent users, consider:
 """
 
 import torch
+import numpy as np
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 import time
 
 
 @dataclass
+class TurnDelta:
+    """KV cache delta and metadata for a single turn."""
+    kv_delta: List[Optional[Tuple[torch.Tensor, torch.Tensor]]]  # Per-layer (K, V) or None for sliding-window layers
+    token_ids: List[int]            # Raw token ids for this turn
+    bow_vector: np.ndarray          # Bag-of-words vector (vocab_size,) for LSI
+    start_pos: int                  # Original absolute start position
+    num_tokens: int                 # Number of tokens in this turn
+
+
+@dataclass
 class ConversationCache:
-    """Stores KV cache and token history for a conversation."""
-    kv_cache: List[Tuple[torch.Tensor, torch.Tensor]]  # Per-layer (K, V) tuples
-    tokens_so_far: List[int]  # All tokens processed so far
-    last_access: float  # Timestamp for cache eviction
-    
+    """Stores per-turn deltas and conversation-level metadata."""
+    turns: List[TurnDelta] = field(default_factory=list)
+    tokens_so_far: List[int] = field(default_factory=list)  # All tokens (cumulative)
+    live_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None  # Compressed cache from last turn
+    last_access: float = 0.0
+
 
 class KVCacheStore:
     """
-    In-memory store for KV caches per conversation.
-    
-    Manages KV cache lifecycle:
-    - Store cache after each response
-    - Retrieve cache for continuing conversations
-    - Clear cache when conversation is reset
-    - Auto-evict old caches to manage memory
+    In-memory store for per-turn KV cache deltas.
+
+    Each conversation holds a list of TurnDelta objects.  At inference
+    time the LSI retrieval service selects the most relevant past turns
+    and reassembles a KV cache from deltas.
     """
-    
+
     def __init__(self, max_conversations: int = 100, ttl_seconds: int = 3600):
-        """
-        Initialize the KV cache store.
-        
-        Args:
-            max_conversations: Maximum number of conversations to cache.
-            ttl_seconds: Time-to-live for cache entries (default: 1 hour).
-        """
         self.max_conversations = max_conversations
         self.ttl_seconds = ttl_seconds
         self._cache: Dict[str, ConversationCache] = {}
         self._lock = threading.Lock()
-    
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def get(self, conversation_id: str) -> Optional[ConversationCache]:
-        """
-        Get the cached data for a conversation.
-        
-        Args:
-            conversation_id: Unique conversation identifier.
-        
-        Returns:
-            ConversationCache or None if not found/expired.
-        """
         with self._lock:
             if conversation_id not in self._cache:
                 return None
-            
+
             cache = self._cache[conversation_id]
-            
-            # Check TTL
+
             if time.time() - cache.last_access > self.ttl_seconds:
                 self._remove_cache(conversation_id)
                 return None
-            
-            # Update access time
+
             cache.last_access = time.time()
             return cache
-    
+
     def set(
         self,
         conversation_id: str,
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
         tokens_so_far: List[int]
     ) -> None:
-        """
-        Store or update cache for a conversation.
-        
-        Args:
-            conversation_id: Unique conversation identifier.
-            kv_cache: The KV cache from the model.
-            tokens_so_far: All tokens processed in this conversation.
+        """Legacy setter — stores a cumulative snapshot (no per-turn info).
+
+        Kept for backward compatibility with callers that have not yet
+        migrated to ``add_turn``.
         """
         with self._lock:
-            # Evict old entries if at capacity
             if conversation_id not in self._cache and len(self._cache) >= self.max_conversations:
                 self._evict_oldest()
-            
+
             self._cache[conversation_id] = ConversationCache(
-                kv_cache=kv_cache,
+                turns=[],
                 tokens_so_far=tokens_so_far,
-                last_access=time.time()
+                last_access=time.time(),
             )
+
+    def add_turn(
+        self,
+        conversation_id: str,
+        turn_delta: TurnDelta,
+        tokens_so_far: List[int],
+        live_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    ) -> None:
+        """Append a single turn delta to a conversation's history."""
+        with self._lock:
+            if conversation_id not in self._cache:
+                if len(self._cache) >= self.max_conversations:
+                    self._evict_oldest()
+                self._cache[conversation_id] = ConversationCache(
+                    last_access=time.time(),
+                )
+
+            cache = self._cache[conversation_id]
+            cache.turns.append(turn_delta)
+            cache.tokens_so_far = tokens_so_far
+            cache.live_cache = live_cache
+            cache.last_access = time.time()
     
+    def get_turns(self, conversation_id: str) -> List[TurnDelta]:
+        """Return the list of per-turn deltas (empty list if missing)."""
+        cache = self.get(conversation_id)
+        if cache is None:
+            return []
+        return cache.turns
+
     def clear(self, conversation_id: str) -> bool:
-        """
-        Clear cache for a specific conversation.
-        
-        Args:
-            conversation_id: Unique conversation identifier.
-        
-        Returns:
-            True if cache was cleared, False if not found.
-        """
         with self._lock:
             return self._remove_cache(conversation_id)
     
@@ -129,9 +142,14 @@ class KVCacheStore:
         """Remove cache and free GPU memory."""
         if conversation_id in self._cache:
             cache = self._cache[conversation_id]
-            # Clear tensor references to allow garbage collection
-            if cache.kv_cache:
-                for k, v in cache.kv_cache:
+            for turn in cache.turns:
+                if turn.kv_delta:
+                    for entry in turn.kv_delta:
+                        if entry is not None:
+                            k, v = entry
+                            del k, v
+            if cache.live_cache:
+                for k, v in cache.live_cache:
                     del k, v
             del self._cache[conversation_id]
             return True
@@ -149,11 +167,13 @@ class KVCacheStore:
         """Get cache statistics."""
         with self._lock:
             total_tokens = sum(len(c.tokens_so_far) for c in self._cache.values())
+            total_turns = sum(len(c.turns) for c in self._cache.values())
             return {
                 "num_conversations": len(self._cache),
                 "max_conversations": self.max_conversations,
                 "total_tokens_cached": total_tokens,
-                "ttl_seconds": self.ttl_seconds
+                "total_turns_cached": total_turns,
+                "ttl_seconds": self.ttl_seconds,
             }
     
     def list_conversations(self) -> List[Dict]:
@@ -164,8 +184,8 @@ class KVCacheStore:
                 conversations.append({
                     "conversation_id": conv_id,
                     "num_tokens": len(cache.tokens_so_far),
+                    "num_turns": len(cache.turns),
                     "last_access": cache.last_access,
-                    "num_layers_cached": len(cache.kv_cache) if cache.kv_cache else 0
                 })
             return sorted(conversations, key=lambda x: x["last_access"], reverse=True)
 
