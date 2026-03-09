@@ -3,16 +3,6 @@ import numpy as np
 from torch.nn import functional as F
 
 from architecture.tokenizer import get_tokenizer
-from hf_gptoss_loader import load_gptoss_from_hf
-from architecture.model_loader import (
-    compare_model_architectures,
-    print_architecture_comparison,
-    copy_weights,
-    print_copy_results,
-    create_weight_mapping,
-)
-
-#from transformers import AutoModelForCausalLM
 from architecture.gptoss20B import Transformer, ModelConfig, reposition_rope
 
 from architecture.gptoss20B import TokenGenerator
@@ -26,16 +16,19 @@ DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-20b", "origina
 
 # ---------------------------------------------------------------------------
 # Context-window budget layout  (configurable)
-#     context_len  = prefix_budget + lsi_budget + current_budget
-#     4096         = 3096          + 500        + 500
+#     context_len  = prefix_budget + lsi_budget
+#     4096         = 3096          + 500   (+ ~500 for current turn growth)
 # ---------------------------------------------------------------------------
 context_len: int = 4096
-prefix_budget: int = 3096   # Most-recent KV kept verbatim
+prefix_budget: int = 3096   # First N positions kept verbatim (system prompt)
 lsi_budget: int = 500       # Filled by LSI-retrieved past turn deltas
-current_budget: int = 500   # Reserved for the current turn
 
 # Legacy SVD budget kept as fallback (unused in LSI path)
 svd_budget: int = 100
+
+# Even layers use sliding-window (max 128 tokens); odd layers keep full context.
+# Always use an odd layer for cache-length measurements.
+_FULL_CTX_LAYER: int = 1
 
 tokenizer = get_tokenizer()
 
@@ -184,7 +177,7 @@ def _svd_compress_cache(
     """
     if kv_cache is None:
         return None
-    current_len = kv_cache[0][0].shape[0]
+    current_len = kv_cache[_FULL_CTX_LAYER][0].shape[0]
     if current_len <= max_len:
         return kv_cache
 
@@ -192,11 +185,23 @@ def _svd_compress_cache(
 
     compressed = []
     for k, v in kv_cache:
+        layer_len = k.shape[0]
+        if layer_len <= keep_len:
+            # Sliding-window layer — shorter than keep_len, nothing to compress
+            compressed.append((k, v))
+            continue
+
         k_keep = k[:keep_len]
         v_keep = v[:keep_len]
 
-        k_compressed = _svd_compress_tensor(k[keep_len:], budget)
-        v_compressed = _svd_compress_tensor(v[keep_len:], budget)
+        overflow_k = k[keep_len:]
+        overflow_v = v[keep_len:]
+        if overflow_k.shape[0] == 0:
+            compressed.append((k_keep, v_keep))
+            continue
+
+        k_compressed = _svd_compress_tensor(overflow_k, budget)
+        v_compressed = _svd_compress_tensor(overflow_v, budget)
 
         compressed.append((
             torch.cat([k_keep, k_compressed], dim=0),
@@ -246,9 +251,8 @@ def _extract_turn_delta(
     stores None (these layers are ephemeral and don't need LSI retrieval).
     """
     deltas = []
-    for k, v in kv_cache:
+    for i, (k, v) in enumerate(kv_cache):
         if k.shape[0] < end or start >= end:
-            # Sliding-window layer or empty range
             deltas.append(None)
         else:
             deltas.append((k[start:end].clone(), v[start:end].clone()))
@@ -295,7 +299,7 @@ def assemble_cache_with_lsi(
     """
     from app.services.lsi_retrieval import select_turns_lsi
 
-    current_len = recent_kv[0][0].shape[0]
+    current_len = recent_kv[_FULL_CTX_LAYER][0].shape[0]
 
     # If still within context window, nothing to do
     if current_len <= context_len:
@@ -303,7 +307,11 @@ def assemble_cache_with_lsi(
 
     # --- A. Keep the first prefix_len positions (system prompt + early context) ---
     actual_prefix = min(prefix_len, current_len)
-    prefix_slice = [(k[:actual_prefix], v[:actual_prefix]) for k, v in recent_kv]
+    prefix_slice = []
+    for k, v in recent_kv:
+        layer_len = k.shape[0]
+        layer_prefix = min(actual_prefix, layer_len)
+        prefix_slice.append((k[:layer_prefix], v[:layer_prefix]))
 
     # --- B. Filter to only turns beyond the prefix ----------------------
     # Turns whose tokens are entirely within the first prefix_len positions
@@ -396,8 +404,7 @@ def assemble_cache_with_lsi(
 
     return final_cache
 
-"""
-"""
+
 def generateResultsWithCache(
     prompt: str,
     generator,
@@ -440,7 +447,8 @@ def generateResultsWithCache(
         new_tokens = tokenizer.encode(continuation, allowed_special='all')
 
     # Track where this turn's KV delta starts (position in cumulative cache)
-    turn_kv_start = kv_cache[0][0].shape[0] if kv_cache is not None else 0
+    # Use a full-context layer (odd) — sliding-window layers are capped at 128
+    turn_kv_start = kv_cache[_FULL_CTX_LAYER][0].shape[0] if kv_cache is not None else 0
 
     current_kv_cache = kv_cache
     current_tokens = tokens_so_far if tokens_so_far else []
@@ -473,7 +481,7 @@ def generateResultsWithCache(
             clean_cache = _trim_cache(updated_kv_cache, n=1)
 
             # --- Extract this turn's KV delta BEFORE compression ------
-            turn_kv_end = clean_cache[0][0].shape[0]
+            turn_kv_end = clean_cache[_FULL_CTX_LAYER][0].shape[0]
             turn_token_ids = new_tokens + all_output_tokens
             turn_delta = TurnDelta(
                 kv_delta=_extract_turn_delta(clean_cache, turn_kv_start, turn_kv_end),
@@ -528,7 +536,7 @@ def generateResultsWithCache(
     if updated_kv_cache is not None:
         clean_cache = _trim_cache(updated_kv_cache, n=1)
 
-        turn_kv_end = clean_cache[0][0].shape[0]
+        turn_kv_end = clean_cache[_FULL_CTX_LAYER][0].shape[0]
         turn_delta = TurnDelta(
             kv_delta=_extract_turn_delta(clean_cache, turn_kv_start, turn_kv_end),
             token_ids=turn_token_ids,
