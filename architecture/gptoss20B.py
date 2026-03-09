@@ -83,6 +83,8 @@ def reposition_rope(
         Re-positioned K cache with same shape.
     """
     seq_len = k_cache.shape[0]
+    if seq_len == 0:
+        return k_cache
     concentration, inv_freq = rope_module._compute_concentration_and_inv_freq()
 
     def _cos_sin_for(positions: torch.Tensor):

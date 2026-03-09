@@ -247,8 +247,8 @@ def _extract_turn_delta(
     """
     deltas = []
     for k, v in kv_cache:
-        if k.shape[0] < end:
-            # Sliding-window layer — cache was already trimmed
+        if k.shape[0] < end or start >= end:
+            # Sliding-window layer or empty range
             deltas.append(None)
         else:
             deltas.append((k[start:end].clone(), v[start:end].clone()))
@@ -345,6 +345,9 @@ def assemble_cache_with_lsi(
     for turn_idx in selected_indices:
         turn = overflow_turns[turn_idx]
         turn_len = turn.num_tokens
+
+        if turn_len == 0:
+            continue
 
         old_positions = torch.arange(
             turn.start_pos, turn.start_pos + turn_len,
