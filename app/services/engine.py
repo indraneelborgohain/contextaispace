@@ -1,0 +1,402 @@
+"""
+Inference engine — all generation logic lives here.
+
+Public surface:
+    startup(device, checkpoint) → None        initialise model + system cache (call once)
+    infer(prompt, conv_id, **kwargs) → dict   the only call inference.py needs to make
+
+Everything else is private to this module.
+"""
+
+import os
+import torch
+import torch.nn.functional as F
+from typing import List, Tuple, Optional
+
+from app.config import (
+    DEFAULT_CHECKPOINT,
+    CONTEXT_LIMIT,
+    LAST_N_BUDGET,
+    TOP_K_TURNS,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
+    MAX_RETRIES,
+    SYSTEM_PROMPT,
+    VALID_INTENTS,
+)
+
+# Layer index that always keeps full context (odd layers).
+# Used to read true cache length — even layers use sliding window.
+_FULL_CTX_LAYER: int = 1
+
+# ---------------------------------------------------------------------------
+# Module-level singletons — populated by startup()
+# ---------------------------------------------------------------------------
+_generator        = None   # TokenGenerator
+_system_kv_cache  = None   # List[Tuple[Tensor, Tensor]]  — frozen, never mutated
+_tokenizer        = None   # tiktoken Encoding
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+def startup(device=None, checkpoint: str = None) -> None:
+    """Load model and pre-compute system-prompt KV cache.
+
+    Call once at application startup before serving any requests.
+    """
+    global _generator, _system_kv_cache, _tokenizer
+
+    from architecture.tokenizer import get_tokenizer
+    from architecture.gptoss20B import TokenGenerator
+
+    if checkpoint is None:
+        checkpoint = DEFAULT_CHECKPOINT
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    _tokenizer = get_tokenizer()
+    _generator = TokenGenerator(checkpoint=checkpoint, device=device)
+    _system_kv_cache = _cache_system_prompt()
+    print(f"[engine] Model loaded on {device}. System prompt cached "
+          f"({_system_kv_cache[_FULL_CTX_LAYER][0].shape[0]} tokens).")
+
+
+# ---------------------------------------------------------------------------
+# Main public API
+# ---------------------------------------------------------------------------
+
+def infer(
+    prompt: str,
+    conv_id: str,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> dict:
+    """Generate a response for *prompt* within conversation *conv_id*.
+
+    Args:
+        prompt:      Plain-text user message.
+        conv_id:     Conversation identifier (any unique string per session).
+        max_tokens:  Maximum tokens to generate.
+        temperature: Sampling temperature.
+
+    Returns:
+        {
+            "answer":    str,   # the model's final response text
+            "intent":    str,   # classified intent label
+            "continues": bool,  # whether this turn depends on prior context
+        }
+    """
+    _assert_ready()
+
+    from app.services.kv_cache_store import get_kv_cache_store, TurnDelta
+    from app.services.lsi_retrieval import select_turns
+    from app.services.embedder import get_embedder
+    from app.services.chat_history_fs import get_chat_history
+
+    kv_store   = get_kv_cache_store()
+    embedder   = get_embedder()
+    history    = get_chat_history()
+
+    # --- Retrieve past turns for this conversation ---
+    past_turns = kv_store.get_turns(conv_id)
+
+    # --- Assemble KV cache ---
+    # Note: this does not mutate the cached system KV; it clones and concatenates
+    kv_cache = _assemble_kv_cache(past_turns, prompt)
+
+    # --- Track where this turn's delta starts ---
+    turn_start = kv_cache[_FULL_CTX_LAYER][0].shape[0]
+
+    # --- Tokenise the user turn ---
+    user_str   = f"<|start|>user<|message|>{prompt}<|end|><|start|>assistant"
+    new_tokens = _tokenizer.encode(user_str, allowed_special="all")
+
+    # --- Generate ---
+    answer, intent, continues, output_tokens, final_kv = _generate_loop(
+        new_tokens=new_tokens,
+        kv_cache=kv_cache,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+    # --- Build and store TurnDelta ---
+    clean_kv   = _trim_cache(final_kv, n=1)           # remove stop token
+    turn_end   = clean_kv[_FULL_CTX_LAYER][0].shape[0]
+    turn_tokens = new_tokens + output_tokens
+
+    # Encode turn text for semantic retrieval
+    turn_text  = _tokenizer.decode(turn_tokens)
+    embedding  = embedder.encode(turn_text)
+
+    turn_delta = TurnDelta(
+        kv_delta   = _extract_delta(clean_kv, turn_start, turn_end),
+        token_ids  = turn_tokens,
+        embedding  = embedding,
+        start_pos  = turn_start,
+        num_tokens = turn_end - turn_start,
+        intent     = intent,
+        continues  = continues,
+    )
+    kv_store.add_turn(conv_id, turn_delta)
+
+    # --- Persist to chat history ---
+    history.add_turn(conv_id, role="user",      content=prompt)
+    history.add_turn(conv_id, role="assistant", content=answer,
+                     intent=intent, continues=continues)
+
+    return {"answer": answer, "intent": intent, "continues": continues}
+
+
+# ---------------------------------------------------------------------------
+# KV cache assembly
+# ---------------------------------------------------------------------------
+
+def _assemble_kv_cache(
+    past_turns: list,
+    query_text: str,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Build the KV cache to use for the current turn.
+
+    Layout: [system_cache] + [selected past turn deltas, re-RoPE'd]
+
+    If total tokens fit within CONTEXT_LIMIT → include all turns.
+    Otherwise:
+      - Walk backwards from the most recent turn, greedily filling up to
+        LAST_N_BUDGET tokens.  This ensures the full 1000-token budget is
+        always consumed by recent turns even when individual turns are short.
+      - Fill any remaining context budget with top-K semantically similar
+        turns from the history that was not already included above.
+    """
+    from architecture.gptoss20B import reposition_rope
+
+    # Clone system cache — never mutate the frozen singleton
+    if not past_turns:
+        return [(k.clone(), v.clone()) for k, v in _system_kv_cache]
+
+    system_len = _system_kv_cache[_FULL_CTX_LAYER][0].shape[0]
+    total_turn_tokens = sum(t.num_tokens for t in past_turns)
+
+    # --- Case 1: everything fits ---
+    if system_len + total_turn_tokens <= CONTEXT_LIMIT:
+        return _concat_turns(_system_kv_cache, past_turns)
+
+    # --- Case 2: overflow ---
+    # Step A: walk backwards, accumulating recent turns until LAST_N_BUDGET
+    # is fully consumed (or there are no more turns).
+    recent_turns   = []
+    recent_tokens  = 0
+    remaining_past = list(past_turns)          # copy so we can pop
+
+    while remaining_past and recent_tokens < LAST_N_BUDGET:
+        turn = remaining_past.pop()            # take from the end (most recent)
+        recent_turns.insert(0, turn)           # preserve chronological order
+        recent_tokens += turn.num_tokens
+
+    # Step B: fill leftover context with semantically similar middle turns.
+    middle_budget = CONTEXT_LIMIT - system_len - recent_tokens
+
+    if middle_budget > 0 and remaining_past:
+        from app.services.lsi_retrieval import select_turns
+        selected_indices = select_turns(
+            turns        = remaining_past,
+            query_text   = query_text,
+            token_budget = middle_budget,
+            top_k        = TOP_K_TURNS,
+        )
+        selected_middle = [remaining_past[i] for i in selected_indices]
+    else:
+        selected_middle = []
+
+    turns_to_use = selected_middle + recent_turns
+    return _concat_turns(_system_kv_cache, turns_to_use)
+
+
+def _concat_turns(
+    system_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    turns: list,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Concatenate system cache + turn deltas, re-RoPE'ing each delta."""
+    from architecture.gptoss20B import reposition_rope
+
+    num_layers   = len(system_cache)
+    system_len   = system_cache[_FULL_CTX_LAYER][0].shape[0]
+    rope_modules = [block.attn.rope for block in _generator.model.block]
+    dev          = _generator.device
+
+    assembled = []
+    for layer_idx in range(num_layers):
+        parts_k = [system_cache[layer_idx][0].clone()]
+        parts_v = [system_cache[layer_idx][1].clone()]
+        pos_offset = system_len
+
+        for turn in turns:
+            delta = turn.kv_delta[layer_idx] if turn.kv_loaded else None
+            if delta is None:
+                continue                        # sliding-window or evicted layer
+            k_delta, v_delta = delta
+            k_delta = k_delta.to(dev)
+            v_delta = v_delta.to(dev)
+
+            old_pos = torch.arange(
+                turn.start_pos, turn.start_pos + turn.num_tokens, device=dev
+            )
+            new_pos = torch.arange(
+                pos_offset, pos_offset + turn.num_tokens, device=dev
+            )
+            k_repositioned = reposition_rope(
+                k_delta, old_pos, new_pos, rope_modules[layer_idx]
+            )
+            parts_k.append(k_repositioned)
+            parts_v.append(v_delta)
+            pos_offset += turn.num_tokens
+
+        assembled.append((
+            torch.cat(parts_k, dim=0),
+            torch.cat(parts_v, dim=0),
+        ))
+    return assembled
+
+
+# ---------------------------------------------------------------------------
+# Generation loop
+# ---------------------------------------------------------------------------
+
+def _generate_loop(
+    new_tokens: List[int],
+    kv_cache,
+    max_tokens: int,
+    temperature: float,
+) -> Tuple[str, str, bool, List[int], object]:
+    """Run the model, retrying until the final channel marker appears.
+
+    Returns:
+        (answer, intent, continues, all_output_tokens, final_kv_cache)
+    """
+    stop_ids = [_tokenizer.encode("<|return|>", allowed_special="all")[0]]
+    all_output_tokens = []
+    current_kv = kv_cache
+    current_input = new_tokens
+
+    for attempt in range(MAX_RETRIES):
+        output_tokens, updated_kv = _generator.generate_with_cache(
+            new_tokens   = current_input,
+            stop_tokens  = stop_ids,
+            kv_cache     = current_kv,
+            temperature  = temperature,
+            max_tokens   = max_tokens,
+        )
+        all_output_tokens.extend(output_tokens)
+        full_output = _tokenizer.decode(all_output_tokens)
+
+        if "<|channel|>final<|message|>" in full_output:
+            intent    = _parse_intent(full_output)
+            continues = _parse_continues(full_output)
+            answer    = _extract_final(full_output)
+            return answer, intent, continues, all_output_tokens, updated_kv
+
+        # No final channel yet — keep generating with no new input tokens
+        current_kv    = updated_kv
+        current_input = []
+
+    # Fallback: max retries exhausted
+    full_output = _tokenizer.decode(all_output_tokens) if all_output_tokens else ""
+    answer      = _strip_special(all_output_tokens)
+    intent      = _parse_intent(full_output)
+    return answer, intent, False, all_output_tokens, updated_kv
+
+
+# ---------------------------------------------------------------------------
+# System prompt caching
+# ---------------------------------------------------------------------------
+
+def _cache_system_prompt() -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    prompt_str = f"<|start|>system<|message|>{SYSTEM_PROMPT}<|end|>"
+    tokens     = _tokenizer.encode(prompt_str, allowed_special="all")
+    tensor     = torch.as_tensor(tokens, dtype=torch.int32, device=_generator.device)
+    with torch.inference_mode():
+        _, kv = _generator.model(tensor, kv_cache=None, use_cache=True)
+    return kv
+
+
+# ---------------------------------------------------------------------------
+# KV cache helpers
+# ---------------------------------------------------------------------------
+
+def _trim_cache(
+    kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    n: int = 1,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Remove last *n* token positions from every layer."""
+    return [(k[:-n], v[:-n]) for k, v in kv_cache]
+
+
+def _extract_delta(
+    kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    start: int,
+    end: int,
+) -> list:
+    """Slice positions [start:end] from cumulative KV cache per layer.
+
+    Returns None for sliding-window layers whose cache is shorter than *end*.
+    """
+    deltas = []
+    for k, v in kv_cache:
+        if k.shape[0] < end or start >= end:
+            deltas.append(None)
+        else:
+            deltas.append((k[start:end].clone(), v[start:end].clone()))
+    return deltas
+
+
+# ---------------------------------------------------------------------------
+# Output parsing
+# ---------------------------------------------------------------------------
+
+def _parse_intent(text: str) -> str:
+    marker = "<|channel|>intent<|message|>"
+    idx    = text.find(marker)
+    if idx == -1:
+        return "none"
+    rest  = text[idx + len(marker):].strip()
+    label = rest.split("<|")[0].split()[0].lower() if rest else "none"
+    return label if label in VALID_INTENTS else "none"
+
+
+def _parse_continues(text: str) -> bool:
+    marker = "<|channel|>continues<|message|>"
+    idx    = text.find(marker)
+    if idx == -1:
+        return False
+    rest  = text[idx + len(marker):].strip()
+    value = rest.split("<|")[0].split()[0].upper() if rest else "NO"
+    return value == "YES"
+
+
+def _extract_final(text: str) -> str:
+    marker     = "<|channel|>final<|message|>"
+    start      = text.find(marker)
+    if start == -1:
+        return text.strip()
+    start     += len(marker)
+    end        = text.find("<|return|>", start)
+    end        = end if end != -1 else len(text)
+    return text[start:end].strip()
+
+
+def _strip_special(token_ids: List[int]) -> str:
+    special_ids = set(_tokenizer._special_tokens.values())
+    clean       = [t for t in token_ids if t not in special_ids]
+    return _tokenizer.decode(clean).strip()
+
+
+# ---------------------------------------------------------------------------
+# Guard
+# ---------------------------------------------------------------------------
+
+def _assert_ready() -> None:
+    if _generator is None or _system_kv_cache is None:
+        raise RuntimeError(
+            "Engine not initialised. Call engine.startup() before engine.infer()."
+        )
