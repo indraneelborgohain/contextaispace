@@ -1,6 +1,5 @@
 datasets
 tiktoken
-datasets
 tqdm
 wandb
 ipywidgets
@@ -11,3 +10,5 @@ transformers
 torch
 flask
 flask-cors
+sentence-transformers
+numpy

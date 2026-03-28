@@ -250,6 +250,14 @@ class HybridSystemGenerator:
             "explanation": ["explain", "why", "how does", "what is", "describe", "tell me about"],
         }
         
+        # Intent classification instruction appended to every system prompt
+        self.intent_instruction = (
+            "Before your final response, classify the user's intent into exactly one of: "
+            "question, creative, technical, emotional, math, explanation, translate, search, none. "
+            "Output it as: <|channel|>intent<|message|>LABEL "
+            "Then output your response as: <|channel|>final<|message|>YOUR RESPONSE"
+        )
+
         # Templates for each intent
         self.templates = {
             "question": "You are a helpful assistant.",
@@ -366,6 +374,9 @@ class HybridSystemGenerator:
         
         # Reasoning effort
         components.append(f"Reasoning effort: {analysis['reasoning']}")
+        
+        # Intent classification instruction
+        components.append(self.intent_instruction)
         
         return " ".join(components)
 

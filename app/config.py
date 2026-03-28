@@ -1,40 +1,65 @@
-"""Configuration for the GPT-OSS Flask Server with SLURM Backend"""
+"""
+Central configuration for the GPT-OSS chat application.
+
+All tuneable knobs live here. No magic numbers elsewhere.
+"""
+
 import os
-from pathlib import Path
 
-# Server configuration
-HOST = os.getenv("GPTOSS_SERVER_HOST", "0.0.0.0")
-PORT = int(os.getenv("GPTOSS_SERVER_PORT", 5000))
-DEBUG = os.getenv("GPTOSS_SERVER_DEBUG", "false").lower() == "true"
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+PROJECT_ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-20b", "original")
 
-# Paths
-BASE_DIR = Path(__file__).parent
-PROJECT_DIR = BASE_DIR.parent
-JOBS_DIR = BASE_DIR / "jobs"
-LOGS_DIR = BASE_DIR / "logs"
-RESULTS_DIR = BASE_DIR / "results"
+# ---------------------------------------------------------------------------
+# Context window budgets
+# ---------------------------------------------------------------------------
+CONTEXT_LIMIT   : int = 4096   # Hard model limit (tokens)
+LAST_N_BUDGET   : int = 1000   # Tokens reserved for the most recent turn(s)
+TOP_K_TURNS     : int = 5      # Max similar past turns retrieved for context fill
 
-# Create directories if they don't exist
-JOBS_DIR.mkdir(exist_ok=True)
-LOGS_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+# ---------------------------------------------------------------------------
+# Memory management (in-memory KV cache)
+# ---------------------------------------------------------------------------
+MAX_TURNS_PER_USER  : int = 20        # KV deltas kept in memory per user/conversation
+MAX_TOKENS_PER_USER : int = 10_000    # Token budget per conversation in memory
+MAX_TOTAL_TURNS     : int = 200       # Global pool across all conversations
+TTL_SECONDS         : int = 3600      # Evict conversation after this many seconds idle
 
-# SLURM configuration
-SLURM_ACCOUNT = os.getenv("SLURM_ACCOUNT", "pct_cav")
-SLURM_TIME_LIMIT = os.getenv("SLURM_TIME_LIMIT", "01:00:00")
-MIN_GPUS_REQUIRED = int(os.getenv("MIN_GPUS_REQUIRED", 1))
+# ---------------------------------------------------------------------------
+# Embedder
+# ---------------------------------------------------------------------------
+EMBEDDER_MODEL : str = "all-MiniLM-L6-v2"   # sentence-transformers model name
+EMBEDDING_DIM  : int = 384                   # output dimension of above model
 
-# Model configuration
-MODEL_CHECKPOINT_PATH = os.getenv(
-    "MODEL_CHECKPOINT_PATH", 
-    str(PROJECT_DIR / "model/gpt-oss-120b/original/")
+# ---------------------------------------------------------------------------
+# Generation defaults
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_TOKENS  : int   = 200
+DEFAULT_TEMPERATURE : float = 1.0
+MAX_RETRIES         : int   = 3      # retries if model doesn't emit final channel
+
+# ---------------------------------------------------------------------------
+# Chat history (filesystem)
+# ---------------------------------------------------------------------------
+HISTORY_DIR : str = os.path.join(PROJECT_ROOT, "data", "chat_history")
+
+# ---------------------------------------------------------------------------
+# System prompt  (fixed — KV cache pre-computed once at startup)
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = (
+    "You are a helpful, professional AI assistant. "
+    "Be concise, accurate, and cite sources when possible. "
+    "For every response you must output three channels in this exact order:\n"
+    "1. <|channel|>intent<|message|>LABEL — classify the user's intent as exactly one of: "
+    "question, creative, technical, emotional, math, explanation, translate, search, none.\n"
+    "2. <|channel|>continues<|message|>YES or NO — is this query a continuation of the previous conversation?\n"
+    "3. <|channel|>final<|message|>YOUR RESPONSE — your actual answer to the user.\n"
+    "Always output all three channels. The first turn of a conversation is always continues=NO."
 )
 
-# Virtual environment path for SLURM jobs
-VENV_PATH = os.getenv("VENV_PATH", "/pct_cav/Data/CMR/contextaispace/venv")
-
-# Job timeout (seconds) - how long to wait before marking job as stale
-JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", 3600))
-
-# SQLite database path for job tracking
-DATABASE_PATH = BASE_DIR / "jobs.db"
+VALID_INTENTS = frozenset({
+    "question", "creative", "technical", "emotional",
+    "math", "explanation", "translate", "search", "none",
+})
