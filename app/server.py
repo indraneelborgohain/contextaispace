@@ -33,10 +33,6 @@ def initialize_model():
     print("Engine ready.")
 
 
-@app.route('/')
-def index():
-    """Serve the main chat interface"""
-    return send_from_directory('static', 'index.html')
 
 @app.route("/")
 def index():

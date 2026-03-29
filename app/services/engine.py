@@ -75,6 +75,11 @@ def infer(
 ) -> dict:
     """Generate a response for *prompt* within conversation *conv_id*.
 
+    Builds a flat token sequence:
+        [system prompt] + [retrieved past turns as text] + [user message]
+    and passes it directly to the model in a single forward pass.
+    No KV cache pre-loading is used.
+
     Args:
         prompt:      Plain-text user message.
         conv_id:     Conversation identifier (any unique string per session).
@@ -91,51 +96,51 @@ def infer(
     _assert_ready()
 
     from app.services.kv_cache_store import get_kv_cache_store, TurnDelta
-    from app.services.lsi_retrieval import select_turns
     from app.services.embedder import get_embedder
     from app.services.chat_history_fs import get_chat_history
 
-    kv_store   = get_kv_cache_store()
-    embedder   = get_embedder()
-    history    = get_chat_history()
+    kv_store = get_kv_cache_store()
+    embedder = get_embedder()
+    history  = get_chat_history()
 
     # --- Retrieve past turns for this conversation ---
     past_turns = kv_store.get_turns(conv_id)
 
-    # --- Assemble KV cache ---
-    # Note: this does not mutate the cached system KV; it clones and concatenates
-    kv_cache = _assemble_kv_cache(past_turns, prompt)
+    # --- Build full prompt token sequence ---
+    # System prompt first
+    system_str  = f"<|start|>system<|message|>{SYSTEM_PROMPT}<|end|>"
+    prompt_tokens = _tokenizer.encode(system_str, allowed_special="all")
 
-    # --- Track where this turn's delta starts ---
-    turn_start = kv_cache[_FULL_CTX_LAYER][0].shape[0]
+    # Select relevant past turns to fill remaining token budget
+    turn_budget = CONTEXT_LIMIT - len(prompt_tokens) - LAST_N_BUDGET
+    if past_turns and turn_budget > 0:
+        context_turns = _select_text_turns(past_turns, prompt, turn_budget)
+        for turn in context_turns:
+            prompt_tokens += turn.token_ids
 
-    # --- Tokenise the user turn ---
-    user_str   = f"<|start|>user<|message|>{prompt}<|end|><|start|>assistant"
-    new_tokens = _tokenizer.encode(user_str, allowed_special="all")
+    # Append the current user message
+    user_str    = f"<|start|>user<|message|>{prompt}<|end|><|start|>assistant"
+    user_tokens = _tokenizer.encode(user_str, allowed_special="all")
+    prompt_tokens += user_tokens
 
     # --- Generate ---
-    answer, intent, continues, output_tokens, final_kv = _generate_loop(
-        new_tokens=new_tokens,
-        kv_cache=kv_cache,
-        max_tokens=max_tokens,
-        temperature=temperature,
+    answer, intent, continues, output_tokens = _generate_loop(
+        prompt_tokens = prompt_tokens,
+        max_tokens    = max_tokens,
+        temperature   = temperature,
     )
 
-    # --- Build and store TurnDelta ---
-    clean_kv   = _trim_cache(final_kv, n=1)           # remove stop token
-    turn_end   = clean_kv[_FULL_CTX_LAYER][0].shape[0]
-    turn_tokens = new_tokens + output_tokens
-
-    # Encode turn text for semantic retrieval
-    turn_text  = _tokenizer.decode(turn_tokens)
-    embedding  = embedder.encode(turn_text)
+    # --- Build and store TurnDelta (token_ids + embedding only; no KV delta) ---
+    turn_tokens = user_tokens + output_tokens
+    turn_text   = _tokenizer.decode(turn_tokens)
+    embedding   = embedder.encode(turn_text)
 
     turn_delta = TurnDelta(
-        kv_delta   = _extract_delta(clean_kv, turn_start, turn_end),
+        kv_delta   = [],           # not used in full-text mode
         token_ids  = turn_tokens,
         embedding  = embedding,
-        start_pos  = turn_start,
-        num_tokens = turn_end - turn_start,
+        start_pos  = 0,            # not used in full-text mode
+        num_tokens = len(turn_tokens),
         intent     = intent,
         continues  = continues,
     )
@@ -150,7 +155,46 @@ def infer(
 
 
 # ---------------------------------------------------------------------------
-# KV cache assembly
+# Full-text context turn selection
+# ---------------------------------------------------------------------------
+
+def _select_text_turns(past_turns: list, query_text: str, token_budget: int) -> list:
+    """Return a chronologically-ordered subset of past_turns whose combined
+    token_ids length fits within token_budget.
+
+    Strategy (mirrors _assemble_kv_cache):
+      1. Walk backwards from the most recent turn, pinning turns until
+         LAST_N_BUDGET tokens are consumed.
+      2. Fill any remaining budget with the top-K semantically similar
+         turns from the rest.
+    """
+    recent_turns  = []
+    recent_tokens = 0
+    remaining     = list(past_turns)
+
+    while remaining and recent_tokens < LAST_N_BUDGET:
+        turn = remaining.pop()                 # most recent first
+        recent_turns.insert(0, turn)
+        recent_tokens += turn.num_tokens
+
+    middle_budget = token_budget - recent_tokens
+    selected_middle = []
+
+    if middle_budget > 0 and remaining:
+        from app.services.lsi_retrieval import select_turns
+        indices = select_turns(
+            turns        = remaining,
+            query_text   = query_text,
+            token_budget = middle_budget,
+            top_k        = TOP_K_TURNS,
+        )
+        selected_middle = [remaining[i] for i in indices]
+
+    return selected_middle + recent_turns
+
+
+# ---------------------------------------------------------------------------
+# KV cache assembly (kept for reference — not used in full-text mode)
 # ---------------------------------------------------------------------------
 
 def _assemble_kv_cache(
@@ -264,29 +308,30 @@ def _concat_turns(
 # ---------------------------------------------------------------------------
 
 def _generate_loop(
-    new_tokens: List[int],
-    kv_cache,
+    prompt_tokens: List[int],
     max_tokens: int,
     temperature: float,
-) -> Tuple[str, str, bool, List[int], object]:
-    """Run the model, retrying until the final channel marker appears.
+) -> Tuple[str, str, bool, List[int]]:
+    """Run the model on a flat token sequence, retrying until the final
+    channel marker appears.
+
+    The entire prompt (system + context turns + user message) is passed
+    in as a single flat list — no KV cache pre-loading.
 
     Returns:
-        (answer, intent, continues, all_output_tokens, final_kv_cache)
+        (answer, intent, continues, all_output_tokens)
     """
     stop_ids = [_tokenizer.encode("<|return|>", allowed_special="all")[0]]
     all_output_tokens = []
-    current_kv = kv_cache
-    current_input = new_tokens
+    current_input = prompt_tokens
 
     for attempt in range(MAX_RETRIES):
-        output_tokens, updated_kv = _generator.generate_with_cache(
-            new_tokens   = current_input,
-            stop_tokens  = stop_ids,
-            kv_cache     = current_kv,
-            temperature  = temperature,
-            max_tokens   = max_tokens,
-        )
+        output_tokens = list(_generator.generate(
+            prompt_tokens = current_input,
+            stop_tokens   = stop_ids,
+            temperature   = temperature,
+            max_tokens    = max_tokens,
+        ))
         all_output_tokens.extend(output_tokens)
         full_output = _tokenizer.decode(all_output_tokens)
 
@@ -294,17 +339,16 @@ def _generate_loop(
             intent    = _parse_intent(full_output)
             continues = _parse_continues(full_output)
             answer    = _extract_final(full_output)
-            return answer, intent, continues, all_output_tokens, updated_kv
+            return answer, intent, continues, all_output_tokens
 
-        # No final channel yet — keep generating with no new input tokens
-        current_kv    = updated_kv
-        current_input = []
+        # No final channel yet — keep generating from the full sequence
+        current_input = prompt_tokens + all_output_tokens
 
     # Fallback: max retries exhausted
     full_output = _tokenizer.decode(all_output_tokens) if all_output_tokens else ""
     answer      = _strip_special(all_output_tokens)
     intent      = _parse_intent(full_output)
-    return answer, intent, False, all_output_tokens, updated_kv
+    return answer, intent, False, all_output_tokens
 
 
 # ---------------------------------------------------------------------------
