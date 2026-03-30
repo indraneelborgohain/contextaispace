@@ -10,7 +10,7 @@ import os
 # Model
 # ---------------------------------------------------------------------------
 PROJECT_ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "model", "gpt-oss-20b", "original")
+DEFAULT_CHECKPOINT = os.path.join(PROJECT_ROOT, "models", "gpt-oss-20b", "original")
 
 # ---------------------------------------------------------------------------
 # Context window budgets
@@ -48,15 +48,15 @@ HISTORY_DIR : str = os.path.join(PROJECT_ROOT, "data", "chat_history")
 # ---------------------------------------------------------------------------
 # System prompt  (fixed — KV cache pre-computed once at startup)
 # ---------------------------------------------------------------------------
+import datetime as _dt
+
 SYSTEM_PROMPT = (
     "You are a helpful, professional AI assistant. "
-    "Be concise, accurate, and cite sources when possible. "
-    "For every response you must output three channels in this exact order:\n"
-    "1. <|channel|>intent<|message|>LABEL — classify the user's intent as exactly one of: "
-    "question, creative, technical, emotional, math, explanation, translate, search, none.\n"
-    "2. <|channel|>continues<|message|>YES or NO — is this query a continuation of the previous conversation?\n"
-    "3. <|channel|>final<|message|>YOUR RESPONSE — your actual answer to the user.\n"
-    "Always output all three channels. The first turn of a conversation is always continues=NO."
+    "Be concise, accurate, and cite sources when possible.\n"
+    f"Knowledge cutoff: 2024-06\n"
+    f"Current date: {_dt.date.today().isoformat()}\n\n"
+    "reasoning effort high\n\n"
+    "# Valid channels: analysis, final. Channel must be included for every message."
 )
 
 VALID_INTENTS = frozenset({

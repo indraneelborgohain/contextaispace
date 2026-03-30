@@ -9,6 +9,7 @@ Everything else is private to this module.
 """
 
 import os
+import re
 import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Optional
@@ -20,7 +21,6 @@ from app.config import (
     TOP_K_TURNS,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
-    MAX_RETRIES,
     SYSTEM_PROMPT,
     VALID_INTENTS,
 )
@@ -119,12 +119,16 @@ def infer(
             prompt_tokens += turn.token_ids
 
     # Append the current user message
-    user_str    = f"<|start|>user<|message|>{prompt}<|end|><|start|>assistant"
+    user_str    = f"<|start|>user<|message|>{prompt}<|end|><|start|>assistant<|channel|>"
     user_tokens = _tokenizer.encode(user_str, allowed_special="all")
     prompt_tokens += user_tokens
 
+    # Classify intent and continuation locally — no model output needed
+    intent    = _classify_intent(prompt)
+    continues = bool(past_turns)
+
     # --- Generate ---
-    answer, intent, continues, output_tokens = _generate_loop(
+    answer, output_tokens = _generate_loop(
         prompt_tokens = prompt_tokens,
         max_tokens    = max_tokens,
         temperature   = temperature,
@@ -311,44 +315,25 @@ def _generate_loop(
     prompt_tokens: List[int],
     max_tokens: int,
     temperature: float,
-) -> Tuple[str, str, bool, List[int]]:
-    """Run the model on a flat token sequence, retrying until the final
-    channel marker appears.
-
-    The entire prompt (system + context turns + user message) is passed
-    in as a single flat list — no KV cache pre-loading.
+) -> Tuple[str, List[int]]:
+    """Run the model on a flat token sequence and return when the stop token
+    (<|return|>) is emitted or max_tokens is reached.
 
     Returns:
-        (answer, intent, continues, all_output_tokens)
+        (answer, output_tokens)
     """
     stop_ids = [_tokenizer.encode("<|return|>", allowed_special="all")[0]]
-    all_output_tokens = []
-    current_input = prompt_tokens
 
-    for attempt in range(MAX_RETRIES):
-        output_tokens = list(_generator.generate(
-            prompt_tokens = current_input,
-            stop_tokens   = stop_ids,
-            temperature   = temperature,
-            max_tokens    = max_tokens,
-        ))
-        all_output_tokens.extend(output_tokens)
-        full_output = _tokenizer.decode(all_output_tokens)
+    output_tokens = list(_generator.generate(
+        prompt_tokens = prompt_tokens,
+        stop_tokens   = stop_ids,
+        temperature   = temperature,
+        max_tokens    = max_tokens,
+    ))
 
-        if "<|channel|>final<|message|>" in full_output:
-            intent    = _parse_intent(full_output)
-            continues = _parse_continues(full_output)
-            answer    = _extract_final(full_output)
-            return answer, intent, continues, all_output_tokens
-
-        # No final channel yet — keep generating from the full sequence
-        current_input = prompt_tokens + all_output_tokens
-
-    # Fallback: max retries exhausted
-    full_output = _tokenizer.decode(all_output_tokens) if all_output_tokens else ""
-    answer      = _strip_special(all_output_tokens)
-    intent      = _parse_intent(full_output)
-    return answer, intent, False, all_output_tokens
+    full_output = _tokenizer.decode(output_tokens)
+    answer      = _extract_final(full_output)
+    return answer, output_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -398,35 +383,55 @@ def _extract_delta(
 # Output parsing
 # ---------------------------------------------------------------------------
 
-def _parse_intent(text: str) -> str:
-    marker = "<|channel|>intent<|message|>"
-    idx    = text.find(marker)
-    if idx == -1:
-        return "none"
-    rest  = text[idx + len(marker):].strip()
-    label = rest.split("<|")[0].split()[0].lower() if rest else "none"
-    return label if label in VALID_INTENTS else "none"
-
-
-def _parse_continues(text: str) -> bool:
-    marker = "<|channel|>continues<|message|>"
-    idx    = text.find(marker)
-    if idx == -1:
-        return False
-    rest  = text[idx + len(marker):].strip()
-    value = rest.split("<|")[0].split()[0].upper() if rest else "NO"
-    return value == "YES"
+def _classify_intent(prompt: str) -> str:
+    """Classify user intent from the prompt text using keyword heuristics."""
+    t = prompt.lower()
+    if any(w in t for w in ["translate", "in french", "in spanish", "in german", "in japanese"]):
+        return "translate"
+    if any(w in t for w in ["calculate", "solve", "equation", "integral", "derivative", "factorial"]):
+        return "math"
+    if any(w in t for w in ["code", "function", "bug", "debug", "implement", "python", "javascript", "error"]):
+        return "technical"
+    if any(w in t for w in ["write a story", "write a poem", "creative", "imagine", "fiction"]):
+        return "creative"
+    if any(w in t for w in ["feel", "sad", "happy", "anxious", "depressed", "worried", "emotion"]):
+        return "emotional"
+    if any(w in t for w in ["search for", "look up", "find me", "latest news"]):
+        return "search"
+    if any(w in t for w in ["explain", "how does", "what is", "describe", "definition of"]):
+        return "explanation"
+    if "?" in prompt:
+        return "question"
+    return "none"
 
 
 def _extract_final(text: str) -> str:
-    marker     = "<|channel|>final<|message|>"
-    start      = text.find(marker)
-    if start == -1:
-        return text.strip()
-    start     += len(marker)
-    end        = text.find("<|return|>", start)
-    end        = end if end != -1 else len(text)
-    return text[start:end].strip()
+    """Extract the user-facing answer from model output.
+
+    Tries Harmony channel markers in order of precedence:
+        <|channel|>final<|message|>ANSWER        (no # prefix)
+        <|channel|>#final<|message|>ANSWER       (# prefix variant)
+    Falls back to stripping all special tokens from the full output.
+    """
+    start = -1
+    marker_len = 0
+    for marker in ("<|channel|>final<|message|>", "<|channel|>#final<|message|>"):
+        idx = text.find(marker)
+        if idx != -1:
+            start = idx + len(marker)
+            marker_len = len(marker)
+            break
+
+    if start != -1:
+        # Answer ends at the next channel marker, return token, or end of text
+        for stopper in ("<|channel|>", "<|return|>", "<|end|>"):
+            idx = text.find(stopper, start)
+            if idx != -1:
+                return text[start:idx].strip()
+        return text[start:].strip()
+
+    # Fallback: remove all <|...|> special tokens and return cleaned text
+    return re.sub(r"<\|[^|>]*\|>", "", text).strip()
 
 
 def _strip_special(token_ids: List[int]) -> str:

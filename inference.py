@@ -19,9 +19,10 @@ if __name__ == "__main__":
     # Quick smoke-test: initialise and run one turn
     startup()
     result = infer(
-        prompt  = "What is the capital of France?",
-        conv_id = "smoke-test",
+        prompt      = "What is the capital of France?",
+        conv_id     = "smoke-test",
+        temperature = 0.0,
     )
-    print(f"Intent:    {result['intent']}")
-    print(f"Continues: {result['continues']}")
+    #print(f"Intent:    {result['intent']}")
+    #print(f"Continues: {result['continues']}")
     print(f"Answer:    {result['answer']}")

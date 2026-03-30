@@ -202,40 +202,48 @@ class RotaryEmbedding(torch.nn.Module):
 
 def sdpa(Q, K, V, S, sm_scale, sliding_window=0, start_pos: int = 0):
     # sliding_window == 0 means no sliding window
-    # start_pos: position of first Q token (for KV cache)
+    # start_pos: sequence position of the first Q token (used for sliding window mask)
     q_len, n_heads, q_mult, d_head = Q.shape
     kv_len = K.shape[0]
-    assert K.shape == (kv_len, n_heads, d_head)
-    assert V.shape == (kv_len, n_heads, d_head)
-    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
-    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
-    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, q_len, -1)
+    batch = n_heads * q_mult  # = num_attention_heads
 
-    # Build causal mask: Q tokens can only attend to K tokens at positions <= their own
-    # Q positions: [start_pos, start_pos + q_len)
-    # K positions: [0, kv_len)
-    q_positions = torch.arange(start_pos, start_pos + q_len, device=Q.device)
-    k_positions = torch.arange(kv_len, device=Q.device)
+    # Reshape to (batch, seq, d_head) for bmm
+    Q_b = Q.permute(1, 2, 0, 3).reshape(batch, q_len, d_head)
+    K_b = (K.permute(1, 0, 2).unsqueeze(1).expand(-1, q_mult, -1, -1)
+           .reshape(batch, kv_len, d_head).contiguous())
+    V_b = (V.permute(1, 0, 2).unsqueeze(1).expand(-1, q_mult, -1, -1)
+           .reshape(batch, kv_len, d_head).contiguous())
 
-    # Create mask using masked_fill to avoid 0 * -inf = NaN
-    mask = torch.zeros((q_len, kv_len), device=Q.device, dtype=Q.dtype)
-    # mask[i,j] = -inf if k_positions[j] > q_positions[i] (future token)
-    causal_mask = k_positions[None, :] > q_positions[:, None]
-    mask.masked_fill_(causal_mask, -float("inf"))
+    # Raw attention scores: (batch, q_len, kv_len)
+    scores = torch.bmm(Q_b, K_b.transpose(-2, -1)) * sm_scale
 
-    if sliding_window > 0:
-        # Also mask tokens outside sliding window
-        # mask[i,j] = -inf if q_positions[i] - k_positions[j] >= sliding_window
-        window_mask = q_positions[:, None] - k_positions[None, :] >= sliding_window
-        mask.masked_fill_(window_mask, -float("inf"))
+    # Causal + sliding window mask (only needed for prefill where q_len > 1)
+    if q_len > 1:
+        # Causal: mask future positions
+        causal_mask = torch.triu(
+            scores.new_full((q_len, kv_len), float("-inf")), diagonal=1
+        )
+        scores = scores + causal_mask
+        # Sliding window: mask positions more than sliding_window steps back
+        if sliding_window > 0:
+            sw_mask = torch.tril(
+                scores.new_full((q_len, kv_len), float("-inf")),
+                diagonal=-sliding_window,
+            )
+            scores = scores + sw_mask
 
-    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
-    QK *= sm_scale
-    QK += mask[None, None, :, :]
-    QK = torch.cat([QK, S], dim=-1)
-    W = torch.softmax(QK, dim=-1)
-    W = W[..., :-1]
-    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
+    # Sink attention: S has shape (num_attention_heads,) == (batch,)
+    # Append one virtual "sink" key per head whose logit is S[head_idx].
+    # The sink steals probability mass without contributing to the output value.
+    sink = S.to(scores.dtype).view(batch, 1, 1).expand(batch, q_len, 1)
+    scores_with_sink = torch.cat([scores, sink], dim=-1)   # (batch, q_len, kv_len+1)
+    W = torch.softmax(scores_with_sink, dim=-1)[..., :-1]  # drop sink column
+
+    # Weighted sum of values
+    attn = torch.bmm(W, V_b)  # (batch, q_len, d_head)
+
+    # Restore layout: (batch, q_len, d_head) -> (q_len, n_heads*q_mult*d_head)
+    attn = attn.reshape(n_heads, q_mult, q_len, d_head).permute(2, 0, 1, 3)
     return attn.reshape(q_len, -1)
 
 
@@ -408,28 +416,53 @@ class MLPBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
         g = self.gate(t)
-        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-        expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
-        expert_indices = experts.indices
+        topk = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
+        expert_weights = torch.nn.functional.softmax(topk.values, dim=1)  # (seq_len, k)
+        expert_indices = topk.indices                                       # (seq_len, k)
 
-        # MLP #1
-        mlp1_weight = self.mlp1_weight[expert_indices, ...]
-        mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
+        seq_len, hidden = t.shape
 
-        # MLP #2
-        mlp2_weight = self.mlp2_weight[expert_indices, ...]
-        mlp2_bias = self.mlp2_bias[expert_indices, ...]
-        t = torch.einsum("beck,bek->bec", mlp2_weight, t)
+        # Accumulate row-parallel partial sums (no bias yet — must all_reduce first).
+        partial = torch.zeros(seq_len, hidden, device=t.device, dtype=t.dtype)
+        # Accumulate weighted bias contributions (bias is replicated, no all_reduce needed).
+        bias_acc = torch.zeros(seq_len, hidden, device=t.device, dtype=t.dtype)
+
+        # Loop over unique experts rather than materialising
+        # (seq_len, k, intermediate, hidden) weight tensors, which would be
+        # O(seq_len * k * intermediate * hidden) and exhaust GPU memory for any
+        # non-trivial prompt length.
+        for e_idx in range(self.num_experts):
+            slot_mask = (expert_indices == e_idx)   # (seq_len, k) bool
+            if not slot_mask.any():
+                continue
+
+            # token_pos: which token rows use this expert
+            # slot_pos:  which k-slot within that row holds this expert
+            token_pos, slot_pos = slot_mask.nonzero(as_tuple=True)  # (n,), (n,)
+
+            t_sel = t[token_pos]                        # (n, hidden)
+            w     = expert_weights[token_pos, slot_pos] # (n,)
+
+            # MLP #1
+            h = torch.nn.functional.linear(
+                t_sel, self.mlp1_weight[e_idx], self.mlp1_bias[e_idx]
+            )                                           # (n, intermediate*2)
+            h = swiglu(h, limit=self.swiglu_limit)      # (n, intermediate)
+
+            # MLP #2 — row-parallel partial sum, bias deferred until after all_reduce
+            out = torch.nn.functional.linear(h, self.mlp2_weight[e_idx])  # (n, hidden)
+
+            idx = token_pos.unsqueeze(1).expand(-1, hidden)
+            partial.scatter_add_(0, idx, out * w.unsqueeze(1))
+            bias_acc.scatter_add_(
+                0, idx,
+                self.mlp2_bias[e_idx].unsqueeze(0) * w.unsqueeze(1),  # (n, hidden)
+            )
+
         if self.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t += mlp2_bias
+            dist.all_reduce(partial, op=dist.ReduceOp.SUM)
 
-        # Weighted sum of experts
-        t = torch.einsum("bec,be->bc", t, expert_weights)
-
-        return x + t
+        return x + partial + bias_acc
 
 
 class TransformerBlock(torch.nn.Module):
@@ -462,21 +495,38 @@ class Transformer(torch.nn.Module):
         device: torch.device | None = None,
     ):
         super().__init__()
+
+        # Distribute layers across all visible CUDA devices (pipeline parallelism).
+        # With a single GPU, or when device is CPU/None, all layers stay on one device.
+        n_gpus = (
+            torch.cuda.device_count()
+            if (device is not None and device.type == "cuda")
+            else 1
+        )
+
+        def _layer_dev(idx: int) -> torch.device:
+            if n_gpus <= 1:
+                return device
+            return torch.device(f"cuda:{idx * n_gpus // config.num_hidden_layers}")
+
+        head_dev = _layer_dev(0)
+        tail_dev = _layer_dev(config.num_hidden_layers - 1)
+
         self.embedding = torch.nn.Embedding(
-            config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
+            config.vocab_size, config.hidden_size, device=head_dev, dtype=torch.bfloat16
         )
         self.block = torch.nn.ModuleList(
             [
-                TransformerBlock(config, layer_idx, device)
+                TransformerBlock(config, layer_idx, _layer_dev(layer_idx))
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, device=device)
+        self.norm = RMSNorm(config.hidden_size, device=tail_dev)
         self.unembedding = torch.nn.Linear(
             config.hidden_size,
             config.vocab_size,
             bias=False,
-            device=device,
+            device=tail_dev,
             dtype=torch.bfloat16,
         )
 
@@ -491,7 +541,12 @@ class Transformer(torch.nn.Module):
         new_kv_cache = [] if use_cache else None
 
         for i, block in enumerate(self.block):
+            block_dev = next(block.parameters()).device
+            if x.device != block_dev:
+                x = x.to(block_dev)
             layer_cache = kv_cache[i] if kv_cache is not None else None
+            if layer_cache is not None and layer_cache[0].device != block_dev:
+                layer_cache = (layer_cache[0].to(block_dev), layer_cache[1].to(block_dev))
             x, layer_new_cache = block(x, kv_cache=layer_cache, use_cache=use_cache)
             if use_cache:
                 new_kv_cache.append(layer_new_cache)
@@ -595,12 +650,12 @@ class TokenGenerator:
         max_tokens: int = 100,
         return_logprobs: bool = False,
     ):
-        # First pass: process entire prompt, build KV cache
+        # Prefill: run full prompt once, build KV cache
         input_tensor = torch.as_tensor(
             prompt_tokens, dtype=torch.int32, device=self.device
         )
         logits, kv_cache = self.model(input_tensor, use_cache=True)
-        logits = logits[-1]  # Logits for last token
+        logits = logits[-1]
 
         num_generated_tokens = 0
         while num_generated_tokens < max_tokens:
@@ -612,6 +667,9 @@ class TokenGenerator:
 
             num_generated_tokens += 1
 
+            if predicted_token in stop_tokens:
+                break
+
             if return_logprobs:
                 logprobs = torch.log_softmax(logits, dim=-1)
                 selected_logprobs = logprobs[predicted_token].item()
@@ -619,10 +677,7 @@ class TokenGenerator:
             else:
                 yield predicted_token
 
-            if predicted_token in stop_tokens:
-                break
-
-            # Process only the new token, reuse KV cache
+            # Generate next token using KV cache (single token forward pass)
             input_tensor = torch.as_tensor(
                 [predicted_token], dtype=torch.int32, device=self.device
             )
